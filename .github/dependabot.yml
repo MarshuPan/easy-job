@@ -1,0 +1,21 @@
+version: 2
+
+# 741 个依赖，没有自动更新就只能靠人盯漏洞公告。
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # 补丁和次版本合成一条 PR，否则每周会开出十几个。
+    # 主版本单独开，因为它们需要真的读 changelog。
+    groups:
+      minor-and-patch:
+        update-types: ['minor', 'patch']
+    open-pull-requests-limit: 5
+
+  # workflow 里的 action 按 SHA 固定，固定之后就不会自己跟进上游修复，
+  # 需要 Dependabot 来推 SHA 的更新。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

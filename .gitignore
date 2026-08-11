@@ -1,0 +1,45 @@
+# Dependency installs
+node_modules/
+.worktrees/
+.wxt/
+coverage/
+
+# Local extension builds and bundles
+.output/
+
+# Local private config and generated private payloads
+data/private/personal-config.json
+data/private/resume-evidence.json
+data/private/resume.md
+data/private/exports/
+data/private/public-release-denylist.json
+
+# Local public-repository synchronization state
+.public-sync-target
+.public-sync-manifest.json
+
+# Local project tooling state
+.serena/cache/
+.serena/project.local.yml
+
+# Logs
+logs/
+*.log
+!update.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

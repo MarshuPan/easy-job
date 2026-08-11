@@ -1,0 +1,12 @@
+{
+  "ignorePatterns": [".output/**"],
+  "plugins": ["import", "vue"],
+  "rules": {
+    "eslint/no-unused-expressions": [
+      "error",
+      {
+        "allowShortCircuit": true
+      }
+    ]
+  }
+}

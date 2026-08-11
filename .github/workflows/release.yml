@@ -1,0 +1,71 @@
+name: Release
+
+# 打 tag 才发布。tag 名要和 package.json 的 version 对得上（例如 v1.0.0 对 1.0.0），
+# 对不上就直接失败——Release 页面上的版本号和用户装到的版本号不一致，
+# 出问题时没人说得清对方用的是哪一版。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19'
+
+      # packageManager in package.json pins the pnpm version.
+      - run: corepack enable
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Check tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $PKG"
+            exit 1
+          fi
+
+      # 发布前跑一遍完整门禁。构建能过不代表行为没坏，
+      # 而 Release 一旦发出去就会被人下载安装。
+      - name: Typecheck
+        run: pnpm check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Format
+        run: pnpm fmt:check
+
+      - name: Test
+        run: pnpm test
+
+      # zip 会顺带产出 .output/<browser>-mv3，所以打包和校验共用同一次构建。
+      - name: Build and package
+        run: pnpm zip
+
+      # 三个目标的 manifest 形状不同（Chromium 是 service worker，Firefox 是
+      # event page），且 optional_host_permissions 在转换中丢失时不会报错，
+      # 只在真机上表现为 AI 功能不可用。发布前逐个校验。
+      - name: Validate all targets
+        run: pnpm validate
+
+      # 按 commit SHA 固定，不用 tag。这一步持有 contents: write，
+      # 而 tag 是可变的——上游被入侵并把 v2 重指到别处，这里就会拿着写权限
+      # 去跑别人的代码。SHA 对应 v2。
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            .output/*-chrome.zip
+            .output/*-edge.zip
+            .output/*-firefox.zip
+          generate_release_notes: true
