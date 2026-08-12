@@ -78,7 +78,7 @@
     "protobufjs": "^7.5.4",
     "sass": "^1.97.1",
     "tailwindcss": "4.3.2",
-    "ts-proto": "^1.181.2",
+    "ts-proto": "^2.12.0",
     "typescript": "^5.9.3",
     "uid": "^2.0.2",
     "vitest": "4.1.9",
