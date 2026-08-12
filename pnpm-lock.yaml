@@ -101,8 +101,8 @@ importers:
         specifier: ^0.0.8
         version: 0.0.8(@types/node@20.19.42)(typescript@5.9.3)
       protobufjs:
-        specifier: ^7.5.4
-        version: 7.6.2
+        specifier: ^8.7.2
+        version: 8.7.2
       sass:
         specifier: ^1.97.1
         version: 1.100.0
@@ -2959,8 +2959,12 @@ packages:
     resolution: {integrity: sha512-k8BHqgPBOtrlougZZqF2uUk5Z7bN8f0wj+3e8M3hvtSv0NBAz4VBy5f6R5Nxq/l+i7mRFTgNZb2trxqTpHNY/A==}
     hasBin: true
 
-  protobufjs@7.6.2:
-    resolution: {integrity: sha512-N9EiLovGEQOJSPF26Ij7qUGvahfEnq0eeYZ02aigIedkmz1qZSwjnP9SBITHJuF/6MYbIW4HDN8zdYjsjqJKXQ==}
+  protobufjs@7.6.5:
+    resolution: {integrity: sha512-/FPD0nUc9jH6rfFjji9IBqOz4pcSE3CsT1m7Ep6Mdb0LxSUMj8hgl6GomOvZzpNpAqqGaXA0P3VSrZLFzIhQrw==}
+    engines: {node: '>=12.0.0'}
+
+  protobufjs@8.7.2:
+    resolution: {integrity: sha512-oTVHV+oelUBtiu5iTuTNNZ0eLYsXSMxry4cgr30mayNkgIZL6qZ0IOQVPuSWGcyAaXKl/XgqwWHIC3a0khYVBA==}
     engines: {node: '>=12.0.0'}
 
   proxy-from-env@2.1.0:
@@ -6558,7 +6562,7 @@ snapshots:
       '@types/node': 20.19.42
       long: 4.0.0
 
-  protobufjs@7.6.2:
+  protobufjs@7.6.5:
     dependencies:
       '@protobufjs/aspromise': 1.1.2
       '@protobufjs/base64': 1.1.2
@@ -6566,11 +6570,14 @@ snapshots:
       '@protobufjs/eventemitter': 1.1.1
       '@protobufjs/fetch': 1.1.1
       '@protobufjs/float': 1.0.2
-      '@protobufjs/inquire': 1.1.2
       '@protobufjs/path': 1.1.2
       '@protobufjs/pool': 1.1.0
       '@protobufjs/utf8': 1.1.1
       '@types/node': 20.19.42
+      long: 5.3.2
+
+  protobufjs@8.7.2:
+    dependencies:
       long: 5.3.2
 
   proxy-from-env@2.1.0: {}
@@ -7071,12 +7078,12 @@ snapshots:
   ts-proto-descriptors@1.16.0:
     dependencies:
       long: 5.3.2
-      protobufjs: 7.6.2
+      protobufjs: 7.6.5
 
   ts-proto@1.181.2:
     dependencies:
       case-anything: 2.1.13
-      protobufjs: 7.6.2
+      protobufjs: 7.6.5
       ts-poet: 6.12.0
       ts-proto-descriptors: 1.16.0
 
