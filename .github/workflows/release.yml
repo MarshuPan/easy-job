@@ -73,6 +73,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          # 不传 name 的话建出来的是无标题 Release，GitHub 会把标题位留空、
+          # 只剩一个 tag 链接，看起来跟「只打了个 tag」没区别。
+          name: ${{ github.ref_name }}
           prerelease: ${{ steps.version.outputs.prerelease }}
           files: |
             .output/*-chrome.zip
