@@ -2,7 +2,7 @@ name: Release
 
 # 打 tag 才发布。tag 名要和 package.json 的 version 对得上（例如 v1.0.0 对 1.0.0），
 # 对不上就直接失败——Release 页面上的版本号和用户装到的版本号不一致，
-# 出问题时没人说得清对方用的是哪一版。
+# 出问题时没人说得清对方用的是哪一版。v1.0.0-rc1 这类预发布后缀允许存在。
 on:
   push:
     tags: ['v*']
@@ -25,13 +25,22 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # 预发布后缀是允许的：v1.1.4-rc1 对 1.1.4 算通过，用来在不动正式版本号的
+      # 前提下验证这条流水线本身。带后缀的会被标成 prerelease，不占 Latest。
       - name: Check tag matches package version
+        id: version
         run: |
           TAG="${GITHUB_REF_NAME#v}"
+          BASE="${TAG%%-*}"
           PKG="$(node -p "require('./package.json').version")"
-          if [ "$TAG" != "$PKG" ]; then
+          if [ "$BASE" != "$PKG" ]; then
             echo "tag $GITHUB_REF_NAME does not match package.json version $PKG"
             exit 1
+          fi
+          if [ "$TAG" != "$BASE" ]; then
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
           fi
 
       # 发布前跑一遍完整门禁。构建能过不代表行为没坏，
@@ -64,6 +73,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          prerelease: ${{ steps.version.outputs.prerelease }}
           files: |
             .output/*-chrome.zip
             .output/*-edge.zip
