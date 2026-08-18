@@ -28,6 +28,7 @@ import { AgentButton, AgentMessage } from '@/ui/instrument'
 import { delay, getCurDay } from '@/utils'
 import { createAccountStorageKey } from '@/utils/accountStorage'
 import { acquireBossAction } from '@/utils/actionGateStore'
+import { startBackgroundKeepAlive } from '@/utils/backgroundKeepAlive'
 import {
   ExtensionRuntimeHealthError,
   getExtensionRuntimeHealthDiagnostic,
@@ -479,12 +480,31 @@ onMounted(() => {
   })()
 })
 
+/**
+ * 投递运行期间保住 background service worker。
+ *
+ * 长等待（限速、AI 请求、翻页）期间没有任何 RPC，worker 空闲 30 秒就被回收，
+ * 之后写检查点会以心跳超时失败，岗位状态落不了盘。详见 utils/backgroundKeepAlive.ts。
+ */
+let backgroundKeepAlive: { stop: () => void } | undefined
+
+function beginBackgroundKeepAlive() {
+  backgroundKeepAlive?.stop()
+  backgroundKeepAlive = startBackgroundKeepAlive(() => counter.backgroundTest('success'))
+}
+
+function endBackgroundKeepAlive() {
+  backgroundKeepAlive?.stop()
+  backgroundKeepAlive = undefined
+}
+
 onUnmounted(() => {
   window.removeEventListener('agent-delivery:job-runtime-ready', handleRuntimeReady)
   if (scheduledDeliveryResumeTimer != null) {
     window.clearTimeout(scheduledDeliveryResumeTimer)
     scheduledDeliveryResumeTimer = undefined
   }
+  endBackgroundKeepAlive()
   stopStatisticsRefresh()
 })
 
@@ -774,6 +794,7 @@ async function pauseDeliver() {
   if (accountUid == null || taskId == null) return
   const workerId = await getDeliveryWorkerId()
   const result = await counter.deliveryTaskPause({ uid: accountUid, runId: taskId, workerId })
+  endBackgroundKeepAlive()
   setDurableDeliveryTask(result.task)
   if (!result.accepted) {
     logBatchDiagnostic('暂停投递未被接受', { taskId, conflict: result.conflict ?? null })
@@ -792,6 +813,7 @@ async function resumeFromPause() {
   // claim 把暂停中的任务重新置为 running 并取回租约；拿不到就说明别的标签页已经接管。
   const result = await counter.deliveryTaskResume({ uid: accountUid, runId: taskId, workerId })
   setDurableDeliveryTask(result.task)
+  if (result.accepted) beginBackgroundKeepAlive()
   if (!result.accepted) {
     logBatchDiagnostic('继续投递未被接受', { taskId, conflict: result.conflict ?? null })
     AgentMessage.warning(
@@ -898,6 +920,7 @@ async function startPersistentDeliveryTask(
       result.conflict === 'active-run' ? '同一账号已有投递任务在运行' : '投递任务后台登记失败'
     throw new Error(message)
   }
+  beginBackgroundKeepAlive()
 }
 
 async function claimPersistentDeliveryTask(task: DeliveryTask) {
@@ -932,6 +955,9 @@ async function claimPersistentDeliveryTask(task: DeliveryTask) {
   if (!result.accepted) {
     throw new Error('当前投递任务已停止或不存在')
   }
+  // 页面重载后的自动恢复走的是 claim 而不是 start（任务还在，只是换了个执行者），
+  // 保活必须挂在这里——否则恰恰是重载之后的那一段没有保活，而那正是问题高发段。
+  beginBackgroundKeepAlive()
   return true
 }
 
@@ -968,6 +994,7 @@ async function releasePersistentDeliveryTask(task: DeliveryTask) {
     runId: task.id,
     workerId,
   })
+  endBackgroundKeepAlive()
   setDurableDeliveryTask(result.task)
 }
 
@@ -986,6 +1013,7 @@ async function terminatePersistentDeliveryTask(
     reason,
     message,
   })
+  endBackgroundKeepAlive()
   setDurableDeliveryTask(result.task)
 }
 
