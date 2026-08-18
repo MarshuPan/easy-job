@@ -220,6 +220,29 @@ function restoreLogDataListData(record: log) {
   return record
 }
 
+/** 投递请求尚未发出的阶段。此后的阶段都由 `ctx.publish` 推导而来。 */
+const prePublishStages: ReadonlySet<string> = new Set<DeliveryStage>([
+  '待处理',
+  'JD筛选中',
+  '打招呼语生成中',
+])
+
+/**
+ * 判断中断时是否已经发出过 friend/add 请求。
+ *
+ * 三个信号必须一致才认定「没发出」，任一存疑都按发出过处理：误判成没发会导致重复投递，
+ * 白白吃掉沟通额度，而误判成发过只是多让用户核对一次。
+ */
+function hasAttemptedPublish(ctx: NonNullable<log['data']>, interruptedStage: string) {
+  if (ctx.publish != null) return true
+  // 阶段名是持久化的，且 `正在建立沟通` 及之后都由 publish 推导，比 trace 可靠——
+  // trace 只在内存里累积，页面被重载时未必来得及落盘。
+  if (!prePublishStages.has(interruptedStage)) return true
+  const trace = ctx.trace
+  if (!Array.isArray(trace)) return false
+  return trace.some((item) => item?.stage === '投递接口')
+}
+
 function finalizeInterruptedDelivery(record: log) {
   const ctx = record.data
   if (!ctx) return record
@@ -254,6 +277,34 @@ function finalizeInterruptedDelivery(record: log) {
       if (!job?.status) continue
       job.status.status = 'warn'
       job.status.msg = message
+    }
+    return record
+  }
+
+  // 中断发生在发出投递请求之前时，结果并非「不确定」而是「确定没投」。
+  //
+  // 最常见的情形是卡在动作闸门限速——日志里出现过等待 158 秒、186 秒的记录，
+  // 而 BOSS 的安全校验会在这期间重载页面，content script 连同未写完的检查点一起没了。
+  // 这类记录的 trace 停在「动作闸门」，publish 字段根本不存在，却被一律标成
+  // 「结果不确定，请人工核对」，把一件本可自动重试的事推给用户去 BOSS 上翻聊天列表。
+  //
+  // 判据取 trace 里有没有出现过「投递接口」：那是唯一发出 friend/add 请求的阶段，
+  // 没有它就不可能建立沟通。请求发出之后被中断的仍然保持原有的保守处理。
+  if (!hasAttemptedPublish(ctx, interruptedStage)) {
+    const pendingMessage = '上次运行中断于投递请求之前，未发出投递，可重新处理'
+    record.state = 'warning'
+    record.state_name = '待重试'
+    record.message = pendingMessage
+    ctx.failureStage = interruptedStage
+    ctx.failureReason = pendingMessage
+    ctx.retryable = true
+    ctx.state = '待重试'
+    ctx.err = pendingMessage
+    ctx.deliveryStage = '投递失败'
+    for (const job of [record.job, ctx.listData]) {
+      if (!job?.status) continue
+      job.status.status = 'warn'
+      job.status.msg = pendingMessage
     }
     return record
   }

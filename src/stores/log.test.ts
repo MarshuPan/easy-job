@@ -323,6 +323,108 @@ describe('useLog persistence', () => {
     await vi.waitFor(() => expect(storageRmMock).toHaveBeenCalled())
   })
 
+  // 真机日志里的场景：岗位卡在「动作闸门：详情请求限速，等待 158 秒」时被 BOSS 的
+  // 安全校验重载了页面。它一次投递请求都没发出过，却被标成「结果不确定」要人工核对。
+  it('finalizes a pre-publish interruption as retryable instead of unknown', async () => {
+    const job = makeJob() as any
+    storageGetMock.mockResolvedValueOnce([
+      {
+        createdAt: 1000,
+        data: {
+          deliveryStage: 'JD筛选中',
+          listData: job,
+          retryable: true,
+          trace: [
+            { at: 1, stage: '流程', status: 'info', message: '开始处理第 6/9 个岗位' },
+            { at: 2, stage: '动作闸门', status: 'info', message: '详情请求限速，等待 158 秒' },
+          ],
+        },
+        job,
+        state: 'info',
+        state_name: 'JD筛选中',
+        title: job.jobName,
+      },
+    ])
+    vi.resetModules()
+    const { useLog: useHydratedLog } = await import('./log')
+    const store = useHydratedLog()
+
+    await store.hydrate()
+
+    expect(store.data.value[0]).toMatchObject({
+      state_name: '待重试',
+      data: { retryable: true, state: '待重试' },
+    })
+    store.clear()
+    await vi.waitFor(() => expect(storageRmMock).toHaveBeenCalled())
+  })
+
+  // 反向：trace 里出现过「投递接口」就说明 friend/add 发出去了，哪怕阶段名还停在
+  // JD筛选中也必须保守处理——误判成没发会导致重复投递，白吃沟通额度。
+  it('keeps a publish-attempted interruption unknown even at a pre-publish stage', async () => {
+    const job = makeJob() as any
+    storageGetMock.mockResolvedValueOnce([
+      {
+        createdAt: 1000,
+        data: {
+          deliveryStage: 'JD筛选中',
+          listData: job,
+          retryable: true,
+          trace: [{ at: 1, stage: '投递接口', status: 'info', message: '第 1 次发送投递请求' }],
+        },
+        job,
+        state: 'info',
+        state_name: 'JD筛选中',
+        title: job.jobName,
+      },
+    ])
+    vi.resetModules()
+    const { useLog: useHydratedLog } = await import('./log')
+    const store = useHydratedLog()
+
+    await store.hydrate()
+
+    expect(store.data.value[0]).toMatchObject({
+      state_name: '结果不确定',
+      data: { retryable: false, state: '结果未知' },
+    })
+    store.clear()
+    await vi.waitFor(() => expect(storageRmMock).toHaveBeenCalled())
+  })
+
+  // publish 已写入但 deliveryStage 还没来得及更新就被持久化——两次写入之间存在窗口。
+  // 这时阶段名还停在 JD筛选中，trace 也可能没落盘，publish 字段是唯一的证据。
+  it('trusts the publish field when the stage write lost the race', async () => {
+    const job = makeJob() as any
+    storageGetMock.mockResolvedValueOnce([
+      {
+        createdAt: 1000,
+        data: {
+          deliveryStage: 'JD筛选中',
+          listData: job,
+          retryable: true,
+          publish: { ok: false, attempts: 1, phase: 'sent' },
+        },
+        job,
+        state: 'info',
+        state_name: 'JD筛选中',
+        title: job.jobName,
+      },
+    ])
+    vi.resetModules()
+    const { useLog: useHydratedLog } = await import('./log')
+    const store = useHydratedLog()
+
+    await store.hydrate()
+
+    expect(store.data.value[0]).toMatchObject({
+      state_name: '结果不确定',
+      data: { retryable: false, state: '结果未知' },
+    })
+    store.clear()
+    await vi.waitFor(() => expect(storageRmMock).toHaveBeenCalled())
+  })
+
   it('restores a confirmed communication as a greeting-only retry', async () => {
     const job = makeJob() as any
     storageGetMock.mockResolvedValueOnce([
