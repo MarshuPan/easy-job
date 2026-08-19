@@ -1050,7 +1050,13 @@ async function getJobDetail(
       securityId: item.securityId,
     })
     if (res.data.code !== 0 || !res.data.zpData) {
-      throw new Error(`详情接口返回异常：${res.data.message || res.data.code}`)
+      // code 和 message 都要留下。原来是 `message || code`——message 有值时 code 就丢了，
+      // 于是日志里连着三轮全是同一句「您的环境存在异常」，看不出这到底是哪种条件：
+      // 会话额度用尽、Zp_token 失效、还是 lid 过期，BOSS 用的是不同的码，而处理方式
+      // 完全不同（额度只能接受，token 和 lid 是可修的）。
+      const code = res.data.code
+      const detail = res.data.message ? `${res.data.message}（code ${code}）` : `code ${code}`
+      throw new Error(`详情接口返回异常：${detail}`)
     }
     return res.data.zpData
   } catch (error) {

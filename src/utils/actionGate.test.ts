@@ -160,18 +160,23 @@ describe('the shipped defaults', () => {
     }
   })
 
-  it('holds the detail requests to what BOSS actually accepted', () => {
-    // 真机两轮都在第 6、第 7 次详情请求上被 BOSS 拒（「您的环境存在异常」），而第二轮
-    // 慢了一倍也只多撑一次。所以这里限的是次数，不是速率。
-    //
-    // 这条必须扛得住会话曲线：开工阶段补充速率是 1.8 倍，恰恰是最容易撞上去的时候。
-    // 桶单独是拦不住的——真机那轮桶容量 6，从头到尾一次都没限速过。
+  it('paces detail with the bucket alone, and no fixed ceiling', () => {
+    // 这里原来有一条 5 次 / 5 分钟的硬顶，赌的是「您的环境存在异常」按窗口滚动。
+    // 第三轮真机证伪了：第 12 次是硬顶算出来等了 182 秒之后才发的，窗口从满降到不满、
+    // 账号整整安静 3.6 分钟，照样被拒；而这轮撑了 11 次、上轮 14 次，两轮节奏几乎相同
+    // （1.08 与 1.10 次/分钟）。慢跑买不到次数，只让同一件事在页面上多暴露 10 分钟。
     let history: ActionEvent[] = []
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       expect(waitMsFor(history, 'detail', now + i * 1000, defaultGateRules)).toBe(0)
       history = [...history, { kind: 'detail', at: now + i * 1000 }]
     }
-    expect(waitMsFor(history, 'detail', now + 5000, defaultGateRules)).toBeGreaterThan(0)
+
+    // 桶还在：连发满一整桶之后要等补充，节奏仍然像人，不会变成机枪。
+    expect(waitMsFor(history, 'detail', now + 6000, defaultGateRules)).toBeGreaterThan(0)
+
+    // 但硬顶不能回来：等桶补上之后就该放行。如果这里又开始等，说明有人在明明还有令牌
+    // 的情况下按「这个窗口内已经发过几次」拦人——那正是被证伪的那条路。
+    expect(waitMsFor(history, 'detail', now + 3 * minute, defaultGateRules)).toBe(0)
   })
 
   it('does not stall a run that comes back after a break', () => {

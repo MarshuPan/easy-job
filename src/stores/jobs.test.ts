@@ -822,6 +822,48 @@ describe('JobList', () => {
     await expect(list.get('job-page-1')?.getCard()).rejects.toThrow('detail api failed')
     expect(clickJobCardAction).not.toHaveBeenCalled()
   })
+
+  // BOSS 用不同的 code 表示不同的拒绝原因，而处理方式完全不同：会话额度只能接受，
+  // Zp_token 失效和 lid 过期是可修的。原来这里写的是 `message || code`——message 有值
+  // 时 code 就被丢掉，于是连着三轮真机日志里全是同一句「您的环境存在异常.」，
+  // 分不出是哪一种。两个都必须留下。
+  // 走的是「岗位已经不在当前页」这条路，跟上面那个用例一样——否则失败会退回点卡片，
+  // 一等就是 60 秒，测的就不是接口返回的这句话了。
+  async function pooledJobFromAnEarlierPage(id: string) {
+    const list = new JobList()
+    list.setDeliveryPoolCaptureEnabled(true)
+    vueJobList.push({
+      brandName: '第一页公司',
+      encryptJobId: id,
+      jobName: '第一页岗位',
+      lid: `lid-${id}`,
+      securityId: `security-${id}`,
+    })
+    await list.initJobList({ useCache: { value: false } } as any)
+    vueJobList.length = 0
+    await list.initJobList({ useCache: { value: false } } as any)
+    return list
+  }
+
+  it('records the BOSS error code alongside the message', async () => {
+    const list = await pooledJobFromAnEarlierPage('job-coded')
+    requestDetailMock.mockResolvedValueOnce({
+      data: { code: 37, message: '您的环境存在异常.', zpData: null },
+    })
+
+    const card = list.get('job-coded')?.getCard()
+    await expect(card).rejects.toThrow(/37/)
+    // 两个都要在，不是二选一。
+    await expect(card).rejects.toThrow(/您的环境存在异常/)
+  })
+
+  it('still says something useful when BOSS sends a code with no message', async () => {
+    const list = await pooledJobFromAnEarlierPage('job-bare')
+    requestDetailMock.mockResolvedValueOnce({ data: { code: 500, message: '', zpData: null } })
+
+    // 不能退化成「详情接口返回异常：」这种后面什么都没有的空句子。
+    await expect(list.get('job-bare')?.getCard()).rejects.toThrow(/500/)
+  })
 })
 
 const poolIds = (list: JobList, source: 'group' | 'search') =>

@@ -484,8 +484,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         if (e instanceof JobUnavailableError || e instanceof JobDataIncompleteError) {
           jobWasUnevaluable = true
           consecutiveUnevaluableJobs += 1
-          // 风控拦截不等三振：BOSS 已经明确说了是账号被标记，不是这个岗位的问题，而且
-          // 两轮真机数据里同一次运行内从未恢复过。继续敲门只是在被标记的状态下多暴露两次。
+          // 详情接口拒绝服务时不等三振：等待已被证伪——安静 3.6 分钟、窗口降到不满，
+          // 第 12 次照样被拒；慢跑也没换来更多次数。继续打救不回这一轮，只是白耗。
           const riskControlled = isRiskControlMessage(e)
           if (riskControlled || consecutiveUnevaluableJobs >= unevaluableJobLimit) {
             // 停下来，但不对原因下结论。连续失败说明问题不在单个岗位上——投递池里的岗位是
@@ -494,8 +494,10 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             //
             // 不走风控退避那条路：那会扣当日额度、当天反复命中还会直接收工，代价不小，
             // 不该压在一个还没查清的原因上。先停下、把话说清楚，比自动决定重要。
+            // 只陈述发生了什么，不替用户下「账号出事了」的结论——真机上这时候浏览器
+            // 里一切正常。具体是额度、token 还是 lid，看日志里的 code。
             const msg = riskControlled
-              ? `已被平台风控拦截，立即暂停：${e.message}`
+              ? `详情接口拒绝服务，已暂停：${e.message}`
               : `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
             shouldCachePipeline = false
             shouldCountTotal = false
@@ -503,7 +505,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             addLogTrace(ctx, '流程', 'danger', msg)
             AgentMessage.error(
               riskControlled
-                ? '已被平台风控拦截，已暂停投递，建议今日不要继续'
+                ? '详情接口拒绝服务，已暂停投递，请查看运行日志'
                 : '连续多个岗位无法评估，已暂停投递，请查看运行日志',
             )
             common.deliverStop = true
