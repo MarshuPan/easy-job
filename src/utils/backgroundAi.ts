@@ -236,6 +236,10 @@ function parseUsage(res: any): messageReps['usage'] {
     reasoning_tokens:
       res?.usage?.output_tokens_details?.reasoning_tokens ??
       res?.usage?.completion_tokens_details?.reasoning_tokens,
+    // Chat Completions 放在 prompt_tokens_details，Responses 放在 input_tokens_details。
+    cached_tokens:
+      res?.usage?.prompt_tokens_details?.cached_tokens ??
+      res?.usage?.input_tokens_details?.cached_tokens,
     total_tokens: res?.usage?.total_tokens,
   }
 }
@@ -1048,6 +1052,8 @@ function parseConfiguredResult(
       usage: {
         input_tokens: json?.usage?.input_tokens,
         output_tokens: json?.usage?.output_tokens,
+        // Anthropic 分读取和写入两个数，这里只关心读到了多少。
+        cached_tokens: json?.usage?.cache_read_input_tokens,
         total_tokens:
           typeof json?.usage?.input_tokens === 'number' &&
           typeof json?.usage?.output_tokens === 'number'

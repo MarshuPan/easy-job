@@ -36,6 +36,7 @@ import { acquireBossAction, getCurrentPaceMultiplier } from '@/utils/actionGateS
 import { sampleHumanDelayMs } from '@/utils/humanPace'
 import { logger } from '@/utils/logger'
 import { getProviderHeartbeatDiagnostic, isProviderHeartbeatError } from '@/utils/providerHealth'
+import { isRiskControlMessage } from '@/utils/riskControl'
 import {
   isStorageQuotaError,
   shouldReportStorageQuota,
@@ -483,19 +484,28 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         if (e instanceof JobUnavailableError || e instanceof JobDataIncompleteError) {
           jobWasUnevaluable = true
           consecutiveUnevaluableJobs += 1
-          if (consecutiveUnevaluableJobs >= unevaluableJobLimit) {
+          // 风控拦截不等三振：BOSS 已经明确说了是账号被标记，不是这个岗位的问题，而且
+          // 两轮真机数据里同一次运行内从未恢复过。继续敲门只是在被标记的状态下多暴露两次。
+          const riskControlled = isRiskControlMessage(e)
+          if (riskControlled || consecutiveUnevaluableJobs >= unevaluableJobLimit) {
             // 停下来，但不对原因下结论。连续失败说明问题不在单个岗位上——投递池里的岗位是
             // 几分钟前刚抓的，连着三个恰好同时下线讲不通。至于是被限制、登录态失效还是
             // 别的，日志里现在带着真实报错，看了才知道。
             //
             // 不走风控退避那条路：那会扣当日额度、当天反复命中还会直接收工，代价不小，
             // 不该压在一个还没查清的原因上。先停下、把话说清楚，比自动决定重要。
-            const msg = `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
+            const msg = riskControlled
+              ? `已被平台风控拦截，立即暂停：${e.message}`
+              : `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
             shouldCachePipeline = false
             shouldCountTotal = false
             data.status.setStatus('wait', '等待中')
             addLogTrace(ctx, '流程', 'danger', msg)
-            AgentMessage.error('连续多个岗位无法评估，已暂停投递，请查看运行日志')
+            AgentMessage.error(
+              riskControlled
+                ? '已被平台风控拦截，已暂停投递，建议今日不要继续'
+                : '连续多个岗位无法评估，已暂停投递，请查看运行日志',
+            )
             common.deliverStop = true
             terminalError.value = msg
             return 'terminalError'

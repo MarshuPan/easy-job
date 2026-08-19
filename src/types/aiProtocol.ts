@@ -28,5 +28,15 @@ export interface messageReps<T = string> {
      * 完全不同：前者要缩小单次判断的范围，后者要减少要求模型重新输出的内容。
      */
     reasoning_tokens?: number
+    /**
+     * 命中提示词缓存的输入 token，已包含在 input_tokens 里。
+     *
+     * 匹配提示词里约 12000 token 的前缀（系统契约 + 用户 Prompt + 简历证据）每次请求完全
+     * 相同，只有末尾的岗位数据在变。这部分该不该按全价计费，取决于服务商有没有做前缀缓存，
+     * 而走中转时更不确定——中转是否透传缓存无从得知。
+     *
+     * 不记这个数就只能看着 inputTokens 每次一万二，分不清是真花了还是走了缓存。
+     */
+    cached_tokens?: number
   }
 }

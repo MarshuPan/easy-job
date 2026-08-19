@@ -160,6 +160,8 @@ function eventDetail(event: AiRuntimeDiagnosticEvent) {
     outputTokens: event.usage?.output_tokens,
     // 推理 token 含在 outputTokens 里。两者的差值才是真正复述出来的内容。
     reasoningTokens: event.usage?.reasoning_tokens,
+    // 缓存命中数。服务商不返回时为 undefined——那本身也是信息：说明这条链路上无从判断。
+    cachedTokens: event.usage?.cached_tokens,
     promptChars: event.diagnostics.promptChars,
     requestBodyChars: event.diagnostics.requestBodyChars,
     attempts: event.diagnostics.attempts.map((attempt) => ({

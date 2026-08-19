@@ -485,6 +485,41 @@ describe('useDeliver job list flow', () => {
     expect(result).toBe('terminalError')
   })
 
+  it('stops on the first risk-control block instead of waiting for three strikes', async () => {
+    // 「您的环境存在异常」是 BOSS 明确说账号被标记，不是这个岗位的问题。两轮真机数据里
+    // 同一次运行内从未恢复过，继续敲门只是在被标记的状态下又暴露两次。
+    jobListRef.value = [createJob('blocked-1'), createJob('blocked-2'), createJob('blocked-3')]
+    const before = vi.fn(async (_args: any, ctx: any) => {
+      ctx.detailAttempted = true
+      throw new JobUnavailableError(
+        '取岗位详情失败，已跳过该岗位：详情接口返回异常：您的环境存在异常.',
+      )
+    })
+    createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
+
+    const result = await useDeliver().jobListHandle()
+
+    expect(result).toBe('terminalError')
+    // 只碰了第一个岗位——第二、三个连详情请求都没发。
+    expect(before).toHaveBeenCalledTimes(1)
+  })
+
+  it('still gives ordinary detail failures three chances before stopping', async () => {
+    // 反向守住：普通的取详情失败不能被风控这条短路带走。单个岗位下线是常事，
+    // 一次就收工会把整轮投递废掉。
+    jobListRef.value = [createJob('gone-1'), createJob('ok-1')]
+    const before = vi.fn(async (_args: any, ctx: any) => {
+      ctx.detailAttempted = true
+      throw new JobUnavailableError('取岗位详情失败，已跳过该岗位：详情接口返回异常：职位已关闭')
+    })
+    createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
+
+    const result = await useDeliver().jobListHandle()
+
+    expect(result).not.toBe('terminalError')
+    expect(before).toHaveBeenCalledTimes(2)
+  })
+
   it('paces a job whose detail request failed, not just the ones that succeeded', async () => {
     // 真机上详情开始连续失败之后，每个失败岗位都是零等待——6 个请求在 565 毫秒内打空了
     // 令牌桶。请求发出去了就该计时间，拿没拿到结果是 BOSS 那边的事，不改变我们发过请求。
