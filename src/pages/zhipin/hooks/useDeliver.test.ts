@@ -168,6 +168,7 @@ import {
   AIProviderError,
   GreetError,
   JobTitleError,
+  JobCredentialExpiredError,
   JobDataIncompleteError,
   JobUnavailableError,
   RateLimitError,
@@ -485,28 +486,52 @@ describe('useDeliver job list flow', () => {
     expect(result).toBe('terminalError')
   })
 
-  it('stops on the first risk-control block instead of waiting for three strikes', async () => {
-    // 「您的环境存在异常」是 BOSS 明确说账号被标记，不是这个岗位的问题。两轮真机数据里
-    // 同一次运行内从未恢复过，继续敲门只是在被标记的状态下又暴露两次。
-    jobListRef.value = [createJob('blocked-1'), createJob('blocked-2'), createJob('blocked-3')]
+  // 这个用例原来断言的是相反的行为：看到「您的环境存在异常」就立刻收工。那是 1.3.0 把它
+  // 误判成账号风控留下的，也正是用户每投十几个就得手动点一次继续的原因——真实原因是列表页
+  // 凭据放太久过期了（现在在发请求之前就拦掉，见 useApplying/index.ts），跟账号无关：
+  // 手动继续之所以每次都好使，就是因为那会重抓列表页，凭据是新的。
+  it('does not end the run over a single environment-anomaly reply', async () => {
+    jobListRef.value = [createJob('blocked-1'), createJob('blocked-2')]
     const before = vi.fn(async (_args: any, ctx: any) => {
       ctx.detailAttempted = true
       throw new JobUnavailableError(
-        '取岗位详情失败，已跳过该岗位：详情接口返回异常：您的环境存在异常.',
+        '取岗位详情失败，已跳过该岗位：详情接口返回异常：您的环境存在异常.（code 37）',
       )
     })
     createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
 
     const result = await useDeliver().jobListHandle()
 
-    expect(result).toBe('terminalError')
-    // 只碰了第一个岗位——第二、三个连详情请求都没发。
-    expect(before).toHaveBeenCalledTimes(1)
+    expect(result).not.toBe('terminalError')
+    // 第二个岗位照常处理，不再被第一个的报错连坐。
+    expect(before).toHaveBeenCalledTimes(2)
+  })
+
+  // 用户的原话：「不可能说现在每投十多个，我就得手动一次，不合理」。一批岗位在池子里
+  // 放旧了是常态（真机上整批都是 23–24 分钟），它们会一个接一个地过期——这必须是「跳过」，
+  // 不能凑成三振把整轮停掉，否则就又回到手动点继续的老路。
+  it('keeps going when a whole batch of pooled jobs has expired credentials', async () => {
+    jobListRef.value = [
+      createJob('stale-1'),
+      createJob('stale-2'),
+      createJob('stale-3'),
+      createJob('stale-4'),
+    ]
+    const before = vi.fn(async () => {
+      throw new JobCredentialExpiredError(
+        '岗位凭据已放置 31 分钟，超过 25 分钟不再可用，跳过该岗位',
+      )
+    })
+    createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
+
+    const result = await useDeliver().jobListHandle()
+
+    expect(result).not.toBe('terminalError')
+    expect(before).toHaveBeenCalledTimes(4)
   })
 
   it('still gives ordinary detail failures three chances before stopping', async () => {
-    // 反向守住：普通的取详情失败不能被风控这条短路带走。单个岗位下线是常事，
-    // 一次就收工会把整轮投递废掉。
+    // 单个岗位下线是常事，一次就收工会把整轮投递废掉。
     jobListRef.value = [createJob('gone-1'), createJob('ok-1')]
     const before = vi.fn(async (_args: any, ctx: any) => {
       ctx.detailAttempted = true

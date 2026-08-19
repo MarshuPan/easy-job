@@ -36,7 +36,6 @@ import { acquireBossAction, getCurrentPaceMultiplier } from '@/utils/actionGateS
 import { sampleHumanDelayMs } from '@/utils/humanPace'
 import { logger } from '@/utils/logger'
 import { getProviderHeartbeatDiagnostic, isProviderHeartbeatError } from '@/utils/providerHealth'
-import { isRiskControlMessage } from '@/utils/riskControl'
 import {
   isStorageQuotaError,
   shouldReportStorageQuota,
@@ -484,30 +483,22 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         if (e instanceof JobUnavailableError || e instanceof JobDataIncompleteError) {
           jobWasUnevaluable = true
           consecutiveUnevaluableJobs += 1
-          // 详情接口拒绝服务时不等三振：等待已被证伪——安静 3.6 分钟、窗口降到不满，
-          // 第 12 次照样被拒；慢跑也没换来更多次数。继续打救不回这一轮，只是白耗。
-          const riskControlled = isRiskControlMessage(e)
-          if (riskControlled || consecutiveUnevaluableJobs >= unevaluableJobLimit) {
+          // 这里曾经有一条「看到『您的环境存在异常』就立刻收工」的短路，是 1.3.0 把它误判成
+          // 账号风控加的。那条短路正是用户每投十几个就得手动点一次继续的原因：一个放旧了的
+          // 岗位，判了整轮的死刑。真正的原因是凭据过期，现在在发请求之前就拦掉了
+          // （JobCredentialExpiredError，算过滤不算失败）。
+          //
+          // 只留三振：如果凭据没过期还连着三个评估不了，说明上面的判断不成立，那时候停才对。
+          if (consecutiveUnevaluableJobs >= unevaluableJobLimit) {
             // 停下来，但不对原因下结论。连续失败说明问题不在单个岗位上——投递池里的岗位是
             // 几分钟前刚抓的，连着三个恰好同时下线讲不通。至于是被限制、登录态失效还是
-            // 别的，日志里现在带着真实报错，看了才知道。
-            //
-            // 不走风控退避那条路：那会扣当日额度、当天反复命中还会直接收工，代价不小，
-            // 不该压在一个还没查清的原因上。先停下、把话说清楚，比自动决定重要。
-            // 只陈述发生了什么，不替用户下「账号出事了」的结论——真机上这时候浏览器
-            // 里一切正常。具体是额度、token 还是 lid，看日志里的 code。
-            const msg = riskControlled
-              ? `详情接口拒绝服务，已暂停：${e.message}`
-              : `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
+            // 别的，日志里现在带着真实报错和 code，看了才知道。
+            const msg = `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
             shouldCachePipeline = false
             shouldCountTotal = false
             data.status.setStatus('wait', '等待中')
             addLogTrace(ctx, '流程', 'danger', msg)
-            AgentMessage.error(
-              riskControlled
-                ? '详情接口拒绝服务，已暂停投递，请查看运行日志'
-                : '连续多个岗位无法评估，已暂停投递，请查看运行日志',
-            )
+            AgentMessage.error('连续多个岗位无法评估，已暂停投递，请查看运行日志')
             common.deliverStop = true
             terminalError.value = msg
             return 'terminalError'

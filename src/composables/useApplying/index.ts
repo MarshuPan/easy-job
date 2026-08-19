@@ -4,6 +4,7 @@ import type { JobStatus } from '@/stores/jobs'
 import { addLogTrace } from '@/stores/log'
 import { useUser } from '@/stores/user'
 import {
+  JobCredentialExpiredError,
   JobDataIncompleteError,
   JobUnavailableError,
   RetryablePipelineError,
@@ -78,6 +79,17 @@ function compilePipeline(
   return result
 }
 
+/**
+ * 列表页凭据（securityId / lid）还能用多久。
+ *
+ * 真机分界：23.0–24.0 分钟的请求全部成功，28.1 分钟那一个被拒。25 取的是这个区间的
+ * 下沿——刚好保住已经在跑的那一批，又能拦住被闸门等老了的那一个。
+ *
+ * 只有一次跨越，所以这是估计不是实测边界。真要收紧，看日志里 code：过期和额度用尽
+ * BOSS 用的码不一样（jobs.ts 现在两个都记）。
+ */
+const JOB_CREDENTIAL_MAX_AGE_MINUTES = 25
+
 export async function createHandle(runtimeFormData?: FormData): Promise<{
   before: Handler[]
   after: Handler[]
@@ -94,11 +106,7 @@ export async function createHandle(runtimeFormData?: FormData): Promise<{
       // Card卡片信息获取
       async (args, ctx) => {
         const fetchedAt = Number(args.data.fetchedAt) || Date.now()
-        const ageMinutes = Math.max(0, Math.round((Date.now() - fetchedAt) / 60_000))
-        addLogTrace(ctx, '岗位时效', 'info', '投递前重新校验岗位详情与投递凭据', {
-          ageMinutes,
-          stale: ageMinutes >= 30,
-        })
+        const ageMinutesAt = (at: number) => Math.max(0, (at - fetchedAt) / 60_000)
         try {
           // 详情请求要过闸门。这是整条链路上最密集的一类请求：粗筛放行的每个岗位都会打一次，
           // 而其中大部分随后就被过滤掉了，用户看不到任何投递，BOSS 那边却看到一串请求。
@@ -112,6 +120,22 @@ export async function createHandle(runtimeFormData?: FormData): Promise<{
                 `详情请求限速，等待 ${Math.round(waitMs / 1000)} 秒`,
               ),
           })
+          // 时效必须在闸门之后算。原来是在前面算完就记进日志，然后这里一等就是几分钟——
+          // 真机上那次等了 222 秒，凭据从 24.3 分钟被推到 28.1 分钟，然后被 BOSS 拒掉。
+          // 也就是说限速本身把凭据等过了期：为了「慢一点更安全」付的钱，买来的是失败。
+          const ageMinutes = ageMinutesAt(Date.now())
+          const expired = ageMinutes >= JOB_CREDENTIAL_MAX_AGE_MINUTES
+          addLogTrace(ctx, '岗位时效', 'info', '投递前重新校验岗位详情与投递凭据', {
+            ageMinutes: Math.round(ageMinutes),
+            expired,
+          })
+          // 过期就别发了。发出去必然是「您的环境存在异常.」，白占一个闸门令牌，还会被
+          // 上层当成岗位失效去凑三振。原来这个判断只写进日志，没人读——这是第二处。
+          if (expired) {
+            throw new JobCredentialExpiredError(
+              `岗位凭据已放置 ${Math.round(ageMinutes)} 分钟，超过 ${JOB_CREDENTIAL_MAX_AGE_MINUTES} 分钟不再可用，跳过该岗位`,
+            )
+          }
           // 请求发出去就要记账，不管拿没拿到结果。节奏是按「BOSS 那边看到了什么」算的，
           // 失败的详情请求在 BOSS 那边和成功的一样是一次请求——真机上就是这样：详情开始
           // 连续失败之后，每个岗位都零等待往下走，半秒钟打空了整个令牌桶。
@@ -121,12 +145,17 @@ export async function createHandle(runtimeFormData?: FormData): Promise<{
           }
           ctx.detailFetched = true
         } catch (e) {
-          addLogTrace(
-            ctx,
-            '职位详情',
-            e instanceof JobUnavailableError ? 'warning' : 'danger',
-            `职位详情获取失败：${errorHandle(e)}`,
-          )
+          if (!(e instanceof JobCredentialExpiredError)) {
+            addLogTrace(
+              ctx,
+              '职位详情',
+              e instanceof JobUnavailableError ? 'warning' : 'danger',
+              `职位详情获取失败：${errorHandle(e)}`,
+            )
+          }
+          if (e instanceof JobCredentialExpiredError) {
+            throw e
+          }
           if (e instanceof JobUnavailableError) {
             throw e
           }

@@ -66,6 +66,27 @@ export class JobAddressError extends AgentDeliveryError {
   }
 }
 
+/**
+ * 岗位的 securityId / lid 已经放太久，BOSS 不再认。
+ *
+ * 这两个值是抓列表页那一刻由 BOSS 发的，有时效。过期之后 job/detail.json 不会说
+ * 「凭据过期」，只回一句含糊的「您的环境存在异常.」——正是反爬系统惯用的说法，
+ * 也正是它一度被误判成账号风控的原因。真机数据里的分界很干净：
+ *
+ *   凭据 23.0 / 23.2 / 23.5 / 23.9 / 24.0 分钟   全部成功
+ *   凭据 28.1 分钟                                您的环境存在异常
+ *
+ * 归到「过滤」而不是「失败」，是因为它跟账号、跟这一轮都没有关系：换一个刚抓来的
+ * 岗位立刻就能用——用户手动继续之所以每次都好使，就是因为那会重抓列表页。让它去撞
+ * 三振出局，等于拿一批放旧了的岗位判整轮死刑，而这正是之前每投十几个就得手动一次的原因。
+ */
+export class JobCredentialExpiredError extends AgentDeliveryError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, 'warning', options)
+    this.name = '凭据过期'
+  }
+}
+
 export class JobUnavailableError extends AgentDeliveryError {
   constructor(message: string, options?: ErrorOptions) {
     super(message, 'warning', options)
