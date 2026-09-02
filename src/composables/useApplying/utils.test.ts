@@ -10,10 +10,52 @@ vi.mock('@/stores/log', () => ({ addLogTrace: vi.fn() }))
 vi.mock('@/utils/logger', () => ({
   logger: { debug: vi.fn(), error: vi.fn(), info: vi.fn(), warn: vi.fn() },
 }))
+vi.mock('@/utils/actionGateStore', () => ({
+  acquireBossAction: vi.fn(async () => true),
+}))
 
-import { LimitError } from '@/types/deliverError'
+import {
+  DeliveryStoppedError,
+  LimitError,
+  PageSessionUnavailableError,
+  PublishError,
+} from '@/types/deliverError'
+import { ActionGateTimeoutError as GateTimeoutError } from '@/utils/actionGate'
+import { acquireBossAction } from '@/utils/actionGateStore'
 
-import { parseFiltering, sendPublishReq } from './utils'
+import { parseFiltering, requestBossData, requestDetail, sendPublishReq } from './utils'
+
+it('classifies a missing bst token as a resumable page-session failure', async () => {
+  window.Cookie = { get: vi.fn(() => undefined) } as any
+
+  await expect(requestDetail({ securityId: 'security-1', lid: 'lid-1' })).rejects.toBeInstanceOf(
+    PageSessionUnavailableError,
+  )
+  expect(axiosMock).not.toHaveBeenCalled()
+})
+
+it('classifies missing bst before publish and greeting follow-up as the same session failure', async () => {
+  window.Cookie = { get: vi.fn(() => undefined) } as any
+
+  await expect(
+    sendPublishReq({ encryptJobId: 'job-1', securityId: 'security-1' } as any),
+  ).rejects.toBeInstanceOf(PageSessionUnavailableError)
+  await expect(
+    requestBossData({ encryptUserId: 'boss-1', securityId: 'security-1' } as any),
+  ).rejects.toBeInstanceOf(PageSessionUnavailableError)
+  expect(axiosMock).not.toHaveBeenCalled()
+})
+
+it('passes BOSS communication-data requests through the detail action gate', async () => {
+  vi.clearAllMocks()
+  window.Cookie = { get: vi.fn(() => 'bst-token') } as any
+  axiosMock.mockResolvedValueOnce({ data: { code: 0, zpData: { bossId: 1 } } })
+
+  await expect(
+    requestBossData({ encryptUserId: 'boss-1', securityId: 'security-1' } as any),
+  ).resolves.toMatchObject({ bossId: 1 })
+  expect(acquireBossAction).toHaveBeenCalledWith('detail', { shouldAbort: undefined })
+})
 
 it('normalizes filtering output to selected fact ids', () => {
   const result = parseFiltering(
@@ -185,6 +227,7 @@ describe('sendPublishReq publish phase', () => {
     await expect(sendPublishReq(data, undefined, 3, {}, ctx)).resolves.toMatchObject({ code: 0 })
 
     expect(axiosMock).toHaveBeenCalledTimes(3)
+    expect(acquireBossAction).toHaveBeenCalledWith('publish', { shouldAbort: undefined })
     expect(axiosMock.mock.calls[2]?.[0]).toMatchObject({
       params: expect.objectContaining({ cid: 1 }),
       url: 'https://www.zhipin.com/wapi/zpgeek/friend/add.json',
@@ -211,5 +254,65 @@ describe('sendPublishReq publish phase', () => {
 
     await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toBeInstanceOf(LimitError)
     expect(axiosMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('preserves a user stop while confirming the 120 reminder', async () => {
+    axiosMock.mockResolvedValueOnce({
+      data: {
+        code: 1,
+        message: '需要确认',
+        zpData: {
+          bizData: {
+            chatRemindDialog: { ba: 'confirm-token', content: '您今天已与120位BOSS沟通' },
+          },
+        },
+      },
+    })
+    vi.mocked(acquireBossAction).mockRejectedValueOnce(new DeliveryStoppedError('用户已停止投递'))
+    const { ctx, data } = createPublishContext()
+
+    await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toBeInstanceOf(
+      DeliveryStoppedError,
+    )
+  })
+
+  it('preserves an action gate timeout while confirming the 120 reminder', async () => {
+    axiosMock.mockResolvedValueOnce({
+      data: {
+        code: 1,
+        message: '需要确认',
+        zpData: {
+          bizData: {
+            chatRemindDialog: { ba: 'confirm-token', content: '您今天已与120位BOSS沟通' },
+          },
+        },
+      },
+    })
+    vi.mocked(acquireBossAction).mockRejectedValueOnce(new GateTimeoutError('publish', 15 * 60_000))
+    const { ctx, data } = createPublishContext()
+
+    await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toBeInstanceOf(
+      GateTimeoutError,
+    )
+  })
+
+  it('reports a missing 120 confirmation token as a publish error', async () => {
+    axiosMock.mockResolvedValueOnce({
+      data: {
+        code: 1,
+        message: '需要确认',
+        zpData: {
+          bizData: {
+            chatRemindDialog: { content: '您今天已与120位BOSS沟通' },
+          },
+        },
+      },
+    })
+    const { ctx, data } = createPublishContext()
+
+    await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toMatchObject({
+      name: '投递出错',
+      message: '投递限制确认缺少 BOSS 校验参数',
+    } satisfies Partial<PublishError>)
   })
 })

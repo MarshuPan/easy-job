@@ -65,6 +65,10 @@ function statistics(date: string, success = 0) {
     success,
     searchSuccess: success,
     groupSuccess: 0,
+    searchTotal: success,
+    groupTotal: 0,
+    searchFiltered: 0,
+    groupFiltered: 0,
     total: success,
     company: 0,
     jobTitle: 0,
@@ -101,6 +105,10 @@ describe('statistics field contract', () => {
     'success',
     'searchSuccess',
     'groupSuccess',
+    'searchTotal',
+    'groupTotal',
+    'searchFiltered',
+    'groupFiltered',
     'total',
     'jobContent',
     'aiFiltering',
@@ -498,7 +506,7 @@ describe('useStatistics daily rollover', () => {
     const storedHistory = storageData.get('local:web-geek-job-Statistics') as Array<
       Record<string, unknown>
     >
-    expect(storedToday).toMatchObject({ date: '2026-07-09', success: 0, total: 0 })
+    expect(storedToday).toMatchObject({ date: '2026-07-09', success: 0, total: 4 })
     expect(storedHistory).toHaveLength(1)
     expect(storedHistory[0]).toMatchObject({ date: '2026-07-08', success: 0, groupSuccess: 0 })
     expect(

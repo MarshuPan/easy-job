@@ -6,6 +6,7 @@ import {
   createDeliveryTask,
   DELIVERY_TASK_HEARTBEAT_MAX_AGE_MS,
   findNextWarmupStepIndex,
+  markWarmupStepAttempted,
   getFreshDeliveryTaskHeartbeat,
   hasReachedDeliveryTaskEmptyCycleLimit,
   type DeliveryTask,
@@ -132,6 +133,119 @@ describe('delivery task storage', () => {
     }
 
     expect(findNextWarmupStepIndex(deliveryTask, ['group', 'search'])).toBe(-1)
+  })
+
+  it('warms the highest-priority underfilled source before the current source', () => {
+    const deliveryTask: DeliveryTask = {
+      ...task(),
+      currentIndex: 0,
+      poolWarmup: {
+        completed: false,
+        attemptedStepIndexes: [],
+        lowWaterArmed: false,
+      },
+      steps: [
+        {
+          source: 'search',
+          url: 'https://www.zhipin.com/web/geek/job?query=one',
+          status: 'running',
+          pagesDone: 0,
+        },
+        {
+          source: 'search',
+          url: 'https://www.zhipin.com/web/geek/job?query=two',
+          status: 'pending',
+          pagesDone: 0,
+        },
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'pending',
+          pagesDone: 0,
+        },
+      ],
+    }
+
+    expect(findNextWarmupStepIndex(deliveryTask, ['group', 'search'])).toBe(2)
+  })
+
+  it('rotates expectation warmup across acquisition cycles', () => {
+    const deliveryTask: DeliveryTask = {
+      ...task(),
+      groupExpectationCursorId: '101',
+      poolWarmup: { completed: false, attemptedStepIndexes: [], lowWaterArmed: false },
+      steps: [
+        {
+          source: 'group',
+          expectation: {
+            id: '101',
+            index: 0,
+            positionName: '一',
+            locationName: '',
+            salaryDesc: '',
+          },
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'pending',
+          pagesDone: 0,
+        },
+        {
+          source: 'group',
+          expectation: {
+            id: '202',
+            index: 1,
+            positionName: '二',
+            locationName: '',
+            salaryDesc: '',
+          },
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'pending',
+          pagesDone: 0,
+        },
+        {
+          source: 'group',
+          expectation: {
+            id: '303',
+            index: 2,
+            positionName: '三',
+            locationName: '',
+            salaryDesc: '',
+          },
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'pending',
+          pagesDone: 0,
+        },
+      ],
+    }
+
+    expect(findNextWarmupStepIndex(deliveryTask, ['group'])).toBe(1)
+    markWarmupStepAttempted(deliveryTask, 1)
+    expect(findNextWarmupStepIndex(deliveryTask, ['group'])).toBe(2)
+  })
+
+  it('skips a temporarily deferred warmup source without exhausting it', () => {
+    const deliveryTask: DeliveryTask = {
+      ...task(),
+      currentIndex: 0,
+      poolWarmup: { completed: false, attemptedStepIndexes: [], lowWaterArmed: false },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'waiting',
+          pagesDone: 0,
+          prefetchExhausted: false,
+          prefetchRetryAt: Date.now() + 60_000,
+        },
+        {
+          source: 'search',
+          url: 'https://www.zhipin.com/web/geek/job?query=AI',
+          status: 'pending',
+          pagesDone: 0,
+        },
+      ],
+    }
+
+    expect(findNextWarmupStepIndex(deliveryTask, ['group', 'search'])).toBe(1)
   })
 
   it('normalizes an active batch so a page remount can resume its remaining jobs', () => {

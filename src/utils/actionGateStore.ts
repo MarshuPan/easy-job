@@ -87,6 +87,7 @@ function markDegraded(reason: string) {
 }
 
 async function readEvents() {
+  if (storageDegraded) return memoryEvents
   const sentinel: unknown = Symbol('gate-storage-timeout')
   const stored = await withTimeout<unknown>(
     (async () => await counter.storageGet<unknown>(actionGateKey, []))(),
@@ -115,6 +116,7 @@ async function tryClaim(kind: BossActionKind, now: number) {
     if (waitMs > 0) return waitMs
     const next = [...events, { kind, at: now }]
     memoryEvents = next
+    if (storageDegraded) return 0
     const written = await withTimeout(
       (async () => {
         await counter.storageSet(actionGateKey, next)

@@ -10,6 +10,7 @@ export interface DeliveryTaskStep {
   searchDirection?: string
   poolSizeAtEntry?: number
   prefetchExhausted?: boolean
+  prefetchRetryAt?: number
   status: 'pending' | 'running' | 'waiting' | 'done'
   pagesDone: number
   lastPage?: {
@@ -47,6 +48,8 @@ export interface DeliveryTask {
   cycleStartedTotal?: number
   noProgressCycles?: number
   retryAt?: number
+  /** 下一轮求职期望从该游标之后开始，避免每轮都固定命中第一个期望。 */
+  groupExpectationCursorId?: string
   runtimeHeartbeat?: {
     at: number
     source: DeliveryLimitSource
@@ -63,6 +66,8 @@ export interface DeliveryTask {
     lowWaterArmed?: boolean
   }
   activeBatch?: DeliveryTaskActiveBatch
+  /** 连续详情访问故障后，已经执行过多少次真实列表刷新。 */
+  detailRecoveryAttempts?: number
 }
 
 export const DELIVERY_TASK_HEARTBEAT_INTERVAL_MS = 2_000
@@ -350,10 +355,21 @@ export function findNextWarmupStepIndex(
   underfilledSources: DeliveryLimitSource[],
 ) {
   const attempted = new Set(task.poolWarmup?.attemptedStepIndexes ?? [])
-  const orderedIndexes = [
-    task.currentIndex,
-    ...task.steps.map((_, index) => index).filter((index) => index !== task.currentIndex),
-  ]
+  const groupIndexes = task.steps.flatMap((step, index) => (step.source === 'group' ? [index] : []))
+  const cursorIndex = task.groupExpectationCursorId
+    ? groupIndexes.findIndex(
+        (index) => task.steps[index]?.expectation?.id === task.groupExpectationCursorId,
+      )
+    : -1
+  const rotatedGroupIndexes =
+    cursorIndex < 0
+      ? groupIndexes
+      : [...groupIndexes.slice(cursorIndex + 1), ...groupIndexes.slice(0, cursorIndex + 1)]
+  const orderedIndexes = underfilledSources.flatMap((source) =>
+    source === 'group'
+      ? rotatedGroupIndexes
+      : task.steps.flatMap((step, index) => (step.source === source ? [index] : [])),
+  )
   return (
     orderedIndexes.find((index) => {
       const step = task.steps[index]
@@ -362,10 +378,18 @@ export function findNextWarmupStepIndex(
         !attempted.has(index) &&
         underfilledSources.includes(step.source) &&
         step.status !== 'done' &&
-        !step.prefetchExhausted
+        !step.prefetchExhausted &&
+        (step.prefetchRetryAt == null || step.prefetchRetryAt <= Date.now())
       )
     }) ?? -1
   )
+}
+
+/** 记录一次求职期望取岗尝试，游标会跨补池周期保留下来。 */
+export function markWarmupStepAttempted(task: DeliveryTask, stepIndex: number) {
+  const step = task.steps[stepIndex]
+  const expectationId = step?.source === 'group' ? step.expectation?.id : undefined
+  if (expectationId) task.groupExpectationCursorId = expectationId
 }
 
 export function createDeliveryTask(args: {

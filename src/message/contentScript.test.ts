@@ -208,6 +208,8 @@ describe('MAIN-world content counter', () => {
     'local:web-geek-job-StatisticsEpoch:account-a',
     'local:web-geek-job-Today:123456',
     'local:agent-delivery-runtime-logs:account-a',
+    'local:boss-action-gate',
+    'local:risk-backoff',
   ])('allows an account-scoped runtime storage key %s', async (key) => {
     const counter = new ContentCounter({} as BackgroundCounterApi)
 

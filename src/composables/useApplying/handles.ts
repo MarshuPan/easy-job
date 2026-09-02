@@ -44,8 +44,14 @@ import { logger } from '@/utils/logger'
 import { isProviderHeartbeatError } from '@/utils/providerHealth'
 import { evaluateRecruiterActivity } from '@/utils/recruiterActivity'
 import { toSafeJsonValue } from '@/utils/safeJson'
+import { createStorageMutex } from '@/utils/storageMutex'
 import { buildGeekChatUrl, isGeekChatUrl } from '@/utils/zhipinRoute'
 
+import {
+  evaluateSameCompany,
+  normalizeSameCompanyStore,
+  recordSameCompanyDelivery,
+} from './sameCompanyPolicy'
 import type { Handler, StepFactory } from './type'
 import {
   errorHandle,
@@ -58,6 +64,7 @@ import {
 } from './utils'
 
 const pendingGreetingExpirySafetyMs = 10_000
+const sameCompanyStorageMutex = createStorageMutex('agent-delivery:same-company')
 type GreetingSendRecord = NonNullable<NonNullable<logData['greetingSend']>['messages']>[number]
 
 class AiGreetingDisabledError extends Error {
@@ -221,7 +228,9 @@ export function handles(runtimeFormData?: FormData) {
     if (!conf.formData.sameCompanyFilter.value) {
       return
     }
-    let someSet: Set<string> | null = null
+    let companyRecords:
+      | Awaited<ReturnType<typeof normalizeSameCompanyStore>>['store'][string]
+      | null = null
     let uid: string | number | null = null
     return {
       fn: async ({ data }) => {
@@ -229,30 +238,48 @@ export function handles(runtimeFormData?: FormData) {
         if (uid == null) {
           throw new RetryablePipelineError('没有获取到uid，无法执行同公司去重')
         }
-        if (someSet == null) {
-          someSet = new Set<string>()
-          const data = await counter.storageGet<Record<string, string[]>>(sameCompanyKey, {})
-          for (const id of data[uid] ?? []) {
-            someSet.add(id)
+        if (companyRecords == null) {
+          const raw = await counter.storageGet<unknown>(sameCompanyKey, {})
+          const normalized = normalizeSameCompanyStore(raw, Date.now())
+          companyRecords = normalized.store[String(uid)] ?? []
+          if (normalized.migrated) {
+            await counter.storageSet(sameCompanyKey, normalized.store)
           }
         }
-        const id = data.encryptBrandId
-        if (id != null && someSet.has(id)) {
+        const decision = evaluateSameCompany(
+          companyRecords,
+          data.encryptBrandId,
+          data.encryptJobId,
+          Date.now(),
+        )
+        if (decision === 'same-job' || decision === 'company-limit') {
           statistics.todayData.repeat++
-          throw new RepeatError('相同公司已投递')
+          throw new RepeatError(
+            decision === 'same-job' ? '相同JD已投递' : '同公司15天内已投递3个不同岗位',
+          )
         }
       },
-      after: async ({ data }) => {
+      afterPublish: async ({ data }) => {
         uid ??= useUser().getUserId()
         if (uid == null) {
           throw new RetryablePipelineError('没有获取到uid，无法记录同公司去重')
         }
-        if (data.encryptBrandId == null) return
-        someSet?.add(data.encryptBrandId)
-        const oldData = await counter.storageGet<Record<string, string[]>>(sameCompanyKey, {})
-        await counter.storageSet(sameCompanyKey, {
-          ...oldData,
-          [uid]: Array.from(someSet ?? []),
+        if (data.encryptBrandId == null || data.encryptJobId == null) return
+        await sameCompanyStorageMutex(async () => {
+          const now = Date.now()
+          const raw = await counter.storageGet<unknown>(sameCompanyKey, {})
+          const normalized = normalizeSameCompanyStore(raw, now)
+          const nextRecords = recordSameCompanyDelivery(
+            normalized.store[String(uid)] ?? companyRecords ?? [],
+            data.encryptBrandId!,
+            data.encryptJobId!,
+            now,
+          )
+          companyRecords = nextRecords
+          await counter.storageSet(sameCompanyKey, {
+            ...normalized.store,
+            [String(uid)]: nextRecords,
+          })
         })
       },
     }
@@ -972,11 +999,14 @@ export function handles(runtimeFormData?: FormData) {
    */
   async function refetchCardForGreeting(ctx: logData, stage: string) {
     addLogTrace(ctx, stage, 'info', '沟通记录缺少岗位详情，重新获取')
-    await acquireBossAction('detail', {
+    const acquired = await acquireBossAction('detail', {
       shouldAbort: () => useCommon().deliverStop,
       onWait: (waitMs) =>
         addLogTrace(ctx, '动作闸门', 'info', `详情请求限速，等待 ${Math.round(waitMs / 1000)} 秒`),
     })
+    if (!acquired) {
+      throw new DeliveryStoppedError('用户已停止投递，未继续补取岗位详情')
+    }
     const card = await ctx.listData.getCard()
     if (card == null) {
       throw new GreetError('岗位详情已失效，无法补齐BOSS沟通数据')
@@ -990,7 +1020,7 @@ export function handles(runtimeFormData?: FormData) {
     addLogTrace(ctx, stage, 'info', '开始获取BOSS沟通数据')
     try {
       const card = ctx.listData.card ?? (await refetchCardForGreeting(ctx, stage))
-      const bossData = await requestBossData(card)
+      const bossData = await requestBossData(card, undefined, 3, () => useCommon().deliverStop)
       ctx.bossData = bossData
       addLogTrace(ctx, stage, 'success', 'BOSS沟通数据已获取')
       return bossData

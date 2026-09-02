@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  findNextRunnableTaskStepIndex,
   findNextTaskStepIndexBySource,
+  getNextTaskStepRetryAt,
   getDeliverableJobs,
   getDeliveryJobKey,
   hasPrefetchableStep,
   isSameNavigationLocation,
   isSameTaskStep,
+  isTaskStepRunnable,
   summarizePools,
 } from './deliveryEngine'
 
@@ -90,12 +93,46 @@ describe('findNextTaskStepIndexBySource', () => {
   })
 })
 
+describe('source retry windows', () => {
+  it('does not consume a step before its prefetch retry time', () => {
+    const now = 10_000
+    const value = task([
+      step({ status: 'waiting', prefetchRetryAt: now + 60_000 }),
+      step({ status: 'pending' }),
+    ])
+
+    expect(isTaskStepRunnable(value.steps[0], now)).toBe(false)
+    expect(findNextRunnableTaskStepIndex(value, now)).toBe(1)
+    expect(getNextTaskStepRetryAt(value, now)).toBe(now + 60_000)
+  })
+
+  it('reports no runnable step while every source is inside its retry window', () => {
+    const now = 10_000
+    const value = task([
+      step({ status: 'waiting', prefetchRetryAt: now + 20_000 }),
+      step({ status: 'waiting', prefetchRetryAt: now + 60_000 }),
+    ])
+
+    expect(findNextRunnableTaskStepIndex(value, now)).toBe(-1)
+    expect(getNextTaskStepRetryAt(value, now)).toBe(now + 20_000)
+  })
+})
+
 describe('hasPrefetchableStep', () => {
   it('ignores steps already marked as exhausted', () => {
     expect(
       hasPrefetchableStep(task([step({ source: 'group', prefetchExhausted: true })]), 'group'),
     ).toBe(false)
     expect(hasPrefetchableStep(task([step({ source: 'group' })]), 'group')).toBe(true)
+  })
+
+  it('keeps a temporarily deferred source retryable after its cooldown', () => {
+    const retryAt = Date.now() + 60_000
+    const value = task([step({ source: 'group', status: 'waiting', prefetchRetryAt: retryAt })])
+
+    expect(hasPrefetchableStep(value, 'group')).toBe(false)
+    value.steps[0].prefetchRetryAt = Date.now() - 1
+    expect(hasPrefetchableStep(value, 'group')).toBe(true)
   })
 })
 

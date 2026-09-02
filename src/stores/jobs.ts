@@ -11,7 +11,8 @@ import {
   getDeliveryLimitSource,
   type DeliveryLimitSource,
 } from '@/pages/zhipin/utils/deliveryLimit'
-import { JobUnavailableError } from '@/types/deliverError'
+import { detectPlatformRisk } from '@/pages/zhipin/utils/platformRisk'
+import { AgentDeliveryError, JobDetailAccessError, RateLimitError } from '@/types/deliverError'
 import type { FormData } from '@/types/formData'
 import { getCurDay } from '@/utils'
 import { createAccountStorageKey, normalizeAccountUid } from '@/utils/accountStorage'
@@ -22,6 +23,12 @@ import { useLog } from './log'
 
 export type EncryptJobId = bossZpJobItemData['encryptJobId']
 export type JobStatus = 'pending' | 'wait' | 'running' | 'success' | 'filtered' | 'error' | 'warn'
+export interface DeliveryCredentialOrigin {
+  source: DeliveryLimitSource
+  page: number
+  groupTargetId?: string
+  searchDirectionKey?: string
+}
 export interface DeliveryJobMetadata {
   /**
    * 入池时这个岗位所属求职期望的名字。
@@ -35,7 +42,13 @@ export interface DeliveryJobMetadata {
   deliveryQueueOrder?: number
   deliveryQueueSource?: DeliveryLimitSource
   deliverySearchDirectionKeys?: string[]
+  /** 最近一次拿到当前 securityId/lid 的列表位置，用于按 FIFO 精确刷新受阻岗位。 */
+  deliveryCredentialOrigin?: DeliveryCredentialOrigin
   fetchedAt?: number
+  credentialRefreshRequired?: boolean
+  /** 当前凭据无法按原来源刷新，等待后续列表重新发现同一岗位。 */
+  credentialRefreshDeferred?: boolean
+  credentialRefreshReason?: 'credentials-stale' | 'platform-rejected' | 'transport'
   retryAttempts?: number
 }
 export type MyJobListData = bossZpJobItemData & {
@@ -76,7 +89,7 @@ export interface DeliveryQueueSnapshot {
 const sourcePoolsStorageKey = 'local:web-geek-job-SourcePools'
 export const sourcePoolsSessionStorageKey = 'agent-delivery:source-pools:v1'
 const sourcePoolPersistDebounceMs = 120
-const maxPersistedSourceJobsPerSource = 300
+const maxPersistedTerminalJobsPerSource = 300
 const deliverySources: DeliveryLimitSource[] = ['group', 'search']
 const sourcePoolsMutex = createStorageMutex('agent-delivery:source-pools')
 
@@ -91,6 +104,37 @@ const jobStatusFinality: Record<string, number> = {
   success: 6,
 }
 
+function isOutstandingSourceJob(job: PersistedSourceJob) {
+  const status = job.status?.status
+  return (
+    job.credentialRefreshRequired === true ||
+    job.credentialRefreshDeferred === true ||
+    status == null ||
+    status === 'pending' ||
+    status === 'wait' ||
+    status === 'running'
+  )
+}
+
+/**
+ * 持久化只能限制已经有结论的历史，不能把仍在队列里的岗位截掉。
+ *
+ * 岗位池是跨刷新恢复的工作队列。以前按总数截前 300 条，后抓到的 pending/wait 岗位
+ * 会在刷新或标签页合并时直接消失；现在未完成工作全部保留，只有终态历史按 FIFO 保留窗口。
+ */
+function limitPersistedSourceJobs(jobs: PersistedSourceJob[]) {
+  const sorted = [...jobs].sort(
+    (left, right) => safeNumber(left.deliveryQueueOrder) - safeNumber(right.deliveryQueueOrder),
+  )
+  const outstanding = sorted.filter(isOutstandingSourceJob)
+  const terminal = sorted
+    .filter((job) => !isOutstandingSourceJob(job))
+    .slice(0, maxPersistedTerminalJobsPerSource)
+  return [...outstanding, ...terminal].sort(
+    (left, right) => safeNumber(left.deliveryQueueOrder) - safeNumber(right.deliveryQueueOrder),
+  )
+}
+
 /**
  * 合并两份投递池快照。
  *
@@ -102,10 +146,24 @@ export function mergeSourcePoolSnapshots(
   stored: PersistedSourcePools | null,
   local: PersistedSourcePools,
 ): PersistedSourcePools {
-  if (stored == null) return local
+  if (stored == null) {
+    return {
+      ...local,
+      sources: {
+        group: limitPersistedSourceJobs(local.sources.group ?? []),
+        search: limitPersistedSourceJobs(local.sources.search ?? []),
+      },
+    }
+  }
   // 配置作用域或日期变化时，旧快照已经不适用于当前这一轮，直接以本地为准。
   if (stored.configFingerprint !== local.configFingerprint || stored.date !== local.date) {
-    return local
+    return {
+      ...local,
+      sources: {
+        group: limitPersistedSourceJobs(local.sources.group ?? []),
+        search: limitPersistedSourceJobs(local.sources.search ?? []),
+      },
+    }
   }
 
   const sources = {} as PersistedSourcePools['sources']
@@ -120,21 +178,62 @@ export function mergeSourcePoolSnapshots(
       }
       const existingFinality = jobStatusFinality[existing.status?.status ?? 'pending'] ?? 0
       const candidateFinality = jobStatusFinality[job.status?.status ?? 'pending'] ?? 0
-      const winner = candidateFinality > existingFinality ? job : existing
+      const existingFetchedAt = safeNumber(existing.fetchedAt)
+      const candidateFetchedAt = safeNumber(job.fetchedAt)
+      const credentialWinner = candidateFetchedAt > existingFetchedAt ? job : existing
+      const statusWinner =
+        candidateFinality > existingFinality
+          ? job
+          : candidateFinality < existingFinality
+            ? existing
+            : credentialWinner
+      // 同一份旧凭据上，只要任一标签页已经发现访问失败，就必须继续阻塞；真正刷新列表会带来
+      // 更晚的 fetchedAt，届时由新凭据明确解除标记。这样既不会丢刷新，也不会被旧标签页回退。
+      const credentialRefreshRequired =
+        candidateFetchedAt > existingFetchedAt
+          ? job.credentialRefreshRequired === true
+          : candidateFetchedAt < existingFetchedAt
+            ? existing.credentialRefreshRequired === true
+            : existing.credentialRefreshRequired === true || job.credentialRefreshRequired === true
+      const credentialRefreshDeferred =
+        candidateFetchedAt > existingFetchedAt
+          ? job.credentialRefreshDeferred === true
+          : candidateFetchedAt < existingFetchedAt
+            ? existing.credentialRefreshDeferred === true
+            : existing.credentialRefreshDeferred === true || job.credentialRefreshDeferred === true
       const existingOrder = safeNumber(existing.deliveryQueueOrder)
       const candidateOrder = safeNumber(job.deliveryQueueOrder)
       const earliestOrder = [existingOrder, candidateOrder].filter((value) => value > 0)
       merged.set(job.encryptJobId, {
-        ...winner,
+        ...credentialWinner,
+        deliveryGroupName: job.deliveryGroupName || existing.deliveryGroupName,
+        deliveryGroupTargetIds: Array.from(
+          new Set([
+            ...safeStringArray(existing.deliveryGroupTargetIds),
+            ...safeStringArray(job.deliveryGroupTargetIds),
+          ]),
+        ),
         deliveryQueueOrder:
-          earliestOrder.length > 0 ? Math.min(...earliestOrder) : winner.deliveryQueueOrder,
+          earliestOrder.length > 0
+            ? Math.min(...earliestOrder)
+            : credentialWinner.deliveryQueueOrder,
+        deliveryQueueSource:
+          existing.deliveryQueueSource ??
+          job.deliveryQueueSource ??
+          credentialWinner.deliveryQueueSource,
+        deliverySearchDirectionKeys: Array.from(
+          new Set([
+            ...safeStringArray(existing.deliverySearchDirectionKeys),
+            ...safeStringArray(job.deliverySearchDirectionKeys),
+          ]),
+        ),
+        credentialRefreshRequired,
+        credentialRefreshDeferred,
+        credentialRefreshReason: credentialWinner.credentialRefreshReason,
+        status: statusWinner.status,
       })
     }
-    sources[source] = [...merged.values()]
-      .sort(
-        (left, right) => safeNumber(left.deliveryQueueOrder) - safeNumber(right.deliveryQueueOrder),
-      )
-      .slice(-maxPersistedSourceJobsPerSource)
+    sources[source] = limitPersistedSourceJobs([...merged.values()])
   }
 
   return {
@@ -243,6 +342,20 @@ function safeStringArray(value: unknown) {
     : []
 }
 
+function safeDeliveryCredentialOrigin(value: unknown): DeliveryCredentialOrigin | undefined {
+  if (!isRecord(value) || (value.source !== 'group' && value.source !== 'search')) return undefined
+  const page = safeNumber(value.page)
+  if (!Number.isInteger(page) || page < 1) return undefined
+  const groupTargetId = safeString(value.groupTargetId).trim()
+  const searchDirectionKey = normalizeDeliverySourceKey(safeString(value.searchDirectionKey))
+  return {
+    source: value.source,
+    page,
+    ...(groupTargetId ? { groupTargetId } : {}),
+    ...(searchDirectionKey ? { searchDirectionKey } : {}),
+  }
+}
+
 function toPlainSourceJob(job: bossZpJobItemData): bossZpJobItemData {
   const gps = isRecord(job.gps) ? job.gps : null
   return {
@@ -307,7 +420,11 @@ function toPersistedSourceJob(job: MyJobListData): PersistedSourceJob {
     deliveryQueueOrder: safeNumber(job.deliveryQueueOrder),
     deliveryQueueSource: job.deliveryQueueSource,
     deliverySearchDirectionKeys: safeStringArray(job.deliverySearchDirectionKeys),
+    deliveryCredentialOrigin: safeDeliveryCredentialOrigin(job.deliveryCredentialOrigin),
     fetchedAt: safeNumber(job.fetchedAt),
+    credentialRefreshRequired: job.credentialRefreshRequired === true,
+    credentialRefreshDeferred: job.credentialRefreshDeferred === true,
+    credentialRefreshReason: job.credentialRefreshReason,
     retryAttempts: safeNumber(job.retryAttempts),
     status: {
       status: status.status,
@@ -340,7 +457,6 @@ export class JobList {
   private _accountUid: string | undefined
   private _activeSourcePoolsStorageKey = sourcePoolsStorageKey
   private _activeSourcePoolsSessionStorageKey = sourcePoolsSessionStorageKey
-  private _deliveryPoolCaptureEnabled = false
   private _configScope: DeliveryQueueConfigScope | undefined
   private _listRevision = 0
   private _deliveryQueueRevision = ref(0)
@@ -373,9 +489,6 @@ export class JobList {
         this._map[item.encryptJobId] = val
         return val
       })
-      if (this._deliveryPoolCaptureEnabled) {
-        this.mergeSourceList(getDeliveryLimitSource(), this._list.value)
-      }
       this.rebuildMap()
     },
   )
@@ -415,7 +528,6 @@ export class JobList {
     this._sourcePoolsHydrated = false
     this._sourcePoolsHydratePromise = undefined
     this._sourcePoolsUpdatedAt = 0
-    this._deliveryPoolCaptureEnabled = false
     this._configScope = undefined
     this._nextDeliveryQueueOrder = 1
     this._list.value = []
@@ -425,9 +537,11 @@ export class JobList {
     this.markDeliveryQueueChanged()
   }
 
-  setDeliveryPoolCaptureEnabled(enabled: boolean) {
-    this._deliveryPoolCaptureEnabled = enabled
-  }
+  /**
+   * 保留旧调用方的生命周期接口，但列表 hook 不再隐式入池；所有入池都必须由显式入口提供
+   * 来源、期望/搜索词和页码上下文。
+   */
+  setDeliveryPoolCaptureEnabled(_enabled: boolean) {}
 
   setConfigScope(scope: DeliveryQueueConfigScope) {
     const previousFingerprint = this._configScope?.fingerprint
@@ -484,13 +598,17 @@ export class JobList {
     searchDirection?: string,
     canDeliver?: (job: MyJobListData) => boolean,
     groupName?: string,
+    pageNumber?: number,
   ) {
     if (this._list.value.length === 0) return 0
-    const fetchedAt = Date.now()
+    const searchDirectionKey = normalizeDeliverySourceKey(searchDirection ?? '')
+    // 所有自动捕获最终都会经过这里。无搜索方向的普通列表页不能写入搜索池，
+    // 否则异步列表刷新仍可绕过 OperationPanel 的显式入口校验。
+    if (source === 'search' && !searchDirectionKey) return 0
     const candidates = canDeliver ? this._list.value.filter(canDeliver) : this._list.value
     if (candidates.length === 0) return 0
+    const page = Number.isInteger(pageNumber) && Number(pageNumber) > 0 ? Number(pageNumber) : 1
     for (const item of candidates) {
-      item.fetchedAt = fetchedAt
       if (source === 'group' && groupTargetId) {
         item.deliveryGroupTargetIds = Array.from(
           new Set([...(item.deliveryGroupTargetIds ?? []), groupTargetId]),
@@ -502,6 +620,33 @@ export class JobList {
           item.deliverySearchDirectionKeys = Array.from(
             new Set([...(item.deliverySearchDirectionKeys ?? []), directionKey]),
           )
+        }
+      }
+      const nextOrigin: DeliveryCredentialOrigin = {
+        source,
+        page,
+        ...(source === 'group' && groupTargetId ? { groupTargetId } : {}),
+        ...(source === 'search' && searchDirectionKey ? { searchDirectionKey } : {}),
+      }
+      const origin = item.deliveryCredentialOrigin
+      const originMatches =
+        origin != null &&
+        origin.source === source &&
+        origin.page === page &&
+        (source !== 'group' ||
+          origin.groupTargetId == null ||
+          origin.groupTargetId === groupTargetId) &&
+        (source !== 'search' ||
+          (origin.searchDirectionKey != null && origin.searchDirectionKey === searchDirectionKey))
+      // 岗位可能同时出现在搜索和求职期望中。凭据只能由首次有效来源，或同一来源的刷新，
+      // 更新；不同来源的重复捕获不能覆盖原始刷新路径。
+      if (origin == null || originMatches) {
+        item.deliveryCredentialOrigin = nextOrigin
+        if (item.credentialRefreshRequired || item.credentialRefreshDeferred) {
+          item.credentialRefreshRequired = false
+          item.credentialRefreshDeferred = false
+          item.credentialRefreshReason = undefined
+          item.status.setStatus('wait', '列表凭据已刷新，等待处理')
         }
       }
     }
@@ -528,7 +673,11 @@ export class JobList {
           ? item.deliveryQueueSource
           : undefined,
       deliverySearchDirectionKeys: safeStringArray(item.deliverySearchDirectionKeys),
+      deliveryCredentialOrigin: safeDeliveryCredentialOrigin(item.deliveryCredentialOrigin),
       fetchedAt: safeNumber(item.fetchedAt) || Date.now(),
+      credentialRefreshRequired: item.credentialRefreshRequired === true,
+      credentialRefreshDeferred: item.credentialRefreshDeferred === true,
+      credentialRefreshReason: item.credentialRefreshReason,
       retryAttempts: safeNumber(item.retryAttempts),
       status: {
         status: savedStatus ? restoredStatus.status : cacheCheck ? cacheCheck.status : 'pending',
@@ -646,7 +795,11 @@ export class JobList {
         deliveryQueueOrder: safeNumber(item.deliveryQueueOrder),
         deliveryQueueSource: item.deliveryQueueSource,
         deliverySearchDirectionKeys: safeStringArray(item.deliverySearchDirectionKeys),
+        deliveryCredentialOrigin: safeDeliveryCredentialOrigin(item.deliveryCredentialOrigin),
         fetchedAt: safeNumber(item.fetchedAt),
+        credentialRefreshRequired: item.credentialRefreshRequired === true,
+        credentialRefreshDeferred: item.credentialRefreshDeferred === true,
+        credentialRefreshReason: item.credentialRefreshReason,
         retryAttempts: safeNumber(item.retryAttempts),
       },
       item.status,
@@ -672,7 +825,17 @@ export class JobList {
       for (const item of this._sourceLists[source]) {
         if (seen.has(item.encryptJobId)) continue
         seen.add(item.encryptJobId)
-        if (item.status.status === 'success' || item.status.status === 'wait') continue
+        if (item.status.status === 'success') continue
+        const needsReset =
+          item.status.status !== 'wait' ||
+          item.status.msg !== '等待中' ||
+          item.credentialRefreshRequired === true ||
+          item.credentialRefreshDeferred === true ||
+          item.credentialRefreshReason != null
+        if (!needsReset) continue
+        item.credentialRefreshRequired = false
+        item.credentialRefreshDeferred = false
+        item.credentialRefreshReason = undefined
         item.status.setStatus('wait', '等待中')
         reset += 1
       }
@@ -788,7 +951,24 @@ export class JobList {
   }
 
   private refreshRuntimeJob(target: MyJobListData, item: bossZpJobItemData) {
+    // A page refresh only replaces the platform payload. Queue ownership and
+    // credential recovery metadata belong to the pooled runtime job and must
+    // survive that replacement; otherwise the next recovery loses its source
+    // page and keeps treating the same FIFO item as a new orphan.
+    const queueMetadata = {
+      deliveryGroupName: target.deliveryGroupName,
+      deliveryGroupTargetIds: target.deliveryGroupTargetIds,
+      deliveryQueueOrder: target.deliveryQueueOrder,
+      deliveryQueueSource: target.deliveryQueueSource,
+      deliverySearchDirectionKeys: target.deliverySearchDirectionKeys,
+      deliveryCredentialOrigin: target.deliveryCredentialOrigin,
+      credentialRefreshRequired: target.credentialRefreshRequired === true,
+      credentialRefreshDeferred: target.credentialRefreshDeferred === true,
+      credentialRefreshReason: target.credentialRefreshReason,
+      retryAttempts: target.retryAttempts,
+    }
     Object.assign(target, toPlainSourceJob(item))
+    Object.assign(target, queueMetadata)
     target.fetchedAt = Date.now()
     return target
   }
@@ -962,12 +1142,8 @@ ${JSON.stringify({
       configFingerprint: this._configScope?.fingerprint,
       date: getCurDay(),
       sources: {
-        group: this._sourceLists.group
-          .slice(-maxPersistedSourceJobsPerSource)
-          .map(toPersistedSourceJob),
-        search: this._sourceLists.search
-          .slice(-maxPersistedSourceJobsPerSource)
-          .map(toPersistedSourceJob),
+        group: limitPersistedSourceJobs(this._sourceLists.group.map(toPersistedSourceJob)),
+        search: limitPersistedSourceJobs(this._sourceLists.search.map(toPersistedSourceJob)),
       },
       updatedAt: snapshotUpdatedAt,
     }
@@ -976,35 +1152,38 @@ ${JSON.stringify({
   private restoreSourcePools(snapshot: PersistedSourcePools) {
     const restoredJobs = new Map<EncryptJobId, MyJobListData>()
     for (const source of deliverySources) {
-      this._sourceLists[source] = snapshot.sources[source]
-        .filter(isPersistedSourceJob)
-        .slice(-maxPersistedSourceJobsPerSource)
-        .map((item) => {
-          const existing = restoredJobs.get(item.encryptJobId)
-          if (existing) return existing
-          const restored = this.createRuntimeJob(
-            {
-              ...toPlainSourceJob(item),
-              deliveryGroupTargetIds: safeStringArray(item.deliveryGroupTargetIds),
-              deliveryQueueOrder: safeNumber(item.deliveryQueueOrder),
-              deliveryQueueSource:
-                item.deliveryQueueSource === 'group' || item.deliveryQueueSource === 'search'
-                  ? item.deliveryQueueSource
-                  : undefined,
-              deliverySearchDirectionKeys: safeStringArray(item.deliverySearchDirectionKeys),
-              fetchedAt: safeNumber(item.fetchedAt),
-              retryAttempts: safeNumber(item.retryAttempts),
-            },
-            item.status,
-          )
-          if ((restored.deliveryQueueOrder ?? 0) <= 0) {
-            restored.deliveryQueueOrder = this._nextDeliveryQueueOrder
-            this._nextDeliveryQueueOrder += 1
-          }
-          restored.deliveryQueueSource ??= source
-          restoredJobs.set(item.encryptJobId, restored)
-          return restored
-        })
+      this._sourceLists[source] = limitPersistedSourceJobs(
+        snapshot.sources[source].filter(isPersistedSourceJob),
+      ).map((item) => {
+        const existing = restoredJobs.get(item.encryptJobId)
+        if (existing) return existing
+        const restored = this.createRuntimeJob(
+          {
+            ...toPlainSourceJob(item),
+            deliveryGroupTargetIds: safeStringArray(item.deliveryGroupTargetIds),
+            deliveryQueueOrder: safeNumber(item.deliveryQueueOrder),
+            deliveryQueueSource:
+              item.deliveryQueueSource === 'group' || item.deliveryQueueSource === 'search'
+                ? item.deliveryQueueSource
+                : undefined,
+            deliverySearchDirectionKeys: safeStringArray(item.deliverySearchDirectionKeys),
+            deliveryCredentialOrigin: safeDeliveryCredentialOrigin(item.deliveryCredentialOrigin),
+            fetchedAt: safeNumber(item.fetchedAt),
+            credentialRefreshRequired: item.credentialRefreshRequired === true,
+            credentialRefreshDeferred: item.credentialRefreshDeferred === true,
+            credentialRefreshReason: item.credentialRefreshReason,
+            retryAttempts: safeNumber(item.retryAttempts),
+          },
+          item.status,
+        )
+        if ((restored.deliveryQueueOrder ?? 0) <= 0) {
+          restored.deliveryQueueOrder = this._nextDeliveryQueueOrder
+          this._nextDeliveryQueueOrder += 1
+        }
+        restored.deliveryQueueSource ??= source
+        restoredJobs.set(item.encryptJobId, restored)
+        return restored
+      })
     }
     this._nextDeliveryQueueOrder =
       Math.max(
@@ -1056,10 +1235,19 @@ async function getJobDetail(
       // 完全不同（额度只能接受，token 和 lid 是可修的）。
       const code = res.data.code
       const detail = res.data.message ? `${res.data.message}（code ${code}）` : `code ${code}`
-      throw new Error(`详情接口返回异常：${detail}`)
+      if (detectPlatformRisk(res.data) === 'rate-limited') {
+        throw new RateLimitError(`详情接口返回频率限制：${detail}`)
+      }
+      throw new JobDetailAccessError(`详情接口返回异常：${detail}`, {
+        code,
+        kind: 'platform-rejected',
+      })
     }
     return res.data.zpData
   } catch (error) {
+    if (error instanceof AgentDeliveryError && !(error instanceof JobDetailAccessError)) {
+      throw error
+    }
     if (!allowPageFallback) {
       // 原来这里把失败原因扔了，直接断言「岗位已失效或已下线」。那是猜的——代码并没有看
       // 失败原因，只知道请求没成功。真实原因只进了浏览器控制台，没进运行日志，于是连续
@@ -1075,15 +1263,33 @@ async function getJobDetail(
         `原因=${reason}`,
       ].join('；')
       logger.warn(message)
-      throw new JobUnavailableError(`取岗位详情失败，已跳过该岗位：${reason}`, {
-        cause: error instanceof Error ? error : undefined,
-      })
+      if (error instanceof JobDetailAccessError) throw error
+      throw new JobDetailAccessError(
+        `取岗位详情失败，等待恢复后重试：${reason}`,
+        { kind: 'transport' },
+        { cause: error instanceof Error ? error : undefined },
+      )
     }
     logger.warn('接口获取职位详情失败，回退页面点击', {
       error: error instanceof Error ? error.message : String(error),
       encryptJobId: item.encryptJobId,
       lid: item.lid,
     })
-    return fallback()
+    try {
+      return await fallback()
+    } catch (fallbackError) {
+      const requestReason = error instanceof Error ? error.message : String(error)
+      const fallbackReason =
+        fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+      const requestFailure = error instanceof JobDetailAccessError ? error : null
+      throw new JobDetailAccessError(
+        `详情接口与页面回退均失败：接口=${requestReason}；页面=${fallbackReason}`,
+        {
+          code: requestFailure?.code,
+          kind: requestFailure?.kind ?? 'transport',
+        },
+        { cause: fallbackError instanceof Error ? fallbackError : undefined },
+      )
+    }
   }
 }

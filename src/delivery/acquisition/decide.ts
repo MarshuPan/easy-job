@@ -52,11 +52,6 @@ function byLargestGap(input: AcquisitionInput) {
     (input.targetPoolPlan[left] - input.poolSizes[left])
 }
 
-function pickTarget(candidates: readonly DeliveryLimitSource[], current: DeliveryLimitSource) {
-  // 能在当前来源就地补池就不跳转——切换来源要走页面导航，代价高得多。
-  return candidates.includes(current) ? current : candidates[0]
-}
-
 export function decideAcquisition(input: AcquisitionInput): AcquisitionDecision {
   if (input.enabledSources.length === 0) return { kind: 'idle', reason: '没有启用的岗位来源' }
 
@@ -68,7 +63,7 @@ export function decideAcquisition(input: AcquisitionInput): AcquisitionDecision 
   if (!input.warmupJustCompleted && totalPoolSize(input) < input.lowWaterMark) {
     const candidates = [...prefetchable].sort(byLargestGap(input))
     if (candidates.length > 0) {
-      const target = pickTarget(candidates, input.currentSource)
+      const target = candidates[0]
       return target === input.currentSource
         ? { kind: 'prefetch-current', source: target, trigger: 'low-water' }
         : { kind: 'switch-source', source: target, trigger: 'low-water', candidates }
@@ -77,11 +72,11 @@ export function decideAcquisition(input: AcquisitionInput): AcquisitionDecision 
 
   // 阶段二：某个来源没达到目标容量。此时若已有可处理批次，先投递再补——
   // 补池要跳页，让用户看到的进度停滞比池子略浅更糟。
-  const underfilled = prefetchable.filter(
-    (source) => input.poolSizes[source] < input.targetPoolPlan[source],
-  )
+  const underfilled = prefetchable
+    .filter((source) => input.poolSizes[source] < input.targetPoolPlan[source])
+    .sort(byLargestGap(input))
   if (underfilled.length > 0 && input.readyBatchSize === 0) {
-    const target = pickTarget(underfilled, input.currentSource)
+    const target = underfilled[0]
     return target === input.currentSource
       ? { kind: 'prefetch-current', source: target, trigger: 'underfilled' }
       : { kind: 'switch-source', source: target, trigger: 'underfilled', candidates: underfilled }

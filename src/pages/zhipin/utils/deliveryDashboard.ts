@@ -19,6 +19,8 @@ export interface DashboardJob {
   status?: {
     status?: string
   }
+  credentialRefreshRequired?: boolean
+  credentialRefreshDeferred?: boolean
 }
 
 export interface DashboardRecord {
@@ -57,6 +59,7 @@ export interface DashboardSourceMetric {
   label: string
   fetched: number
   pending: number
+  deferred: number
   processed: number
   success: number
   filtered: number
@@ -100,24 +103,12 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
     group: new Set(),
     search: new Set(),
   }
-  const unknownFetchedKeys = new Set<string>()
+  const deferredKeys: Record<DeliveryLimitSource, Set<string>> = {
+    group: new Set(),
+    search: new Set(),
+  }
   const globallyFetchedKeys = new Set<string>()
   const globallyPendingKeys = new Set<string>()
-  const failedBySource: Record<DeliveryLimitSource, number> = {
-    group: 0,
-    search: 0,
-  }
-  const filteredBySource: Record<DeliveryLimitSource, number> = {
-    group: 0,
-    search: 0,
-  }
-  const successBySource: Record<DeliveryLimitSource, number> = {
-    group: 0,
-    search: 0,
-  }
-  let unknownFailed = 0
-  let unknownFiltered = 0
-  let unknownSuccess = 0
   const failureCounts: Record<DeliveryFailureCategoryId, number> = {
     jobFit: 0,
     hardFilter: 0,
@@ -139,6 +130,7 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
         globallyPendingKeys.add(key)
         pendingKeys[source].add(key)
       }
+      if (key && item.credentialRefreshDeferred === true) deferredKeys[source].add(key)
     }
   }
 
@@ -146,28 +138,12 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
     args.records.filter((record) => getLocalDate(new Date(record.createdAt)) === args.targetDate),
   )
   for (const record of targetRecords) {
-    const source = resolveRecordSource(record.data?.deliverySource)
-    if (isSuccessRecord(record)) {
-      if (source) successBySource[source] += 1
-      else unknownSuccess += 1
-      continue
-    }
+    if (isSuccessRecord(record)) continue
     if (!isFailureRecord(record)) continue
 
     if (record.data?.retryable) retryableFailures += 1
     const category = classifyDeliveryFailure(record)
     if (category) failureCounts[category] += 1
-    const isFiltered =
-      record.data?.deliveryStage === '已过滤' ||
-      (category != null && isFilteredFailureCategory(category))
-    if (source) {
-      if (isFiltered) filteredBySource[source] += 1
-      else failedBySource[source] += 1
-    } else if (isFiltered) {
-      unknownFiltered += 1
-    } else {
-      unknownFailed += 1
-    }
   }
 
   const totalWeight = deliverySources.reduce(
@@ -176,12 +152,17 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
   )
   const sources = Object.fromEntries(
     deliverySources.map((source) => {
-      // 表格恒定用投递记录：成功、过滤、异常三列必须同源，否则各列之间自己就对不上。
-      const success = successBySource[source]
-      const filtered = filteredBySource[source]
-      const failed = failedBySource[source]
-      const processed = (success ?? 0) + filtered + failed
+      const success = args.todayData[source === 'group' ? 'groupSuccess' : 'searchSuccess'] ?? 0
+      const filtered = args.todayData[source === 'group' ? 'groupFiltered' : 'searchFiltered'] ?? 0
+      // 老版本只有来源成功数。把来源处理数至少抬到成功+过滤，剩余旧记录会进入
+      // 「未归因历史」，不会再拿最近 200 条记录冒充全天累计。
+      const processed = Math.max(
+        args.todayData[source === 'group' ? 'groupTotal' : 'searchTotal'] ?? 0,
+        success + filtered,
+      )
+      const failed = Math.max(0, processed - success - filtered)
       const pending = pendingKeys[source].size
+      const deferred = deferredKeys[source].size
       return [
         source,
         {
@@ -189,6 +170,7 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
           label: sourceLabels[source],
           fetched: fetchedKeys[source].size,
           pending,
+          deferred,
           processed,
           success: success ?? 0,
           filtered,
@@ -204,28 +186,43 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
     }),
   ) as Record<DeliveryLimitSource, DashboardSourceMetric>
 
+  const attributedProcessed = deliverySources.reduce(
+    (total, source) => total + sources[source].processed,
+    0,
+  )
+  const attributedSuccess = deliverySources.reduce(
+    (total, source) => total + sources[source].success,
+    0,
+  )
+  const unknownProcessed = Math.max(0, args.todayData.total - attributedProcessed)
+  const unknownSuccess = Math.min(
+    unknownProcessed,
+    Math.max(0, args.todayData.success - attributedSuccess),
+  )
   const unknownSource: DashboardSourceMetric = {
     source: 'unknown',
-    label: '未归因来源',
-    fetched: unknownFetchedKeys.size,
+    label: '未归因历史',
+    fetched: 0,
     pending: 0,
-    processed: unknownSuccess + unknownFiltered + unknownFailed,
+    deferred: 0,
+    processed: unknownProcessed,
     success: unknownSuccess,
-    filtered: unknownFiltered,
-    failed: unknownFailed,
+    filtered: 0,
+    failed: Math.max(0, unknownProcessed - unknownSuccess),
     actualPercent: 0,
-    successRate: percentage(unknownSuccess, unknownSuccess + unknownFiltered + unknownFailed),
+    successRate: percentage(unknownSuccess, unknownProcessed),
     targetPercent: 0,
   }
   const sourceRows = [
     ...deliverySources.map((source) => sources[source]),
-    ...(unknownSource.fetched > 0 || unknownSource.processed > 0 ? [unknownSource] : []),
+    ...(unknownSource.processed > 0 ? [unknownSource] : []),
   ]
 
   const fetched = sourceRows.reduce((total, source) => total + source.fetched, 0)
   const pending = sourceRows.reduce((total, source) => total + source.pending, 0)
+  const deferred = sourceRows.reduce((total, source) => total + source.deferred, 0)
   for (const source of sourceRows) {
-    source.actualPercent = percentage(source.fetched, fetched)
+    source.actualPercent = percentage(source.processed, args.todayData.total)
   }
 
   // 摘要恒定用统计计数器，和顶部「今日已投递 / 上限」同源。
@@ -241,6 +238,7 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
     summary: {
       fetched,
       pending,
+      deferred,
       processed,
       success,
       failed,
@@ -262,10 +260,6 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
       count: failureCounts[id as DeliveryFailureCategoryId],
     })),
   }
-}
-
-function resolveRecordSource(source?: DeliveryLimitSource) {
-  return source === 'group' || source === 'search' ? source : null
 }
 
 export function classifyDeliveryFailure(record: DashboardRecord): DeliveryFailureCategoryId | null {
@@ -299,15 +293,6 @@ export function classifyDeliveryFailure(record: DashboardRecord): DeliveryFailur
   }
   if (/公司名|公司规模|薪资|工作地址|地址|Hr职位|HR职位/.test(text)) return 'hardFilter'
   return 'publish'
-}
-
-function isFilteredFailureCategory(category: DeliveryFailureCategoryId) {
-  return (
-    category === 'jobFit' ||
-    category === 'hardFilter' ||
-    category === 'dedupe' ||
-    category === 'activity'
-  )
 }
 
 function getRecordJob(record: DashboardRecord) {
@@ -364,6 +349,7 @@ function isFailureRecord(record: DashboardRecord) {
 // 与 getDeliverableJobs 保持同一套判定：已过滤的岗位不再是待处理，
 // 否则「投递池待处理」会把早已判掉的岗位一直算进去。
 function isDeliverableJob(job: DashboardJob) {
+  if (job.credentialRefreshRequired === true || job.credentialRefreshDeferred === true) return false
   const status = job.status?.status
   return status === 'pending' || status === 'wait' || status === 'running'
 }

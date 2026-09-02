@@ -7,8 +7,6 @@ import { getCurDay } from '@/utils'
 import { ExtensionRuntimeHealthError } from '@/utils/extensionRuntimeHealth'
 import { resetStorageQuotaNotice } from '@/utils/storageQuota'
 
-import { sameCompanyPoolQuota } from '../utils/deliveryDedupe'
-
 enableAutoUnmount(afterEach)
 
 const {
@@ -537,8 +535,10 @@ vi.mock('@/stores/jobs', () => ({
       (
         source?: 'group' | 'search',
         groupTargetId?: string,
-        _searchDirection?: string,
+        searchDirection?: string,
         canDeliver?: (job: any) => boolean,
+        _groupName?: string,
+        pageNumber?: number,
       ) => {
         const targetSource = source ?? sourceOverride.value ?? visibleSource.value
         const next = new Map(sourceLists[targetSource].map((item) => [item.encryptJobId, item]))
@@ -551,6 +551,14 @@ vi.mock('@/stores/jobs', () => ({
               new Set([...(item.deliveryGroupTargetIds ?? []), groupTargetId]),
             )
           }
+          item.deliveryCredentialOrigin = {
+            source: targetSource,
+            page: Math.max(1, Number(pageNumber) || 1),
+            ...(targetSource === 'group' && groupTargetId ? { groupTargetId } : {}),
+            ...(targetSource === 'search' && searchDirection
+              ? { searchDirectionKey: searchDirection.replace(/\s+/g, '').toLocaleLowerCase() }
+              : {}),
+          }
           next.set(item.encryptJobId, item)
         }
         sourceLists[targetSource] = [...next.values()]
@@ -559,6 +567,11 @@ vi.mock('@/stores/jobs', () => ({
     ),
     flushSourcePools: vi.fn(async () => undefined),
     initJobList,
+    get: vi.fn((encryptJobId: string) =>
+      [...sourceLists.group, ...sourceLists.search, ...jobListRef.value].find(
+        (item) => item.encryptJobId === encryptJobId,
+      ),
+    ),
     listBySource: vi.fn((source: 'group' | 'search') => sourceLists[source]),
     setDeliveryPoolCaptureEnabled: vi.fn((enabled: boolean) => {
       deliveryPoolCaptureEnabled.value = enabled
@@ -795,6 +808,101 @@ describe('operation panel pagination delivery', () => {
 
     expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
     expect(AgentMessage.info).not.toHaveBeenCalledWith('当前已有投递任务在执行')
+  })
+
+  it('keeps the local checkpoint when background task registration is temporarily unavailable', async () => {
+    vi.mocked(counter.deliveryTaskStart).mockRejectedValueOnce(
+      new Error('background rpc temporarily unavailable'),
+    )
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalled())
+
+    expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
+    expect(durableTaskState.value).toBeNull()
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('后台连接暂时中断，保留本地检查点'),
+    )
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+  })
+
+  it('automatically registers and resumes the preserved local task after reconnecting', async () => {
+    vi.useFakeTimers({
+      toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+    })
+    vi.mocked(counter.deliveryTaskStart).mockRejectedValueOnce(
+      new Error('background rpc temporarily unavailable'),
+    )
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() =>
+      expect(logInfo).toHaveBeenCalledWith(
+        '投递批次',
+        expect.stringContaining('后台连接暂时中断，保留本地检查点'),
+      ),
+    )
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+
+    expect(durableTaskState.value?.runId).toBeTruthy()
+    expect(durableTaskState.value?.status).not.toBe('failed')
+    expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
+    expect(wrapper.exists()).toBe(true)
+  })
+
+  it('keeps an existing task waiting when claiming the background lease throws', async () => {
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'claim-rpc-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 0,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+    vi.mocked(counter.deliveryTaskClaim).mockRejectedValueOnce(new Error('claim rpc failed'))
+
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() => expect(counter.deliveryTaskClaim).toHaveBeenCalled())
+
+    expect(durableTaskState.value?.status).not.toBe('failed')
+    expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('投递任务等待：后台连接暂时中断'),
+    )
+    expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    const buttonTexts = wrapper.findAll('button').map((button) => button.text())
+    expect(buttonTexts).toContain('等待中')
+    expect(buttonTexts).not.toContain('开始投递')
+    expect(buttonTexts).not.toContain('暂停')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('等待中')
+    expect(wrapper.exists()).toBe(true)
   })
 
   it('continues delivering the loaded next page even when page metadata stays stale', async () => {
@@ -1136,9 +1244,8 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).toBeNull()
   })
 
-  it('keeps already-contacted companies out of the pool so the level stays honest', async () => {
-    // 真机上一批 10 个岗位里 7 个是同公司重复。这些岗位在处理前状态是「待处理」，
-    // 会把投递池水位撑在低水位线之上，补池因此不触发，整轮都在同一批死数据里打转。
+  it('keeps every fetched job in the unified pool until the normal delivery filters run', async () => {
+    // 来源只负责取岗和记录归属；同公司、已沟通等业务过滤在岗位处理阶段执行。
     actualSource.value = 'group'
     visibleSource.value = 'group'
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
@@ -1157,19 +1264,17 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     for (let i = 0; i < 10; i++) await flushPromises()
 
-    // 断言池子里的实际内容，而不是「有没有传一个函数进去」。
+    // 入池不能提前消耗岗位：即使是已沟通过的公司，也要保留在统一 FIFO 队列中，
+    // 由正常岗位处理流程记录过滤结果。
     const pooled = sourceLists.group.map((item) => item.encryptJobId)
-    expect(pooled).not.toContain('dupe-1')
-    expect(pooled).not.toContain('dupe-2')
+    expect(pooled).toContain('dupe-1')
+    expect(pooled).toContain('dupe-2')
     expect(pooled).toContain('fresh-1')
-    // 重复岗位不再占名额，水位掉到低水位线以下，补池才会去翻下一页拿真岗位。
-    // 这一条正是原来失效的地方：死数据把水位撑住，整轮都在同一批里空转。
-    expect(pooled.length).toBeGreaterThan(1)
+    expect(pooled.length).toBeGreaterThanOrEqual(3)
   })
 
-  it('caps how many jobs one company may take from the pool', async () => {
-    // 一家公司针对同一个岗位刷 20 个 JD 是常见的。入池预判只认「已经投过的公司」，
-    // 对一家还没投过的公司毫无作用：20 个全是合法候选，全部进池，把名额吃光。
+  it('does not impose a company quota while acquiring the unified pool', async () => {
+    // 同一家公司多个 JD 仍是岗位数据，必须先进入 FIFO；公司去重只影响后续处理结论。
     actualSource.value = 'group'
     visibleSource.value = 'group'
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 30 : 0))
@@ -1185,12 +1290,12 @@ describe('operation panel pagination delivery', () => {
     for (let i = 0; i < 10; i++) await flushPromises()
 
     const fromFlood = sourceLists.group.filter((item) => item.encryptBrandId === 'brand-flood')
-    expect(fromFlood).toHaveLength(sameCompanyPoolQuota)
+    expect(fromFlood).toHaveLength(20)
   })
 
-  it('voids pool siblings once their company has been delivered to', async () => {
-    // 入池预判管不到这一段：一家公司的 3 个 JD 一起进池时都还是合法候选，
-    // 等第一个投出去，剩下两个当场变成死数据，却仍然是待处理，继续把水位撑着。
+  it('does not preemptively rewrite FIFO siblings before normal job processing', async () => {
+    // 入池只建立 FIFO 顺序。即使同公司岗位已经在池中，也必须等它们各自进入正常处理流程，
+    // 由该流程记录过滤或成功，不能由补池扫描直接改状态。
     actualSource.value = 'group'
     visibleSource.value = 'group'
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
@@ -1212,6 +1317,10 @@ describe('operation panel pagination delivery', () => {
       { ...job('sibling-2'), encryptBrandId: 'brand-x' },
     ]
     jobListRef.value = []
+    deliverJobListHandle.mockImplementationOnce(async () => {
+      common.deliverStop = true
+      return 'stopped'
+    })
 
     const wrapper = mount(OperationPanel)
     const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
@@ -1221,8 +1330,7 @@ describe('operation panel pagination delivery', () => {
     const siblings = sourceLists.group.filter((item) => item.encryptBrandId === 'brand-x')
     expect(siblings).not.toHaveLength(0)
     for (const sibling of siblings) {
-      expect(sibling.status.status).toBe('filtered')
-      expect(sibling.status.msg).toBe('相同公司已投递')
+      expect(sibling.status.status).not.toBe('filtered')
     }
   })
 
@@ -1243,16 +1351,34 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     for (let i = 0; i < 10; i++) await flushPromises()
 
-    // 检查点保住，任务是暂停不是终止——冷却结束要能接着原来的位置继续。
-    expect(durableTaskState.value?.status).toBe('paused')
+    // 检查点保住，任务进入可自动接管的等待态；paused 只用于必须由用户点击继续的暂停。
+    expect(durableTaskState.value?.status).toBe('waiting-for-page')
+    expect(durableTaskState.value?.checkpoint?.retryAt).toBeGreaterThan(clock.now)
     const stored = (storageSetMock.mock.calls as unknown as [string, unknown][]).find(
       ([key]) => key === 'local:risk-backoff',
     )
     expect(stored?.[1]).toMatchObject({ 'account-a': expect.objectContaining({ hits: 1 }) })
   })
 
-  it('stops for the day once the rate limit keeps coming back', async () => {
-    // 同一天反复命中说明不是偶发抖动，继续试的期望收益是负的。
+  it('pauses independently on a BOSS security-check page and keeps the checkpoint', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    window.history.replaceState({}, '', '/web/geek/jobs?_security_check=1')
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    sourceLists.group = Array.from({ length: 20 }, (_, index) => job(`security-${index + 1}`))
+    jobListRef.value = sourceLists.group.slice(0, 15)
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
+
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(durableTaskState.value?.checkpoint).toBeTruthy()
+    expect(storageSetMock).not.toHaveBeenCalledWith('local:risk-backoff', expect.anything())
+  })
+
+  it('keeps the run resumable after a third explicit platform rate limit', async () => {
     actualSource.value = 'group'
     visibleSource.value = 'group'
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
@@ -1272,12 +1398,16 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     for (let i = 0; i < 10; i++) await flushPromises()
 
-    // 收工也保留检查点，但不安排自动恢复。
-    expect(durableTaskState.value?.status).toBe('paused')
+    expect(durableTaskState.value?.status).toBe('waiting-for-page')
+    expect(durableTaskState.value?.checkpoint?.retryAt).toBeGreaterThan(clock.now)
     const stored = (storageSetMock.mock.calls as unknown as [string, unknown][]).find(
       ([key]) => key === 'local:risk-backoff',
     )
     expect(stored?.[1]).toMatchObject({ 'account-a': expect.objectContaining({ hits: 3 }) })
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('"exitReason":"risk-control"'),
+    )
   })
 
   it('pauses a resumed run when the AI is unavailable', async () => {
@@ -1346,6 +1476,416 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
   })
 
+  it('refreshes the pool automatically after consecutive detail refusals', async () => {
+    // 详情连续被拒不应把整轮任务直接标成 failed。恢复动作必须真实调用列表 reload，
+    // 并保留原 FIFO 批次；这里第二次调用用 stopped 收束测试运行。
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    sourceLists.group = Array.from({ length: 20 }, (_, index) => job(`detail-refused-${index + 1}`))
+    jobListRef.value = sourceLists.group.slice(0, 15)
+    pagerNext.mockReturnValue(false)
+    deliverJobListHandle
+      .mockImplementationOnce(async (items: Array<{ item: any }> = []) => {
+        const blocked = items[0]?.item
+        blocked.credentialRefreshRequired = true
+        blocked.deliveryCredentialOrigin = { source: 'group', page: 1 }
+        return 'detailRefused'
+      })
+      .mockImplementationOnce(async (items) => {
+        markBatchProcessed(items)
+        common.deliverStop = true
+        return 'stopped'
+      })
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(2))
+
+    expect(pagerReload).toHaveBeenCalled()
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('详情接口连续被拒，重抓列表后继续'),
+    )
+    expect(durableTaskState.value?.status).not.toBe('failed')
+    expect(durableTaskState.value?.checkpoint?.detailRecoveryAttempts).toBe(1)
+    expect(durableTaskState.value?.checkpoint?.activeBatch?.items).not.toHaveLength(0)
+    expect(wrapper.exists()).toBe(true)
+  })
+
+  it('reloads the original page and retries the first blocked FIFO job before later jobs', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    const first = {
+      ...job('blocked-page-2'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 2 },
+    }
+    const second = {
+      ...job('later-job'),
+      deliveryQueueOrder: 2,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 1 },
+    }
+    sourceLists.group = [first, second]
+    jobListRef.value = [second]
+    pagerReload.mockImplementation((targetPage: number) => {
+      expect(targetPage).toBe(2)
+      first.credentialRefreshRequired = false
+      jobListRef.value = [first]
+      jobListRevision.value += 1
+    })
+    const seenBatches: string[][] = []
+    deliverJobListHandle.mockImplementation(async (items: Array<{ item: any }> = []) => {
+      seenBatches.push(items.map(({ item }) => item.encryptJobId))
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'blocked-fifo-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      activeBatch: {
+        id: 'blocked-fifo-batch',
+        startedAt: clock.now - 30_000,
+        items: [
+          { source: 'group', encryptJobId: first.encryptJobId },
+          { source: 'group', encryptJobId: second.encryptJobId },
+        ],
+      },
+      detailRecoveryAttempts: 1,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+
+    expect(pagerReload).toHaveBeenCalledWith(2)
+    expect(seenBatches[0]).toEqual(['blocked-page-2', 'later-job'])
+    expect(wrapper.exists()).toBe(true)
+  })
+
+  it('does not guess the current step for a legacy blocked job without an origin', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation(() => 50)
+    const blocked = {
+      ...job('legacy-search-without-origin'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'search',
+    }
+    const later = {
+      ...job('later-group-job'),
+      deliveryQueueOrder: 2,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 1 },
+    }
+    sourceLists.search = [blocked]
+    sourceLists.group = [later]
+    jobListRef.value = [later]
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map((entry: any) => entry.item.encryptJobId)).toEqual(['later-group-job'])
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'legacy-origin-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      activeBatch: {
+        id: 'legacy-origin-batch',
+        startedAt: clock.now - 30_000,
+        items: [
+          { source: 'search', encryptJobId: blocked.encryptJobId },
+          { source: 'group', encryptJobId: later.encryptJobId },
+        ],
+      },
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    mount(OperationPanel)
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+
+    expect(pagerReload).not.toHaveBeenCalled()
+    expect(routerPush).not.toHaveBeenCalled()
+    expect(blocked).toMatchObject({
+      credentialRefreshRequired: false,
+      credentialRefreshDeferred: true,
+      status: { status: 'wait' },
+    })
+  })
+
+  it('defers only the missing job when its original page no longer contains it', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    const blocked = {
+      ...job('gone-from-original-page'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 2 },
+    }
+    const later = {
+      ...job('still-deliverable'),
+      deliveryQueueOrder: 2,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 1 },
+    }
+    sourceLists.group = [blocked, later]
+    jobListRef.value = [later]
+    pagerReload.mockImplementation((targetPage: number) => {
+      expect(targetPage).toBe(2)
+      jobListRef.value = [job('different-page-job')]
+      jobListRevision.value += 1
+    })
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map((entry: any) => entry.item.encryptJobId)).toEqual(['still-deliverable'])
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'missing-original-job-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      activeBatch: {
+        id: 'missing-original-job-batch',
+        startedAt: clock.now - 30_000,
+        items: [
+          { source: 'group', encryptJobId: blocked.encryptJobId },
+          { source: 'group', encryptJobId: later.encryptJobId },
+        ],
+      },
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    mount(OperationPanel)
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+
+    expect(pagerReload).toHaveBeenCalledWith(2)
+    expect(blocked).toMatchObject({
+      credentialRefreshRequired: false,
+      credentialRefreshDeferred: true,
+    })
+    expect(durableTaskState.value?.status).not.toBe('failed')
+  })
+
+  it('uses a source retry after three failed detail recoveries without losing the active batch', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    const blocked = {
+      ...job('cooldown-blocked'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 2 },
+    }
+    sourceLists.group = [blocked]
+    jobListRef.value = [job('other-page')]
+    pagerReload.mockImplementation(() => {
+      jobListRevision.value += 1
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'detail-cooldown-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      activeBatch: {
+        id: 'detail-cooldown-batch',
+        startedAt: clock.now - 30_000,
+        items: [{ source: 'group', encryptJobId: blocked.encryptJobId }],
+      },
+      detailRecoveryAttempts: 3,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() =>
+      expect(durableTaskState.value?.checkpoint?.detailRecoveryAttempts).toBe(4),
+    )
+
+    expect(pagerReload).not.toHaveBeenCalled()
+    expect(durableTaskState.value?.checkpoint).toMatchObject({
+      detailRecoveryAttempts: 4,
+      activeBatch: { id: 'detail-cooldown-batch' },
+    })
+    expect(durableTaskState.value?.checkpoint?.retryAt).toBe(clock.now + 60_000)
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(wrapper.exists()).toBe(true)
+  })
+
+  it('recovers a single blocked pool job even after its original batch was completed', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    const blocked = {
+      ...job('orphaned-credential-job'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 2 },
+    }
+    sourceLists.group = [blocked]
+    jobListRef.value = [job('current-page-job')]
+    pagerReload.mockImplementation((targetPage: number) => {
+      expect(targetPage).toBe(2)
+      blocked.credentialRefreshRequired = false
+      jobListRef.value = [blocked]
+      jobListRevision.value += 1
+    })
+    deliverJobListHandle.mockImplementation(async (items) => {
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'orphaned-credential-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() => expect(pagerReload).toHaveBeenCalledWith(2))
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+
+    expect(durableTaskState.value?.status).not.toBe('failed')
+    expect(wrapper.exists()).toBe(true)
+  })
+
+  it('does not let an unrelated blocked pool job interrupt an active FIFO batch', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    const active = {
+      ...job('active-fifo-job'),
+      deliveryQueueOrder: 1,
+      deliveryQueueSource: 'group',
+    }
+    const unrelated = {
+      ...job('unrelated-blocked-job'),
+      credentialRefreshRequired: true,
+      deliveryQueueOrder: 2,
+      deliveryQueueSource: 'group',
+      deliveryCredentialOrigin: { source: 'group', page: 2 },
+    }
+    sourceLists.group = [active, unrelated]
+    jobListRef.value = [active]
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map(({ item }: any) => item.encryptJobId)).toContain('active-fifo-job')
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'active-fifo-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      activeBatch: {
+        id: 'active-fifo-batch',
+        startedAt: clock.now - 30_000,
+        items: [{ source: 'group', encryptJobId: active.encryptJobId }],
+      },
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint)
+
+    mount(OperationPanel)
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+    expect(pagerReload).not.toHaveBeenCalled()
+  })
+
   it('resumes one owner after refresh when the background run is active', async () => {
     actualSource.value = 'group'
     visibleSource.value = 'group'
@@ -1391,7 +1931,6 @@ describe('operation panel pagination delivery', () => {
 
     mount(OperationPanel)
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
-    window.dispatchEvent(new CustomEvent('agent-delivery:job-runtime-ready'))
     await flushPromises()
 
     expect(deliverJobListHandle).toHaveBeenCalledTimes(1)
@@ -1708,13 +2247,7 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
 
     // 暂停是异步的：waitFor 命中的是后台状态，界面还要再等一轮微任务和渲染。
-    // 暂停链路是异步的：状态落盘后界面还要再等若干微任务，这个文件统一用 flushPromises 推进。
     for (let i = 0; i < 6; i++) await flushPromises()
-    console.log(
-      'DBG2',
-      wrapper.find('.operation-panel__command-bank').attributes('data-dbg'),
-      JSON.stringify(wrapper.findAll('button').map((b) => b.text())),
-    )
     expect(findButton('暂停')).toBeUndefined()
     // 暂停态只给两个出口，「重置待处理」不掺和进来。
     expect(findButton('重置待处理')).toBeUndefined()
@@ -1729,6 +2262,103 @@ describe('operation panel pagination delivery', () => {
     )
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).toBeNull()
     batch.resolve('stopped')
+  })
+
+  it('automatically retries a manual pause after the background runtime reconnects', async () => {
+    vi.useFakeTimers({
+      toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+    })
+    pagerNext.mockReturnValue(false)
+    const batch = createDeferred<'stopped'>()
+    deliverJobListHandle.mockImplementation(() => batch.promise)
+    const wrapper = mount(OperationPanel)
+    const findButton = (label: string) =>
+      wrapper.findAll('button').find((button) => button.text() === label)
+    await findButton('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+    vi.mocked(counter.deliveryTaskPause).mockRejectedValueOnce(new Error('pause rpc failed'))
+
+    await findButton('暂停')!.trigger('click')
+    await vi.waitFor(() =>
+      expect(AgentMessage.info).toHaveBeenCalledWith(
+        '插件后台暂时不可用，暂停状态将在连接恢复后保存',
+      ),
+    )
+    expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
+    expect(durableTaskState.value?.status).toBe('running')
+    const waitingButtonTexts = wrapper.findAll('button').map((button) => button.text())
+    expect(waitingButtonTexts).toContain('等待中')
+    expect(waitingButtonTexts).not.toContain('暂停')
+    expect(waitingButtonTexts).not.toContain('开始投递')
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(counter.deliveryTaskPause).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
+
+    batch.resolve('stopped')
+  })
+
+  it('keeps a paused task resumable when the resume RPC is temporarily unavailable', async () => {
+    pagerNext.mockReturnValue(false)
+    deliverJobListHandle.mockImplementation(async (items?: Array<{ item?: any }>) => {
+      markBatchProcessed(items)
+      return 'aiUnavailable'
+    })
+    const wrapper = mount(OperationPanel)
+    const findButton = (label: string) =>
+      wrapper.findAll('button').find((button) => button.text() === label)
+    await findButton('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
+    vi.mocked(counter.deliveryTaskResume).mockRejectedValueOnce(new Error('resume rpc failed'))
+
+    await findButton('继续')!.trigger('click')
+    await vi.waitFor(() =>
+      expect(AgentMessage.info).toHaveBeenCalledWith('插件后台暂时不可用，请稍后再次继续'),
+    )
+
+    expect(durableTaskState.value?.status).toBe('paused')
+    expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
+    expect(findButton('继续')).toBeDefined()
+  })
+
+  it('restores a paused background checkpoint after a page refresh and continues the same task', async () => {
+    pagerNext.mockReturnValue(false)
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'paused-refresh-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 0,
+        },
+      ],
+    }
+    registerDurableTask(checkpoint, { status: 'paused' })
+    deliverJobListHandle.mockImplementation(async (items) => {
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() =>
+      expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull(),
+    )
+    const findButton = (label: string) =>
+      wrapper.findAll('button').find((button) => button.text() === label)
+    expect(findButton('继续')).toBeDefined()
+
+    await findButton('继续')!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskResume).toHaveBeenCalled())
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+
+    expect(durableTaskState.value?.runId).toBe(checkpoint.id)
+    expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
   })
 
   it('pauses instead of terminating when the AI channel keeps failing', async () => {
@@ -1839,6 +2469,34 @@ describe('operation panel pagination delivery', () => {
     )
     expect(durableTaskState.value?.status).not.toBe('waiting-for-page')
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).toBeNull()
+  })
+
+  // 用户的原话：「不可能说现在每投十多个，我就得手动一次，不合理」。详情接口连着拒三个
+  // 岗位时，之前是直接收工。手动继续之所以每次都好使，无非是重抓了一遍列表页——那就自己做。
+  it('re-warms the pool instead of failing when detail requests are refused', async () => {
+    pagerNext.mockReturnValue(false)
+    deliverJobListHandle.mockResolvedValue('detailRefused')
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+
+    await vi.waitFor(() =>
+      expect(logInfo).toHaveBeenCalledWith(
+        '投递批次',
+        expect.stringContaining('详情接口连续被拒，重抓列表后继续'),
+      ),
+    )
+    // 关键：没有被判成运行错误收工。
+    expect(durableTaskState.value).not.toMatchObject({ terminalReason: 'terminal-error' })
+
+    // 重抓有上限，不能无限空转。放弃那一步走的是 markTerminalFailure，用集成测试卡不住
+    // ——这个环境跑完三轮就自然收尾了，第四轮不会发生——所以在这里把计数和上限钉住。
+    const payload = logInfo.mock.calls.find(
+      (call: unknown[]) =>
+        typeof call[1] === 'string' && call[1].includes('详情接口连续被拒，重抓列表后继续'),
+    )?.[1] as string
+    expect(payload).toContain('"recovery":1')
+    expect(payload).toContain('"maxRecoveries":3')
   })
 
   it('does not resume an expired runtime heartbeat after refresh', async () => {
@@ -2230,10 +2888,11 @@ describe('operation panel pagination delivery', () => {
     await flushPromises()
 
     expect(common.deliverLock).toBe(true)
-    // 开始与停止是同一个开关的两个状态：恢复中的任务已经持有运行权，
-    // 界面上不再提供「开始投递」，手动并发启动在 UI 层就不可达。
+    // 后台正在等待页面恢复时仍保留运行所有权，但页面不应把等待误报成「投递中」，
+    // 也不应暴露暂停或重新开始入口。
     const buttonTexts = wrapper.findAll('button').map((button) => button.text())
-    expect(buttonTexts).toContain('暂停')
+    expect(buttonTexts).toContain('等待中')
+    expect(buttonTexts).not.toContain('暂停')
     expect(buttonTexts).not.toContain('开始投递')
 
     jobListRef.value = [job('resume-job')]
@@ -3142,7 +3801,7 @@ describe('operation panel pagination delivery', () => {
       await flushPromises()
     }
 
-    expect(routerPush).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledWith('/web/geek/job?query=AI')
     expect(pagerReload).toHaveBeenCalledWith(1)
     expect(deliverJobListHandle).toHaveBeenCalledTimes(1)
     expect(logInfo).toHaveBeenCalledWith(
@@ -3519,7 +4178,8 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
 
-    expect(pagerNext).toHaveBeenCalled()
+    // search 的缺口更大，预热先尝试 search；当前 group 不再因为“正好在这页”插队。
+    expect(pagerNext).not.toHaveBeenCalled()
     expect(routerPush).toHaveBeenCalledWith('/web/geek/job?query=AI')
     expect(logInfo).toHaveBeenCalledWith('投递批次', expect.stringContaining('投递池首次补充完成'))
     expect(logInfo).toHaveBeenCalledWith(
@@ -3560,11 +4220,79 @@ describe('operation panel pagination delivery', () => {
       await flushPromises()
     }
 
-    expect(routerPush).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledWith('/web/geek/jobs')
     expect(deliverJobListHandle).toHaveBeenCalledTimes(1)
     expect(logInfo).toHaveBeenCalledWith(
       '投递批次',
       expect.stringContaining('"completionReason":"source-round-complete"'),
+    )
+  })
+
+  it('keeps a group step retryable when its native expectation control is temporarily missing', async () => {
+    actualSource.value = 'search'
+    visibleSource.value = 'search'
+    window.history.replaceState({}, '', '/web/geek/job?query=AI')
+    jobSourcesConfig.value = {
+      searchEnabled: true,
+      recommendEnabled: false,
+      enabledExpectIds: ['101'],
+      expectationsInitialized: true,
+    }
+    getUserResumeData.mockResolvedValue({
+      expectList: [
+        {
+          id: '101',
+          positionType: 0,
+          positionName: 'AI 产品经理',
+          locationName: '上海',
+          salaryDesc: '30-50K',
+        },
+      ],
+    })
+    getDeliveryLimit.mockImplementation(() => 50)
+    const searchJobs = Array.from({ length: 29 }, (_, index) => job(`search-${index + 1}`))
+    sourceLists.search = [...searchJobs]
+    sourceLists.group = []
+    jobListRef.value = searchJobs.slice(0, 15)
+    pagerNext.mockReturnValue(false)
+    routerPush.mockImplementation(async (route?: string) => {
+      window.history.replaceState({}, '', route)
+      if (route?.includes('/web/geek/job?')) {
+        actualSource.value = 'search'
+        visibleSource.value = 'search'
+        pagerPage.value = { page: 1, pageSize: 15, total: searchJobs.length }
+        jobListRevision.value += 1
+        jobListRef.value = searchJobs.slice(0, 15)
+        return
+      }
+      actualSource.value = 'group'
+      visibleSource.value = 'group'
+      pagerPage.value = { page: 1, pageSize: 15 }
+      jobListRef.value = []
+    })
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.every((item: any) => item.source === 'search')).toBe(true)
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+
+    const checkpoint = JSON.parse(
+      window.sessionStorage.getItem('agent-delivery:combined-delivery-task') ?? 'null',
+    )
+    const groupStep = checkpoint.steps.find((step: any) => step.source === 'group')
+    expect(groupStep).toMatchObject({ status: 'waiting', prefetchExhausted: false })
+    expect(groupStep.prefetchRetryAt).toEqual(expect.any(Number))
+    expect(groupStep.prefetchRetryAt).toBeGreaterThan(checkpoint.startedAt)
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('当前取岗步骤暂时不可用，保留并稍后自动重试'),
     )
   })
 })

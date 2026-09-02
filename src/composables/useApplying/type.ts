@@ -13,5 +13,6 @@ export type Step =
   | {
       fn?: Handler
       after?: Handler
+      afterPublish?: Handler
     }
 export type StepFactory = () => Step

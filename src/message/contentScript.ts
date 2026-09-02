@@ -83,6 +83,8 @@ const allowedStorageKeySet = new Set([
   'local:web-geek-job-Statistics',
   'local:web-geek-job-StatisticsEpoch',
   'local:web-geek-job-Today',
+  'local:boss-action-gate',
+  'local:risk-backoff',
   'appearance-conf',
   'theme-dark',
 ])

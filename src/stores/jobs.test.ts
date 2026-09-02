@@ -76,9 +76,63 @@ vi.mock('@/stores/log', () => ({
   }),
 }))
 
-import { JobList, sourcePoolsSessionStorageKey } from './jobs'
+import { JobDetailAccessError, RateLimitError } from '@/types/deliverError'
+
+import { JobList, mergeSourcePoolSnapshots, sourcePoolsSessionStorageKey } from './jobs'
 
 const sourcePoolsStorageKey = 'local:web-geek-job-SourcePools'
+
+it('keeps every outstanding job when a persisted source exceeds its history capacity', () => {
+  const jobs = Array.from({ length: 305 }, (_, index) => ({
+    encryptJobId: `fifo-${index + 1}`,
+    deliveryQueueOrder: index + 1,
+    status: { status: 'wait' },
+  }))
+  const merged = mergeSourcePoolSnapshots(
+    {
+      configFingerprint: 'scope-a',
+      date: '2026-08-19',
+      updatedAt: 1,
+      sources: { group: jobs as any, search: [] },
+    },
+    {
+      configFingerprint: 'scope-a',
+      date: '2026-08-19',
+      updatedAt: 2,
+      sources: { group: [], search: [] },
+    },
+  )
+
+  expect(merged.sources.group).toHaveLength(305)
+  expect(merged.sources.group[0]?.encryptJobId).toBe('fifo-1')
+  expect(merged.sources.group.at(-1)?.encryptJobId).toBe('fifo-305')
+})
+
+it('limits only terminal source history while preserving FIFO order', () => {
+  const jobs = Array.from({ length: 305 }, (_, index) => ({
+    encryptJobId: `terminal-${index + 1}`,
+    deliveryQueueOrder: index + 1,
+    status: { status: 'success', msg: '已投递' },
+  }))
+  const merged = mergeSourcePoolSnapshots(
+    {
+      configFingerprint: 'scope-a',
+      date: '2026-08-19',
+      updatedAt: 1,
+      sources: { group: jobs as any, search: [] },
+    },
+    {
+      configFingerprint: 'scope-a',
+      date: '2026-08-19',
+      updatedAt: 2,
+      sources: { group: [], search: [] },
+    },
+  )
+
+  expect(merged.sources.group).toHaveLength(300)
+  expect(merged.sources.group[0]?.encryptJobId).toBe('terminal-1')
+  expect(merged.sources.group.at(-1)?.encryptJobId).toBe('terminal-300')
+})
 
 function today() {
   const date = new Date()
@@ -167,6 +221,7 @@ describe('JobList', () => {
     currentSource.value = 'search'
     storageData.clear()
     window.sessionStorage.clear()
+    window.history.replaceState({}, '', '/web/geek/jobs?query=AI%20产品经理')
     vueJobList.length = 0
     requestDetailMock.mockResolvedValue({
       data: {
@@ -286,8 +341,99 @@ describe('JobList', () => {
     expect(list.listBySource('search')).toHaveLength(0)
 
     list.setDeliveryPoolCaptureEnabled(true)
-    expect(list.captureCurrentPageToDeliveryPool('search')).toBe(1)
+    expect(list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')).toBe(1)
     expect(list.listBySource('search').map((item) => item.encryptJobId)).toEqual(['page-job-1'])
+  })
+
+  it('does not make old credentials look fresh when recapturing an unchanged page', async () => {
+    vueJobList.push(job({ encryptJobId: 'page-job-1', lid: 'page-lid-1' }))
+    const list = new JobList()
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.setDeliveryPoolCaptureEnabled(true)
+    const item = list.get('page-job-1')!
+    item.fetchedAt = 123_000
+
+    list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+
+    expect(item.fetchedAt).toBe(123_000)
+  })
+
+  it('does not clear a credential block when a duplicate comes from another source', async () => {
+    vueJobList.push(job({ encryptJobId: 'cross-source-job', lid: 'cross-source-lid' }))
+    const list = new JobList()
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+    const item = list.get('cross-source-job')!
+    item.credentialRefreshRequired = true
+    item.status.setStatus('wait', '等待刷新凭据')
+
+    list.captureCurrentPageToDeliveryPool('search', undefined, '政府关系')
+    expect(item.credentialRefreshRequired).toBe(true)
+    expect(item.deliveryCredentialOrigin).toMatchObject({
+      source: 'search',
+      searchDirectionKey: 'ai产品经理',
+    })
+
+    list.captureCurrentPageToDeliveryPool('group', 'expectation-1')
+    expect(item.credentialRefreshRequired).toBe(true)
+    expect(item.deliveryCredentialOrigin?.source).toBe('search')
+  })
+
+  it('persists the exact list page that issued a job credential', async () => {
+    vueJobList.push(job({ encryptJobId: 'page-job-3', lid: 'page-lid-3' }))
+    const list = new JobList()
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.setDeliveryPoolCaptureEnabled(true)
+
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      ' AI Product ',
+      undefined,
+      undefined,
+      3,
+    )
+    await list.flushSourcePools()
+
+    vueJobList.length = 0
+    const restored = new JobList()
+    await restored.initJobList({ useCache: { value: false } } as any)
+    expect(restored.get('page-job-3')?.deliveryCredentialOrigin).toEqual({
+      source: 'search',
+      page: 3,
+      searchDirectionKey: 'aiproduct',
+    })
+  })
+
+  it('releases a credential-blocked job only after a matching source capture', async () => {
+    vueJobList.push(job({ encryptJobId: 'page-job-1', lid: 'page-lid-1' }))
+    const list = new JobList()
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.setDeliveryPoolCaptureEnabled(true)
+    const item = list.get('page-job-1')!
+    item.credentialRefreshRequired = true
+    item.status.setStatus('wait', '等待刷新凭据')
+
+    list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+    // 当前列表已经明确来自同一个搜索方向，显式捕获本身就是凭据刷新证据。
+    expect(item.credentialRefreshRequired).toBe(false)
+
+    const oldFetchedAt = item.fetchedAt
+    vueJobList[0] = { ...vueJobList[0], securityId: 'security-refreshed', lid: 'lid-refreshed' }
+    await list.initJobList({ useCache: { value: false } } as any)
+
+    expect(item).toMatchObject({
+      credentialRefreshRequired: false,
+      lid: 'lid-refreshed',
+      securityId: 'security-refreshed',
+      status: { status: 'wait', msg: '列表凭据已刷新，等待处理' },
+    })
+    expect(item.deliveryCredentialOrigin).toEqual({
+      source: 'search',
+      page: 1,
+      searchDirectionKey: 'ai产品经理',
+    })
+    expect(item.fetchedAt).toBeGreaterThanOrEqual(oldFetchedAt ?? 0)
   })
 
   it('keeps jobs the caller rules out from taking up delivery pool slots', async () => {
@@ -305,7 +451,7 @@ describe('JobList', () => {
     const captured = list.captureCurrentPageToDeliveryPool(
       'search',
       undefined,
-      undefined,
+      'AI 产品经理',
       (item) => item.encryptJobId !== 'dupe-job',
     )
 
@@ -316,13 +462,30 @@ describe('JobList', () => {
   it('persists merged source pools so fetched jobs survive a later runtime', async () => {
     const list = new JobList()
     list.setDeliveryPoolCaptureEnabled(true)
+    window.history.replaceState({}, '', '/web/geek/jobs?query=AI%20产品经理')
 
     vueJobList.push(job({ encryptJobId: 'job-page-1', lid: 'lid-page-1' }))
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      1,
+    )
 
     vueJobList.length = 0
     vueJobList.push(job({ encryptJobId: 'job-page-2', lid: 'lid-page-2' }))
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      2,
+    )
 
     await new Promise((resolve) => window.setTimeout(resolve, 160))
 
@@ -369,11 +532,13 @@ describe('JobList', () => {
     vueJobList.length = 0
     vueJobList.push(job({ encryptJobId: 'from-a', lid: 'lid-a' }))
     await tabA.initJobList({ useCache: { value: false } } as any)
+    tabA.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
     await tabA.flushSourcePools()
 
     vueJobList.length = 0
     vueJobList.push(job({ encryptJobId: 'from-b', lid: 'lid-b' }))
     await tabB.initJobList({ useCache: { value: false } } as any)
+    tabB.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
     logInfoMock.mockClear()
     await tabB.flushSourcePools()
 
@@ -386,8 +551,10 @@ describe('JobList', () => {
   it('logs when the pre-merge read fails and the write degrades to an overwrite', async () => {
     const list = new JobList()
     list.setDeliveryPoolCaptureEnabled(true)
+    window.history.replaceState({}, '', '/web/geek/jobs?query=AI%20产品经理')
     vueJobList.push(job({ encryptJobId: 'only-job' }))
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
 
     storageGetMock.mockRejectedValueOnce(new Error('storage unavailable'))
     logInfoMock.mockClear()
@@ -410,6 +577,7 @@ describe('JobList', () => {
     vueJobList.length = 0
     vueJobList.push(job({ encryptJobId: 'job-from-tab-a', lid: 'lid-a' }))
     await tabA.initJobList({ useCache: { value: false } } as any)
+    tabA.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
     tabA.get('job-from-tab-a')?.status.setStatus('success', '已投递')
     await tabA.flushSourcePools()
 
@@ -417,6 +585,7 @@ describe('JobList', () => {
     vueJobList.length = 0
     vueJobList.push(job({ encryptJobId: 'job-from-tab-b', lid: 'lid-b' }))
     await tabB.initJobList({ useCache: { value: false } } as any)
+    tabB.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
     await tabB.flushSourcePools()
 
     const saved = storageData.get(sourcePoolsStorageKey) as any
@@ -429,6 +598,44 @@ describe('JobList', () => {
     ).toBe('success')
   })
 
+  it('keeps the newest credential when a stale tab writes the same pending job', async () => {
+    const tabA = new JobList()
+    const tabB = new JobList()
+    tabA.setDeliveryPoolCaptureEnabled(true)
+    tabB.setDeliveryPoolCaptureEnabled(true)
+
+    vueJobList.length = 0
+    vueJobList.push(job({ encryptJobId: 'shared-job', lid: 'old-lid', securityId: 'old-security' }))
+    await tabA.initJobList({ useCache: { value: false } } as any)
+    tabA.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+    await tabB.initJobList({ useCache: { value: false } } as any)
+    tabB.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+    const stale = tabB.get('shared-job')!
+    stale.fetchedAt = 100
+    stale.credentialRefreshRequired = true
+
+    vueJobList[0] = job({
+      encryptJobId: 'shared-job',
+      lid: 'new-lid',
+      securityId: 'new-security',
+    })
+    await tabA.initJobList({ useCache: { value: false } } as any)
+    tabA.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
+    const fresh = tabA.get('shared-job')!
+    fresh.fetchedAt = 200
+    await tabA.flushSourcePools()
+    await tabB.flushSourcePools()
+
+    const saved = storageData.get(sourcePoolsStorageKey) as any
+    expect(saved.sources.search[0]).toMatchObject({
+      encryptJobId: 'shared-job',
+      fetchedAt: 200,
+      lid: 'new-lid',
+      securityId: 'new-security',
+      credentialRefreshRequired: false,
+    })
+  })
+
   it('persists and restores acquisition metadata for queued expectation jobs', async () => {
     currentSource.value = 'group'
     const list = new JobList()
@@ -436,7 +643,7 @@ describe('JobList', () => {
     vueJobList.push(job({ encryptJobId: 'group-job-1', lid: 'group-lid-1' }))
     await list.initJobList({ useCache: { value: false } } as any)
 
-    expect(list.captureCurrentPageToDeliveryPool('group', 'expectation-1')).toBe(0)
+    expect(list.captureCurrentPageToDeliveryPool('group', 'expectation-1')).toBe(1)
     const captured = list.get('group-job-1')
     expect(captured?.fetchedAt).toEqual(expect.any(Number))
     expect(captured?.deliveryGroupTargetIds).toEqual(['expectation-1'])
@@ -462,7 +669,7 @@ describe('JobList', () => {
     vueJobList.push(job({ encryptJobId: 'search-job-1', lid: 'search-lid-1' }))
     await list.initJobList({ useCache: { value: false } } as any)
 
-    expect(list.captureCurrentPageToDeliveryPool('search', undefined, ' AI 产品经理 ')).toBe(0)
+    expect(list.captureCurrentPageToDeliveryPool('search', undefined, ' AI 产品经理 ')).toBe(1)
     await list.flushSourcePools()
 
     vueJobList.length = 0
@@ -544,6 +751,7 @@ describe('JobList', () => {
     firstRuntime.setDeliveryPoolCaptureEnabled(true)
     vueJobList.push(job({ encryptJobId: 'session-job-1', lid: 'session-lid-1' }))
     await firstRuntime.initJobList({ useCache: { value: false } } as any)
+    firstRuntime.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
 
     expect(storageSetMock).not.toHaveBeenCalled()
     expect(window.sessionStorage.getItem(sourcePoolsSessionStorageKey)).not.toBeNull()
@@ -707,6 +915,7 @@ describe('JobList', () => {
     const list = new JobList()
     list.setDeliveryPoolCaptureEnabled(true)
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')
     await list.flushSourcePools()
 
     const sessionSnapshot = JSON.parse(
@@ -773,6 +982,14 @@ describe('JobList', () => {
       securityId: 'security-page-1',
     })
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      1,
+    )
 
     vueJobList.length = 0
     vueJobList.push({
@@ -783,6 +1000,14 @@ describe('JobList', () => {
       securityId: 'security-page-2',
     })
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      2,
+    )
 
     expect(list.listBySource('search').map((item) => item.encryptJobId)).toEqual([
       'job-page-1',
@@ -804,6 +1029,14 @@ describe('JobList', () => {
       securityId: 'security-page-1',
     })
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      1,
+    )
 
     vueJobList.length = 0
     vueJobList.push({
@@ -814,6 +1047,14 @@ describe('JobList', () => {
       securityId: 'security-page-2',
     })
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      1,
+    )
 
     requestDetailMock.mockRejectedValueOnce(new Error('detail api failed'))
 
@@ -840,6 +1081,14 @@ describe('JobList', () => {
       securityId: `security-${id}`,
     })
     await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool(
+      'search',
+      undefined,
+      'AI 产品经理',
+      undefined,
+      undefined,
+      1,
+    )
     vueJobList.length = 0
     await list.initJobList({ useCache: { value: false } } as any)
     return list
@@ -857,12 +1106,46 @@ describe('JobList', () => {
     await expect(card).rejects.toThrow(/您的环境存在异常/)
   })
 
+  it('preserves a platform rejection when the current-page fallback also fails', async () => {
+    vueJobList.push(job({ encryptJobId: 'job-current-coded' }))
+    requestDetailMock.mockResolvedValueOnce({
+      data: { code: 37, message: '您的环境存在异常.', zpData: null },
+    })
+    clickJobCardAction.mockRejectedValueOnce(new Error('页面点击失败'))
+    const list = new JobList()
+    await list.initJobList({ useCache: { value: false } } as any)
+
+    const error = await list
+      .get('job-current-coded')
+      ?.getCard()
+      .catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(JobDetailAccessError)
+    expect(error).toMatchObject({ code: 37, kind: 'platform-rejected' })
+  })
+
   it('still says something useful when BOSS sends a code with no message', async () => {
     const list = await pooledJobFromAnEarlierPage('job-bare')
     requestDetailMock.mockResolvedValueOnce({ data: { code: 500, message: '', zpData: null } })
 
     // 不能退化成「详情接口返回异常：」这种后面什么都没有的空句子。
     await expect(list.get('job-bare')?.getCard()).rejects.toThrow(/500/)
+  })
+
+  it('routes an explicit detail rate limit into the unified risk backoff', async () => {
+    const list = await pooledJobFromAnEarlierPage('job-detail-rate-limited')
+    requestDetailMock.mockResolvedValueOnce({
+      data: { code: 1, message: '操作过于频繁，请稍后再试', zpData: null },
+    })
+
+    const error = await list
+      .get('job-detail-rate-limited')
+      ?.getCard()
+      .catch((caught) => caught)
+
+    expect(error).toBeInstanceOf(RateLimitError)
+    expect(error).toMatchObject({ name: '操作频繁' })
+    expect(clickJobCardAction).not.toHaveBeenCalled()
   })
 })
 
@@ -874,6 +1157,7 @@ describe('delivery pool survives a page refresh', () => {
     vi.clearAllMocks()
     storageData.clear()
     vueJobList.length = 0
+    window.history.replaceState({}, '', '/web/geek/jobs?query=AI%20产品经理')
   })
 
   // 真实页面初始化顺序（Ui.vue）是：setAccountScope → setConfigScope → initJobList。
@@ -906,13 +1190,14 @@ describe('delivery pool survives a page refresh', () => {
     expect(poolIds(refreshed, 'group')).toContain('group-untagged')
   })
 
-  it('keeps a queued search job that was captured without a resolvable direction', async () => {
+  it('rejects a queued search job that was captured without a resolvable direction', async () => {
     currentSource.value = 'search'
+    window.history.replaceState({}, '', '/web/geek/jobs')
     const list = new JobList()
     list.setDeliveryPoolCaptureEnabled(true)
     vueJobList.push(job({ encryptJobId: 'search-untagged', lid: 'lid-search' }))
     await list.initJobList({ useCache: { value: false } } as any)
-    list.captureCurrentPageToDeliveryPool('search', undefined, undefined)
+    expect(list.captureCurrentPageToDeliveryPool('search', undefined, undefined)).toBe(0)
     await list.flushSourcePools()
 
     vueJobList.length = 0
@@ -920,7 +1205,7 @@ describe('delivery pool survives a page refresh', () => {
     refreshed.setConfigScope(scope)
     await refreshed.initJobList({ useCache: { value: false } } as any)
 
-    expect(poolIds(refreshed, 'search')).toContain('search-untagged')
+    expect(poolIds(refreshed, 'search')).not.toContain('search-untagged')
   })
 })
 
@@ -1015,5 +1300,26 @@ describe('resetting the delivery pool', () => {
 
     expect(list.resetPendingDeliveryPool()).toBe(0)
     expect(list.get('delivered')?.status.status).toBe('success')
+  })
+
+  it('resets a waiting job that is still blocked on stale credentials', async () => {
+    currentSource.value = 'group'
+    const list = new JobList()
+    list.setDeliveryPoolCaptureEnabled(true)
+    vueJobList.push(job({ encryptJobId: 'blocked-waiting', lid: 'lid-blocked' }))
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.captureCurrentPageToDeliveryPool('group', 'expectation-1')
+    const item = list.get('blocked-waiting')!
+    item.credentialRefreshRequired = true
+    item.credentialRefreshReason = 'credentials-stale'
+    item.status.setStatus('wait', '详情暂不可用，等待刷新凭据后重试')
+
+    expect(list.resetPendingDeliveryPool()).toBe(1)
+    expect(item).toMatchObject({
+      credentialRefreshRequired: false,
+      credentialRefreshDeferred: false,
+      credentialRefreshReason: undefined,
+      status: { status: 'wait', msg: '等待中' },
+    })
   })
 })

@@ -5,6 +5,10 @@ export interface Statistics {
   success: number
   searchSuccess?: number
   groupSuccess?: number
+  searchTotal?: number
+  groupTotal?: number
+  searchFiltered?: number
+  groupFiltered?: number
   total: number
   jobContent: number
   aiFiltering: number

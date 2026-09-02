@@ -66,24 +66,43 @@ export class JobAddressError extends AgentDeliveryError {
   }
 }
 
+export type JobDetailAccessFailureKind = 'credentials-stale' | 'platform-rejected' | 'transport'
+
 /**
- * 岗位的 securityId / lid 已经放太久，BOSS 不再认。
+ * 岗位详情暂时取不到，但没有证据说明岗位本身已经失效。
  *
- * 这两个值是抓列表页那一刻由 BOSS 发的，有时效。过期之后 job/detail.json 不会说
- * 「凭据过期」，只回一句含糊的「您的环境存在异常.」——正是反爬系统惯用的说法，
- * 也正是它一度被误判成账号风控的原因。真机数据里的分界很干净：
- *
- *   凭据 23.0 / 23.2 / 23.5 / 23.9 / 24.0 分钟   全部成功
- *   凭据 28.1 分钟                                您的环境存在异常
- *
- * 归到「过滤」而不是「失败」，是因为它跟账号、跟这一轮都没有关系：换一个刚抓来的
- * 岗位立刻就能用——用户手动继续之所以每次都好使，就是因为那会重抓列表页。让它去撞
- * 三振出局，等于拿一批放旧了的岗位判整轮死刑，而这正是之前每投十几个就得手动一次的原因。
+ * BOSS 的非零业务码、网络超时和连接错误都属于访问链路故障。它们必须保留岗位并交给
+ * 批次层刷新或退避，不能落成「已过滤」，否则一次瞬时故障会永久吞掉 FIFO 中的岗位。
  */
-export class JobCredentialExpiredError extends AgentDeliveryError {
+export class JobDetailAccessError extends AgentDeliveryError {
+  readonly code?: number
+  readonly kind: JobDetailAccessFailureKind
+
+  constructor(
+    message: string,
+    detail: { code?: number; kind: JobDetailAccessFailureKind },
+    options?: ErrorOptions,
+  ) {
+    super(message, 'danger', options)
+    this.name = '职位详情暂不可用'
+    this.code = detail.code
+    this.kind = detail.kind
+  }
+}
+
+/** 当前 BOSS 页面缺少请求所需的会话令牌，需要保留检查点并让用户刷新页面。 */
+export class PageSessionUnavailableError extends AgentDeliveryError {
   constructor(message: string, options?: ErrorOptions) {
-    super(message, 'warning', options)
-    this.name = '凭据过期'
+    super(message, 'danger', options)
+    this.name = '页面会话已失效'
+  }
+}
+
+/** BOSS 已进入需要用户完成的安全校验页面。 */
+export class SecurityCheckRequiredError extends AgentDeliveryError {
+  constructor(message = 'BOSS 页面需要完成安全校验', options?: ErrorOptions) {
+    super(message, 'danger', options)
+    this.name = '页面安全校验'
   }
 }
 

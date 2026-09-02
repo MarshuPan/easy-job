@@ -1,22 +1,31 @@
 import axios from 'axios'
 
+import { detectPlatformRisk } from '@/pages/zhipin/utils/platformRisk'
 import { addLogTrace } from '@/stores/log'
 import type { logData } from '@/stores/log'
 import {
   GreetError,
   AgentDeliveryError,
+  DeliveryStoppedError,
   LimitError,
+  PageSessionUnavailableError,
   PublishError,
   RateLimitError,
 } from '@/types/deliverError'
 import type { FormDataRange } from '@/types/formData'
 import { AgentMessage } from '@/ui/instrument'
+import { ActionGateTimeoutError } from '@/utils/actionGate'
+import { acquireBossAction } from '@/utils/actionGateStore'
 import { parseFilteringDecisionContent } from '@/utils/aiGreetingDraft'
 import { logger } from '@/utils/logger'
 import { parseGptJson } from '@/utils/parse'
 
 type PublishPhase = 'sent' | 'confirmed' | 'unknown'
 type PublishState = NonNullable<logData['publish']> & { phase?: PublishPhase }
+type PublishControl = {
+  limitConfirmationAttempted: boolean
+  shouldAbort?: () => boolean
+}
 const publishRequestTimeoutMs = 15_000
 
 export const sameCompanyKey = 'local:sameCompany'
@@ -36,10 +45,10 @@ export async function requestCard(params: { securityId: string; lid: string }) {
 }
 
 export async function requestDetail(params: { securityId: string; lid: string }) {
-  const token = window?.Cookie.get('bst')
+  const token = window?.Cookie?.get?.('bst')
   if (!token) {
     AgentMessage.error('页面状态已失效，请刷新后重试')
-    throw new PublishError('没有获取到token')
+    throw new PageSessionUnavailableError('没有获取到 bst token，请刷新 BOSS 页面后继续')
   }
   return axios.get<{
     code: number
@@ -61,7 +70,7 @@ export async function sendPublishReq(
   retries = 3,
   _params = {},
   ctx?: logData,
-  state: { limitConfirmationAttempted: boolean } = { limitConfirmationAttempted: false },
+  state: PublishControl = { limitConfirmationAttempted: false },
 ) {
   const attempt = 4 - retries
   ctx && (ctx.publish = { ok: false, attempts: attempt })
@@ -76,12 +85,12 @@ export async function sendPublishReq(
     jobId: data.encryptJobId,
     ..._params,
   }
-  const token = window?.Cookie.get('bst')
+  const token = window?.Cookie?.get?.('bst')
   if (!token) {
     addLogTrace(ctx, '投递接口', 'danger', '没有获取到 bst token')
     ctx && (ctx.publish = { ok: false, attempts: attempt, error: '没有获取到token' })
     AgentMessage.error('页面状态已失效，请刷新后重试')
-    throw new PublishError('没有获取到token')
+    throw new PageSessionUnavailableError('没有获取到 bst token，请刷新 BOSS 页面后继续')
   }
   addLogTrace(ctx, '投递接口', 'info', `第 ${attempt} 次发送投递请求`, {
     url,
@@ -122,15 +131,22 @@ export async function sendPublishReq(
         message: res.data.message,
       })
       // 命中限额弹窗 → 立刻发送确认请求
-      if (content.includes('您今天已与120位BOSS沟通')) {
+      const riskSignal = detectPlatformRisk(res.data)
+      if (riskSignal === 'daily-limit-warning') {
         if (state.limitConfirmationAttempted) {
           addLogTrace(ctx, '投递接口', 'danger', '确认后仍返回 120 位沟通提示，已停止补发')
           throw new LimitError('BOSS 重复返回 120 位沟通提示，已停止投递')
         }
         try {
           const params = new URLSearchParams()
-          params.append('ba', res.data.zpData.bizData.chatRemindDialog.ba)
+          const ba = res.data?.zpData?.bizData?.chatRemindDialog?.ba
+          if (typeof ba !== 'string' || ba.trim() === '') {
+            throw new PublishError('投递限制确认缺少 BOSS 校验参数')
+          }
+          params.append('ba', ba)
           params.append('action', 'addf-limit-popup-c')
+          const acquired = await acquireBossAction('publish', { shouldAbort: state.shouldAbort })
+          if (!acquired) throw new DeliveryStoppedError('用户已停止投递，未确认投递限制')
           await axios({
             url: 'https://www.zhipin.com/wapi/zpCommon/actionLog/geek/chatremind.json',
             method: 'POST',
@@ -140,17 +156,21 @@ export async function sendPublishReq(
           })
           addLogTrace(ctx, '投递接口', 'info', '已确认 120 位沟通限制弹窗，继续补发 cid=1')
         } catch (e) {
+          if (e instanceof AgentDeliveryError || e instanceof ActionGateTimeoutError) throw e
           logger.error('尝试确认投递限制失败', e)
           addLogTrace(ctx, '投递接口', 'danger', `投递限制确认失败：${errorHandle(e)}`)
           throw new PublishError(`投递限制确认失败]${content}`)
         }
+        const acquired = await acquireBossAction('publish', { shouldAbort: state.shouldAbort })
+        if (!acquired) throw new DeliveryStoppedError('用户已停止投递，未继续确认额度后的投递')
         return sendPublishReq(data, undefined, retries, { cid: 1 }, ctx, {
           limitConfirmationAttempted: true,
+          shouldAbort: state.shouldAbort,
         })
-      } else if (content.includes('您今天已与150位BOSS沟通')) {
+      } else if (riskSignal === 'daily-limit-reached') {
         addLogTrace(ctx, '投递接口', 'danger', '命中 BOSS 150 位沟通上限')
         throw new LimitError(content)
-      } else if (content.includes('操作过于频繁')) {
+      } else if (riskSignal === 'rate-limited') {
         addLogTrace(ctx, '投递接口', 'warning', '命中 BOSS 操作频繁限制')
         throw new RateLimitError(content)
       }
@@ -166,7 +186,7 @@ export async function sendPublishReq(
     })
     return res.data
   } catch (e: any) {
-    if (e instanceof AgentDeliveryError) {
+    if (e instanceof AgentDeliveryError || e instanceof ActionGateTimeoutError) {
       throw e
     }
     ctx &&
@@ -188,18 +208,21 @@ export async function requestBossData(
   card: bossZpCardData,
   errorMsg?: string,
   retries = 3,
+  shouldAbort?: () => boolean,
 ): Promise<bossZpBossData> {
   if (retries === 0) {
     throw new GreetError(errorMsg ?? '重试多次失败')
   }
   const url = 'https://www.zhipin.com/wapi/zpchat/geek/getBossData'
   // userInfo.value?.token 不相等！
-  const token = window?.Cookie.get('bst')
+  const token = window?.Cookie?.get?.('bst')
   if (!token) {
     AgentMessage.error('页面状态已失效，请刷新后重试')
-    throw new GreetError('没有获取到token')
+    throw new PageSessionUnavailableError('没有获取到 bst token，请刷新 BOSS 页面后继续')
   }
   try {
+    const acquired = await acquireBossAction('detail', { shouldAbort })
+    if (!acquired) throw new DeliveryStoppedError('用户已停止投递，未继续获取BOSS沟通数据')
     const data = new FormData()
     data.append('bossId', card.encryptUserId)
     data.append('securityId', card.securityId)
@@ -217,16 +240,17 @@ export async function requestBossData(
     })
     if (res.data.code !== 0) {
       if (res.data.message === '非好友关系') {
-        return await requestBossData(card, '非好友关系', retries - 1)
+        return await requestBossData(card, '非好友关系', retries - 1, shouldAbort)
       }
       throw new GreetError(`状态错误:${res.data.message}`)
     }
     return res.data.zpData
   } catch (e: any) {
-    if (e instanceof GreetError) {
+    if (e instanceof AgentDeliveryError) {
       throw e
     }
-    return requestBossData(card, e?.message as string, retries - 1)
+    if (e instanceof ActionGateTimeoutError) throw e
+    return requestBossData(card, e?.message as string, retries - 1, shouldAbort)
   }
 }
 
@@ -252,9 +276,6 @@ export function rangeMatch(rangeStr: string, form: FormDataRange): boolean {
   if (inputStart > inputEnd) {
     ;[inputStart, inputEnd] = [inputEnd, inputStart]
   }
-  // console.log({
-  //     inputStart,inputEnd,start,end
-  // })
   if (mode) {
     // 严格：职位范围(input) 完全覆盖 目标范围(form)
     return start <= inputStart && inputEnd <= end

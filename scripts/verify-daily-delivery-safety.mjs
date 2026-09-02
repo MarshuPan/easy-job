@@ -75,8 +75,18 @@ assert.match(pagerSource, /ready/, 'pager should expose an explicit ready flag')
 assert.match(pagerSource, /assertReady/, 'pager navigation should fail before initialization')
 assert.match(
   operationSource,
-  /agent-delivery:job-runtime-ready/,
-  'operation panel should resume only after the page runtime is ready',
+  /watch\([\s\S]*?props\.runtimeReady[\s\S]*?activateOperationRuntime\(\)/,
+  'operation panel should activate only after the host runtime is ready',
+)
+assert.match(
+  operationSource,
+  /function activateOperationRuntime\(\)[\s\S]*?if \(operationRuntimeActivated\) return[\s\S]*?resumeDeliveryTask\('mounted'\)/,
+  'operation panel runtime activation should be idempotent and resume persisted work once',
+)
+assert.match(
+  operationSource,
+  /pendingManualPause = \{ accountUid, taskId \}[\s\S]*?scheduleDeliveryResumeAt\(Date\.now\(\) \+ deliveryReconnectRetryMs\)[\s\S]*?async function retryPendingManualPause\(\)/,
+  'a pause RPC interruption should retain and automatically retry the pause intent',
 )
 assert.match(
   operationSource,
@@ -90,8 +100,13 @@ assert.match(
 )
 assert.match(
   uiSource,
-  /dispatchEvent\(new CustomEvent\('agent-delivery:job-runtime-ready'\)\)/,
-  'UI should dispatch runtime ready after job list and pager initialization',
+  /await jobList\.initJobList\(conf\.formData\)[\s\S]*?await initPager\(\)[\s\S]*?jobRuntimeReady\.value = true/,
+  'UI should mark the runtime ready only after job list and pager initialization',
+)
+assert.match(
+  uiSource,
+  /<OperationPanel[\s\S]*?:runtime-ready="jobRuntimeReady"/,
+  'UI should pass explicit runtime readiness into the always-mounted delivery controller',
 )
 assert.doesNotMatch(
   operationSource,

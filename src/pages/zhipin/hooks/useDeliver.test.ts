@@ -58,6 +58,10 @@ const {
       total: 0,
       groupSuccess: 0,
       searchSuccess: 0,
+      groupTotal: 0,
+      searchTotal: 0,
+      groupFiltered: 0,
+      searchFiltered: 0,
     } as any,
     flush: vi.fn(async () => undefined),
     updateStatistics: vi.fn(async () => undefined),
@@ -167,10 +171,11 @@ import {
   AIFilteringError,
   AIProviderError,
   GreetError,
-  JobTitleError,
-  JobCredentialExpiredError,
+  JobDetailAccessError,
   JobDataIncompleteError,
+  JobTitleError,
   JobUnavailableError,
+  PublishError,
   RateLimitError,
 } from '@/types/deliverError'
 import { ActionGateTimeoutError } from '@/utils/actionGate'
@@ -211,6 +216,10 @@ describe('useDeliver job list flow', () => {
     statistics.todayData.total = 0
     statistics.todayData.groupSuccess = 0
     statistics.todayData.searchSuccess = 0
+    statistics.todayData.groupTotal = 0
+    statistics.todayData.searchTotal = 0
+    statistics.todayData.groupFiltered = 0
+    statistics.todayData.searchFiltered = 0
     formData.aiGreeting.enable = true
     formData.customGreeting.enable = false
     formData.delay.deliveryInterval = 0
@@ -262,7 +271,7 @@ describe('useDeliver job list flow', () => {
     )
   })
 
-  it('pauses instead of burning the job when the gate says slow down', async () => {
+  it('defers the source instead of burning the job when the local gate is saturated', async () => {
     // 撞上硬顶是「跑太快」的信号，不是这个岗位的错。原来它顺着未知错误走成岗位失败并
     // 清掉检查点，方向正好反了：应该停下、岗位留在待处理、检查点保住。
     const job = createJob('job-gate-timeout')
@@ -279,7 +288,7 @@ describe('useDeliver job list flow', () => {
 
     const result = await useDeliver().jobListHandle()
 
-    expect(result).toBe('aiUnavailable')
+    expect(result).toBe('sourceDeferred')
     expect(job.status.status).toBe('wait')
     expect(sendPublishReqMock).not.toHaveBeenCalled()
   })
@@ -461,20 +470,27 @@ describe('useDeliver job list flow', () => {
     expect(seen).toEqual(['bad-1', 'ok-1', 'ok-2'])
   })
 
-  it('still stops when job after job cannot be evaluated', async () => {
-    // 反过来，连着三个都评不上说明问题不在单个岗位上，继续跑只是把整个池子磨掉。
-    // 这里三个都缺数据，中间没有成功打断，应当停。
+  it('bails out of the batch when job after job cannot be evaluated', async () => {
+    // 连着三个都评不上说明问题不在单个岗位上，继续磨这一批没有意义——但也不是收工。
+    // 交给上层重抓列表换一批新凭据（recoverFromDetailRefusal），那正是用户手动点继续
+    // 时发生的事；反复重抓仍然不行才真的停。
     jobListRef.value = [
       createJob('bad-1'),
       createJob('bad-2'),
       createJob('bad-3'),
       createJob('ok-1'),
-    ]
+    ].map((item) => ({
+      ...item,
+      deliveryCredentialOrigin: { source: 'search' as const, page: 1 },
+    }))
     createHandleMock.mockResolvedValue({
       before: [
         vi.fn(async (args: any, ctx: any) => {
           ctx.detailAttempted = true
-          throw new JobDataIncompleteError('岗位地址为空，无法执行工作地址筛选')
+          throw new JobDetailAccessError('详情接口返回异常：您的环境存在异常.（code 37）', {
+            code: 37,
+            kind: 'platform-rejected',
+          })
         }),
       ],
       after: [],
@@ -483,19 +499,52 @@ describe('useDeliver job list flow', () => {
 
     const result = await useDeliver().jobListHandle()
 
-    expect(result).toBe('terminalError')
+    // 不是 terminalError：收工是上层刷新/冷却策略的决定，不在这一层。
+    expect(result).toBe('detailRefused')
+    expect(common.deliverStop).toBe(false)
+    expect(jobListRef.value.slice(0, 3).every((item: any) => item.credentialRefreshRequired)).toBe(
+      true,
+    )
+    expect(cachePipelineResultMock).not.toHaveBeenCalled()
+  })
+
+  it('defers a stale legacy job without an origin and continues later jobs', async () => {
+    const legacy = createJob('legacy-without-origin')
+    const later = createJob('later-job')
+    jobListRef.value = [legacy, later]
+    const before = vi.fn(async ({ data }: any, ctx: any) => {
+      ctx.detailAttempted = true
+      if (data.encryptJobId === legacy.encryptJobId) {
+        throw new JobDetailAccessError('旧凭据已失效', {
+          kind: 'credentials-stale',
+        })
+      }
+      ctx.detailFetched = true
+    })
+    createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
+
+    const result = await useDeliver().jobListHandle()
+
+    expect(result).toBe('completed')
+    expect(legacy).toMatchObject({
+      credentialRefreshRequired: false,
+      credentialRefreshDeferred: true,
+      credentialRefreshReason: 'credentials-stale',
+      status: { status: 'wait' },
+    })
+    expect(before).toHaveBeenCalledTimes(2)
   })
 
   // 这个用例原来断言的是相反的行为：看到「您的环境存在异常」就立刻收工。那是 1.3.0 把它
-  // 误判成账号风控留下的，也正是用户每投十几个就得手动点一次继续的原因——真实原因是列表页
-  // 凭据放太久过期了（现在在发请求之前就拦掉，见 useApplying/index.ts），跟账号无关：
-  // 手动继续之所以每次都好使，就是因为那会重抓列表页，凭据是新的。
+  // 误判成账号风控留下的，也正是用户每投十几个就得手动点一次继续的原因。日志不足以证明
+  // BOSS 为什么拒，所以这里只守住一件事：一次被拒不能判整轮死刑。
   it('does not end the run over a single environment-anomaly reply', async () => {
     jobListRef.value = [createJob('blocked-1'), createJob('blocked-2')]
     const before = vi.fn(async (_args: any, ctx: any) => {
       ctx.detailAttempted = true
-      throw new JobUnavailableError(
+      throw new JobDetailAccessError(
         '取岗位详情失败，已跳过该岗位：详情接口返回异常：您的环境存在异常.（code 37）',
+        { code: 37, kind: 'platform-rejected' },
       )
     })
     createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
@@ -505,29 +554,6 @@ describe('useDeliver job list flow', () => {
     expect(result).not.toBe('terminalError')
     // 第二个岗位照常处理，不再被第一个的报错连坐。
     expect(before).toHaveBeenCalledTimes(2)
-  })
-
-  // 用户的原话：「不可能说现在每投十多个，我就得手动一次，不合理」。一批岗位在池子里
-  // 放旧了是常态（真机上整批都是 23–24 分钟），它们会一个接一个地过期——这必须是「跳过」，
-  // 不能凑成三振把整轮停掉，否则就又回到手动点继续的老路。
-  it('keeps going when a whole batch of pooled jobs has expired credentials', async () => {
-    jobListRef.value = [
-      createJob('stale-1'),
-      createJob('stale-2'),
-      createJob('stale-3'),
-      createJob('stale-4'),
-    ]
-    const before = vi.fn(async () => {
-      throw new JobCredentialExpiredError(
-        '岗位凭据已放置 31 分钟，超过 25 分钟不再可用，跳过该岗位',
-      )
-    })
-    createHandleMock.mockResolvedValue({ before: [before], after: [], retryGreeting: vi.fn() })
-
-    const result = await useDeliver().jobListHandle()
-
-    expect(result).not.toBe('terminalError')
-    expect(before).toHaveBeenCalledTimes(4)
   })
 
   it('still gives ordinary detail failures three chances before stopping', async () => {
@@ -671,16 +697,24 @@ describe('useDeliver job list flow', () => {
 
   it('persists the confirmed communication before starting greeting work', async () => {
     let releaseGreeting!: () => void
+    const afterPublish = vi.fn()
     const after = vi.fn(async (_payload: any, ctx: any) => {
       await new Promise<void>((resolve) => (releaseGreeting = resolve))
       ctx.greetingSend = { ok: true, type: 'ai', messageCount: 3 }
     })
     jobListRef.value = [createJob('job-persist-before-greeting')]
-    createHandleMock.mockResolvedValue({ before: [], after: [after], retryGreeting: vi.fn() })
+    createHandleMock.mockResolvedValue({
+      before: [],
+      afterPublish: [afterPublish],
+      after: [after],
+      retryGreeting: vi.fn(),
+    })
 
     const running = useDeliver().jobListHandle()
     await vi.waitFor(() => expect(after).toHaveBeenCalledOnce())
 
+    expect(afterPublish).toHaveBeenCalledOnce()
+    expect(afterPublish.mock.invocationCallOrder[0]).toBeLessThan(after.mock.invocationCallOrder[0])
     expect(statistics.flush).toHaveBeenCalled()
     expect(flushMock).toHaveBeenCalled()
     expect(statistics.flush.mock.invocationCallOrder[0]).toBeLessThan(
@@ -1093,6 +1127,25 @@ describe('useDeliver job list flow', () => {
     expect(statistics.todayData.total).toBe(0)
   })
 
+  it('counts a definitive publish rejection once in the daily processed totals', async () => {
+    const rejected = createJob('job-publish-rejected')
+    jobListRef.value = [rejected]
+    createHandleMock.mockResolvedValue({ after: [], before: [], retryGreeting: vi.fn() })
+    sendPublishReqMock.mockRejectedValueOnce(new PublishError('岗位已被平台拒绝'))
+
+    await expect(useDeliver().jobListHandle()).resolves.toBe('completed')
+
+    expect(statistics.todayData.total).toBe(1)
+    expect(statistics.todayData.groupTotal).toBe(1)
+    expect(statistics.todayData.searchTotal).toBe(0)
+    expect(rejected.status.status).toBe('error')
+    expect(logFinishDeliveryMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ name: '投递出错' }),
+      expect.objectContaining({ retryable: true }),
+    )
+  })
+
   it('marks a persisted running job for manual verification instead of publishing it again', async () => {
     const interrupted = createJob('job-running')
     interrupted.status.setStatus('running', '正在建立沟通')
@@ -1133,6 +1186,10 @@ describe('useDeliver job list flow', () => {
     expect(sendPublishReqMock).not.toHaveBeenCalled()
     expect(statistics.todayData.success).toBe(0)
     expect(statistics.todayData.total).toBe(2)
+    expect(statistics.todayData.groupTotal).toBe(2)
+    expect(statistics.todayData.groupFiltered).toBe(2)
+    expect(statistics.todayData.searchTotal).toBe(0)
+    expect(statistics.todayData.searchFiltered).toBe(0)
     expect(delayMock).not.toHaveBeenCalled()
     expect(first.status).toMatchObject({ status: 'filtered', msg: '已过滤' })
     expect(second.status).toMatchObject({ status: 'filtered', msg: '已过滤' })
@@ -1205,6 +1262,8 @@ describe('useDeliver job list flow', () => {
     expect(statistics.todayData.success).toBe(2)
     expect(statistics.todayData.groupSuccess).toBe(1)
     expect(statistics.todayData.searchSuccess).toBe(1)
+    expect(statistics.todayData.groupTotal).toBe(1)
+    expect(statistics.todayData.searchTotal).toBe(1)
     expect(logStartDeliveryMock.mock.calls[0]?.[1].deliverySource).toBe('group')
     expect(logStartDeliveryMock.mock.calls[0]?.[1].deliverySourceName).toBe('AI 产品经理')
     expect(logStartDeliveryMock.mock.calls[1]?.[1].deliverySource).toBe('search')

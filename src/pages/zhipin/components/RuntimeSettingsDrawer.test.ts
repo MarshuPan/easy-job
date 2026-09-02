@@ -263,8 +263,8 @@ describe('runtime settings drawer', () => {
     const wrapper = mount(RuntimeSettingsDrawer)
     const text = wrapper.text()
 
-    expect(text).toContain('搜索来源比例')
-    expect(text).toContain('求职期望来源比例')
+    expect(text).toContain('搜索取岗比例')
+    expect(text).toContain('求职期望取岗比例')
     expect(text).not.toContain('搜索投递上限')
     expect(text).not.toContain('求职期望投递上限')
   })
@@ -288,6 +288,8 @@ describe('runtime settings drawer', () => {
 
     expect(text).toContain('已沟通 / 好友状态')
     expect(text).toContain('同公司去重')
+    expect(text).toContain('15 天内最多投递 3 个不同岗位')
+    expect(text).toContain('同一 JD 不重复')
     expect(text).toContain('同 HR 去重')
     expect(text).toContain('猎头岗位')
     expect(text).toContain('工作内容')

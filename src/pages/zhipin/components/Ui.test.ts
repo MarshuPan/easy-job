@@ -132,9 +132,10 @@ vi.mock('./Config.vue', () => ({
 vi.mock('./OperationPanel.vue', () => ({
   default: {
     name: 'OperationPanel',
+    props: ['runtimeReady'],
     emits: ['open-settings', 'show-search', 'show-group', 'show-logs'],
     template: `
-      <section data-test="delivery-console">
+      <section data-test="delivery-console" :data-runtime-ready="String(runtimeReady)">
         <button data-test="open-settings" @click="$emit('open-settings')">运行配置</button>
         <button data-test="show-search" @click="$emit('show-search')">岗位规则</button>
         <button data-test="show-group" @click="$emit('show-group')">求职期望来源</button>
@@ -163,6 +164,7 @@ vi.mock('./Logs.vue', () => ({
 vi.mock('./RuntimeSettingsDrawer.vue', () => ({
   default: {
     name: 'RuntimeSettingsDrawer',
+    data: () => ({ draft: '' }),
     methods: { resetRuntimeSettings },
     template: `
       <section data-test="runtime-settings">
@@ -170,6 +172,7 @@ vi.mock('./RuntimeSettingsDrawer.vue', () => ({
           <strong>运行配置</strong>
           <button data-test="reset-runtime-settings" @click="resetRuntimeSettings">重置</button>
         </div>
+        <input data-test="runtime-settings-draft" v-model="draft" />
       </section>
     `,
   },
@@ -274,7 +277,7 @@ describe('zhipin popup UI shell', () => {
     expect(messageError).toHaveBeenCalledWith('账号数据加载失败，请刷新后重试')
   })
 
-  it('opens from the bottom-left launcher and switches menu views without remounting them', async () => {
+  it('mounts secondary views on first visit and keeps them mounted across navigation', async () => {
     const wrapper = mountUi()
     await flushPromises()
 
@@ -285,10 +288,11 @@ describe('zhipin popup UI shell', () => {
     expect(launcher.isVisible()).toBe(true)
     expect(overlay.isVisible()).toBe(false)
     expect(wrapper.find('[data-test="delivery-console"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="delivery-records"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="filter-config"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="runtime-settings"]').exists()).toBe(true)
-    expect(wrapper.find('[data-test="logs"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="delivery-records"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="filter-config"]').exists()).toBe(false)
+    expect(wrapper.find('[data-test="runtime-settings"]').exists()).toBe(false)
+    expect(wrapper.find('.agent-delivery-personal-frame').exists()).toBe(false)
+    expect(wrapper.find('[data-test="logs"]').exists()).toBe(false)
 
     await launcher.trigger('click')
 
@@ -318,8 +322,15 @@ describe('zhipin popup UI shell', () => {
     expect(wrapper.find('.agent-delivery-workspace__menu-foot').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('私有配置已加载')
     expect(wrapper.text()).not.toContain('账户配置')
-    expect(wrapper.find('[data-test="reset-runtime-settings"]').isVisible()).toBe(false)
+    expect(wrapper.find('[data-test="reset-runtime-settings"]').exists()).toBe(false)
     expect(wrapper.find('[data-view="dashboard"]').isVisible()).toBe(true)
+
+    await menuButton(wrapper, '运行配置').trigger('click')
+    const settingsDraft = wrapper.get<HTMLInputElement>('[data-test="runtime-settings-draft"]')
+    await settingsDraft.setValue('keep-this-draft')
+
+    await menuButton(wrapper, '岗位规则').trigger('click')
+    expect(wrapper.find('[data-test="filter-config"]').exists()).toBe(true)
 
     await menuButton(wrapper, '个人信息').trigger('click')
     expect(wrapper.find('[data-view="personal"]').isVisible()).toBe(true)
@@ -339,6 +350,15 @@ describe('zhipin popup UI shell', () => {
     )
     expect(wrapper.find('[data-test="delivery-records"]').attributes('data-visible')).toBe('true')
 
+    await menuButton(wrapper, '运行日志').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[data-test="logs"]').exists()).toBe(true)
+
+    await menuButton(wrapper, '运行配置').trigger('click')
+    expect(
+      wrapper.get<HTMLInputElement>('[data-test="runtime-settings-draft"]').element.value,
+    ).toBe('keep-this-draft')
+
     await wrapper.find('.agent-delivery-workspace__close').trigger('click')
 
     expect(overlay.isVisible()).toBe(false)
@@ -350,6 +370,8 @@ describe('zhipin popup UI shell', () => {
   it('routes only valid personal-frame notifications into the parent panel host', async () => {
     const wrapper = mountUi()
     await flushPromises()
+    await wrapper.find('.agent-delivery-launcher').trigger('click')
+    await menuButton(wrapper, '个人信息').trigger('click')
     const frame = wrapper.get<HTMLIFrameElement>('.agent-delivery-personal-frame').element
     const frameWindow = frame.contentWindow
     expect(frameWindow).not.toBeNull()
@@ -608,6 +630,44 @@ describe('zhipin popup UI shell', () => {
     expect(initJobList).toHaveBeenCalledWith(
       expect.objectContaining({ useCache: expect.objectContaining({ value: true }) }),
     )
+  })
+
+  it('activates the delivery controller only after pager initialization completes', async () => {
+    let resolveInitPager: (() => void) | undefined
+    initPager.mockImplementationOnce(
+      () =>
+        new Promise<undefined>((resolve) => {
+          resolveInitPager = () => resolve(undefined)
+        }),
+    )
+
+    const wrapper = mountUi()
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="delivery-console"]').attributes('data-runtime-ready')).toBe(
+      'false',
+    )
+
+    resolveInitPager?.()
+    await flushPromises()
+
+    expect(wrapper.get('[data-test="delivery-console"]').attributes('data-runtime-ready')).toBe(
+      'true',
+    )
+  })
+
+  it('does not activate the delivery controller when the job cache fails to initialize', async () => {
+    initJobList.mockRejectedValueOnce(new Error('job cache unavailable'))
+
+    const wrapper = mountUi()
+    await flushPromises()
+
+    expect(initPager).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-test="delivery-console"]').attributes('data-runtime-ready')).toBe(
+      'false',
+    )
+    expect(loggerError).toHaveBeenCalledWith('初始化职位列表失败：[Error] job cache unavailable')
+    expect(messageError).toHaveBeenCalledWith('岗位列表初始化失败，请刷新后重试')
   })
 
   it('preserves the existing user, configuration, job-cache, and pager initialization order', async () => {

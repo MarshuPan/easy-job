@@ -21,6 +21,10 @@ const statisticsCounterKeys = [
   'success',
   'searchSuccess',
   'groupSuccess',
+  'searchTotal',
+  'groupTotal',
+  'searchFiltered',
+  'groupFiltered',
   'total',
   'jobContent',
   'aiFiltering',
@@ -73,6 +77,10 @@ export function createEmptyStatistics(date: string): Statistics {
     success: 0,
     searchSuccess: 0,
     groupSuccess: 0,
+    searchTotal: 0,
+    groupTotal: 0,
+    searchFiltered: 0,
+    groupFiltered: 0,
     total: 0,
     jobContent: 0,
     aiFiltering: 0,
@@ -105,8 +113,21 @@ function normalizeStatistics(data: unknown, fallbackDate = getCurDay()): Statist
   for (const key of statisticsCounterKeys) {
     normalized[key] = normalizeCounter(source[key])
   }
-  if (source.searchSuccess == null) normalized.searchSuccess = normalized.success
-  normalized.total = Math.max(normalized.total, normalized.success)
+  if (source.searchSuccess == null) {
+    normalized.searchSuccess = Math.max(0, normalized.success - (normalized.groupSuccess ?? 0))
+  }
+  normalized.groupTotal = Math.max(
+    normalized.groupTotal ?? 0,
+    (normalized.groupSuccess ?? 0) + (normalized.groupFiltered ?? 0),
+  )
+  normalized.searchTotal = Math.max(
+    normalized.searchTotal ?? 0,
+    (normalized.searchSuccess ?? 0) + (normalized.searchFiltered ?? 0),
+  )
+  // 来源累计和顶部总处理必须是同一本账。旧版本或并行写入可能留下来源累计高于
+  // total 的快照；按较大的已处理数修复，避免每日额度被低估而继续超额投递。
+  const attributedTotal = normalized.groupTotal + normalized.searchTotal
+  normalized.total = Math.max(normalized.total, normalized.success, attributedTotal)
   return normalized
 }
 

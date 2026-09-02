@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const handlerRefs = vi.hoisted(() => ({
   communicated: vi.fn(),
   sameCompany: vi.fn(),
+  sameCompanyPublish: vi.fn(),
   sameHr: vi.fn(),
   jobTitle: vi.fn(),
   goldHunter: vi.fn(),
@@ -34,7 +35,7 @@ vi.mock('./handles', () => ({
   handles: handlesFactoryMock,
 }))
 
-import { JobCredentialExpiredError } from '@/types/deliverError'
+import { DeliveryStoppedError, JobDetailAccessError } from '@/types/deliverError'
 
 import { createHandle } from './index'
 
@@ -45,7 +46,10 @@ describe('createHandle pipeline assembly', () => {
     acquireBossActionMock.mockImplementation(async () => true)
     handlesFactoryMock.mockReturnValue({
       communicated: () => handlerRefs.communicated,
-      SameCompanyFilter: () => handlerRefs.sameCompany,
+      SameCompanyFilter: () => ({
+        fn: handlerRefs.sameCompany,
+        afterPublish: handlerRefs.sameCompanyPublish,
+      }),
       SameHrFilter: () => handlerRefs.sameHr,
       jobTitle: () => handlerRefs.jobTitle,
       goldHunterFilter: () => handlerRefs.goldHunter,
@@ -65,9 +69,10 @@ describe('createHandle pipeline assembly', () => {
   })
 
   it('wires configured hard filters into the runtime pipeline in order', async () => {
-    const { before, after, retryGreeting } = await createHandle()
+    const { before, after, afterPublish, retryGreeting } = await createHandle()
 
     expect(after).toEqual([])
+    expect(afterPublish).toEqual([handlerRefs.sameCompanyPublish])
     expect(retryGreeting).toBe(handlerRefs.retryGreeting)
 
     // 岗位名/公司名/薪资范围/HR职位/岗位地址五个过滤器已移除：面板上没有入口，
@@ -107,7 +112,7 @@ describe('createHandle pipeline assembly', () => {
     expect(ctx.trace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          detail: expect.objectContaining({ expired: false }),
+          detail: expect.objectContaining({ refreshRequired: false }),
           message: '投递前重新校验岗位详情与投递凭据',
           stage: '岗位时效',
         }),
@@ -115,23 +120,24 @@ describe('createHandle pipeline assembly', () => {
     )
   })
 
-  // 这个用例原来断言的是「凭据 31 分钟了，记一句 stale:true，然后照发」——那正是真机上
-  // 出事的那条路：BOSS 回一句含糊的「您的环境存在异常.」，被上层当成账号风控，整轮收工。
-  it('does not spend a detail request on credentials BOSS will reject', async () => {
+  it('requests a fresh list credential instead of treating an old job as invalid', async () => {
     const { before } = await createHandle()
     const getCard = vi.fn(async () => ({ postDescription: '最新 JD' }))
     const data = { fetchedAt: Date.now() - 31 * 60_000, getCard }
     const ctx = { listData: data } as any
 
-    await expect(before[5]({ data } as any, ctx)).rejects.toBeInstanceOf(JobCredentialExpiredError)
+    await expect(before[5]({ data } as any, ctx)).rejects.toMatchObject({
+      constructor: JobDetailAccessError,
+      kind: 'credentials-stale',
+    })
 
-    // 关键是「没发出去」：发了必然被拒，还白占一个闸门令牌。
+    // 关键是「没发出去」：先让上层真实刷新列表凭据。
     expect(getCard).not.toHaveBeenCalled()
     expect(ctx.detailFetched).toBeUndefined()
     expect(ctx.trace).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          detail: expect.objectContaining({ expired: true }),
+          detail: expect.objectContaining({ refreshRequired: true }),
           stage: '岗位时效',
         }),
       ]),
@@ -143,10 +149,10 @@ describe('createHandle pipeline assembly', () => {
   it('measures credential age after the action gate, not before', async () => {
     const start = Date.now()
     const fetchedAt = start - 24 * 60_000
-    // 进闸门时 24 分钟，还没过线；闸门里等掉 4 分钟，出来已经 28 分钟——真机上就是这么
-    // 被推过去的（等了 222 秒）。判断写在闸门前面就永远看不到这 4 分钟。
+    // 进闸门时 24 分钟，还没过线；闸门里等掉 7 分钟，出来已经 31 分钟。判断写在闸门
+    // 前面就永远看不到这段等待。
     acquireBossActionMock.mockImplementationOnce(async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(start + 4 * 60_000)
+      vi.spyOn(Date, 'now').mockReturnValue(start + 7 * 60_000)
       return true
     })
 
@@ -155,7 +161,19 @@ describe('createHandle pipeline assembly', () => {
     const data = { fetchedAt, getCard }
     const ctx = { listData: data } as any
 
-    await expect(before[5]({ data } as any, ctx)).rejects.toBeInstanceOf(JobCredentialExpiredError)
+    await expect(before[5]({ data } as any, ctx)).rejects.toBeInstanceOf(JobDetailAccessError)
+    expect(getCard).not.toHaveBeenCalled()
+  })
+
+  it('does not request detail after the user stops while waiting for the gate', async () => {
+    acquireBossActionMock.mockResolvedValueOnce(false)
+    const { before } = await createHandle()
+    const getCard = vi.fn(async () => ({ postDescription: 'JD' }))
+    const data = { fetchedAt: Date.now(), getCard }
+
+    await expect(before[5]({ data } as any, { listData: data } as any)).rejects.toBeInstanceOf(
+      DeliveryStoppedError,
+    )
     expect(getCard).not.toHaveBeenCalled()
   })
 })

@@ -66,26 +66,14 @@ export function getDeliveryLimitSuccess(
     : (statistics.searchSuccess ?? 0)
 }
 
-/**
- * 当日实际可用额度。
- *
- * 平台上限是 150，但今天已经被提示过频率限制的话就不该再往上限顶——每命中一次砍一档。
- * 这个值由运行时按当日命中次数设置，跨天由 riskBackoff 的记录自动归零。
- */
-let riskAdjustedDailyLimit = DAILY_DELIVERY_LIMIT
-
-export function setRiskAdjustedDailyLimit(limit: number) {
-  riskAdjustedDailyLimit = Math.max(0, Math.min(DAILY_DELIVERY_LIMIT, Math.floor(limit)))
-}
-
 export function getEffectiveDailyDeliveryLimit() {
-  return riskAdjustedDailyLimit
+  return DAILY_DELIVERY_LIMIT
 }
 
 export function hasDailyDeliveryRemaining(statistics: Statistics) {
-  return statistics.success < riskAdjustedDailyLimit
+  return statistics.success < DAILY_DELIVERY_LIMIT
 }
 
 export function getDailyDeliveryRemaining(statistics: Statistics) {
-  return Math.max(0, riskAdjustedDailyLimit - statistics.success)
+  return Math.max(0, DAILY_DELIVERY_LIMIT - statistics.success)
 }

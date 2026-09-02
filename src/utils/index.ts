@@ -33,9 +33,8 @@ export function animate({
 }
 let delayLoadId: number | undefined
 
-// 延迟
+// 纯计时等待。批量休息、节奏等待和轮询不应伪装成页面正在加载。
 export async function delay(s: number) {
-  loader({ ms: s * 1000 })
   return new Promise((resolve) => setTimeout(resolve, s * 1000))
 }
 

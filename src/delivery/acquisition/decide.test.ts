@@ -43,11 +43,23 @@ describe('decideAcquisition', () => {
     ).toMatchObject({ kind: 'switch-source', source: 'group', trigger: 'low-water' })
   })
 
-  it('prefers refilling in place over switching, even with a bigger gap elsewhere', () => {
-    // 切换来源要走页面导航，代价远高于就地翻页。
+  it('switches to the source with the largest gap instead of staying on the current source', () => {
+    // 当前来源是 search，但 group 距离软目标差 42、search 只差 30，应先补 group。
     expect(
-      decideAcquisition(input({ poolSizes: { group: 8, search: 2 }, currentSource: 'search' })),
-    ).toMatchObject({ kind: 'prefetch-current', source: 'search' })
+      decideAcquisition(
+        input({
+          poolSizes: { group: 8, search: 20 },
+          currentSource: 'search',
+          readyBatchSize: 0,
+        }),
+      ),
+    ).toMatchObject({ kind: 'switch-source', source: 'group', trigger: 'underfilled' })
+  })
+
+  it('uses stable source order when both sources have the same gap', () => {
+    expect(
+      decideAcquisition(input({ poolSizes: { group: 5, search: 5 }, currentSource: 'search' })),
+    ).toMatchObject({ kind: 'switch-source', source: 'group', trigger: 'low-water' })
   })
 
   it('does not trigger low-water refill right after a full warmup pass', () => {

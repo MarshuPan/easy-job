@@ -17,8 +17,12 @@ const {
   resolveAmapLocationMock,
   runBackgroundAiTaskMock,
   sendMessageMock,
+  storageGetMock,
+  storageSetMock,
 } = vi.hoisted(() => {
   const sendMessageMock = vi.fn(() => 'MockChannel')
+  const storageGetMock = vi.fn()
+  const storageSetMock = vi.fn()
   return {
     // 与 createEmptyStatistics 的字段全集保持一致；beforeEach 会重置为 0。
     todayData: {
@@ -59,6 +63,8 @@ const {
     resolveAmapLocationMock: vi.fn(),
     runBackgroundAiTaskMock: vi.fn(),
     sendMessageMock,
+    storageGetMock,
+    storageSetMock,
   }
 })
 
@@ -83,8 +89,8 @@ vi.mock('@/utils/actionGateStore', () => ({
 vi.mock('@/message', () => ({
   counter: {
     openChatTab: openChatTabMock,
-    storageGet: vi.fn(),
-    storageSet: vi.fn(),
+    storageGet: storageGetMock,
+    storageSet: storageSetMock,
   },
   runBackgroundAiTask: runBackgroundAiTaskMock,
 }))
@@ -297,6 +303,8 @@ describe('useApplying handles greeting flow', () => {
     confState.formData.customGreeting.enable = false
     confState.formData.customGreeting.value = ''
     confState.formData.friendStatus.value = false
+    confState.formData.sameCompanyFilter.value = false
+    confState.formData.sameHrFilter.value = false
     confState.formData.amap.enable = false
     confState.formData.amap.key = ''
     confState.formData.amap.origins = ''
@@ -310,6 +318,59 @@ describe('useApplying handles greeting flow', () => {
     recentAiGreetingsMock.mockReset()
     recentAiGreetingsMock.mockReturnValue([])
     logHydrateMock.mockClear()
+    storageGetMock.mockReset()
+    storageSetMock.mockReset()
+  })
+
+  it('migrates the legacy company list and allows three distinct jobs before limiting the company', async () => {
+    confState.formData.sameCompanyFilter.value = true
+    let storageState: unknown = { '10001': ['brand-a'] }
+    storageGetMock.mockImplementation(async () => storageState)
+    storageSetMock.mockImplementation(async (_key: string, value: unknown) => {
+      storageState = value
+      return true
+    })
+    const step = handles().SameCompanyFilter() as { fn: Handler; afterPublish: Handler }
+
+    const jobs = ['job-2', 'job-3']
+    for (const jobId of jobs) {
+      const data = { ...createJobData(), encryptBrandId: 'brand-a', encryptJobId: jobId }
+      await step.fn({ data }, createCtx())
+      await step.afterPublish({ data }, createCtx())
+    }
+
+    const blocked = { ...createJobData(), encryptBrandId: 'brand-a', encryptJobId: 'job-4' }
+    await expect(step.fn({ data: blocked }, createCtx())).rejects.toThrow(
+      '同公司15天内已投递3个不同岗位',
+    )
+    expect(storageState).toEqual({
+      '10001': [
+        {
+          brandId: 'brand-a',
+          jobIds: ['job-2', 'job-3'],
+          deliveredCount: 3,
+          lastDeliveredAt: expect.any(Number),
+        },
+      ],
+    })
+  })
+
+  it('blocks the same JD independently of the company allowance', async () => {
+    confState.formData.sameCompanyFilter.value = true
+    storageGetMock.mockResolvedValue({
+      '10001': [
+        {
+          brandId: 'brand-a',
+          jobIds: ['job-1'],
+          deliveredCount: 1,
+          lastDeliveredAt: Date.now(),
+        },
+      ],
+    })
+    const step = handles().SameCompanyFilter() as { fn: Handler }
+    const data = { ...createJobData(), encryptBrandId: 'brand-a', encryptJobId: 'job-1' }
+
+    await expect(step.fn({ data }, createCtx())).rejects.toThrow('相同JD已投递')
   })
 
   it('ends queue waiting before the pending greeting can expire', () => {
@@ -824,7 +885,7 @@ describe('useApplying handles greeting flow', () => {
     expect(ctx.listData.getCard).toHaveBeenCalledTimes(1)
     // 补详情是一次真实的详情请求，BOSS 那边看到的和正常投递的那次没区别，必须过闸门。
     expect(acquireBossAction).toHaveBeenCalledWith('detail', expect.anything())
-    expect(requestBossDataMock).toHaveBeenCalledWith(refetched)
+    expect(requestBossDataMock).toHaveBeenCalledWith(refetched, undefined, 3, expect.any(Function))
   })
 
   it('fails the resend with a clear reason when the detail is gone for good', async () => {

@@ -39,7 +39,8 @@ export const formInfoData: FormInfoData = {
   },
   sameCompanyFilter: {
     label: '相同公司过滤',
-    'data-help': '投递过的公司id存储到浏览器本地，避免多次向同公司投递，即使岗位不同hr不同',
+    'data-help':
+      '同一公司15天内最多投递3个不同岗位，同一JD不会重复投递；记录按账号保存在浏览器本地',
   },
   sameHrFilter: {
     label: '相同Hr过滤',

@@ -240,15 +240,15 @@ defineExpose({ resetRuntimeSettings })
         <div>
           <div class="instrument-setting-row">
             <span class="instrument-setting-copy">
-              <strong>搜索来源比例</strong>
-              <span>搜索岗位在投递队列中的占比</span>
+              <strong>搜索取岗比例</strong>
+              <span>每轮补池从搜索来源获取的软目标</span>
             </span>
             <label class="runtime-settings__unit-field">
               <input
                 v-model.number="conf.formData.deliveryLimit.search"
                 type="number"
                 inputmode="numeric"
-                aria-label="搜索来源比例"
+                aria-label="搜索取岗比例"
                 min="0"
                 max="100"
                 step="5"
@@ -259,15 +259,15 @@ defineExpose({ resetRuntimeSettings })
 
           <div class="instrument-setting-row">
             <span class="instrument-setting-copy">
-              <strong>求职期望来源比例</strong>
-              <span>求职期望岗位在投递队列中的占比</span>
+              <strong>求职期望取岗比例</strong>
+              <span>每轮补池从求职期望获取的软目标</span>
             </span>
             <label class="runtime-settings__unit-field">
               <input
                 v-model.number="conf.formData.deliveryLimit.group"
                 type="number"
                 inputmode="numeric"
-                aria-label="求职期望来源比例"
+                aria-label="求职期望取岗比例"
                 min="0"
                 max="100"
                 step="5"
@@ -369,7 +369,7 @@ defineExpose({ resetRuntimeSettings })
           <label class="instrument-setting-row">
             <span class="instrument-setting-copy">
               <strong>同公司去重</strong>
-              <span>当天不重复投递同一家公司</span>
+              <span>同一家公司 15 天内最多投递 3 个不同岗位，同一 JD 不重复</span>
             </span>
             <AgentSwitch v-model="conf.formData.sameCompanyFilter.value" />
           </label>

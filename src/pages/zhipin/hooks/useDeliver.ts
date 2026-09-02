@@ -21,11 +21,14 @@ import {
   DeliveryStoppedError,
   GreetError,
   JobDataIncompleteError,
+  JobDetailAccessError,
   JobUnavailableError,
   LimitError,
   PublishError,
+  PageSessionUnavailableError,
   RateLimitError,
   RetryablePipelineError,
+  SecurityCheckRequiredError,
   UnknownError,
 } from '@/types/deliverError'
 import type { FormData } from '@/types/formData'
@@ -33,6 +36,7 @@ import { AgentMessage } from '@/ui/instrument'
 import { delay, getCurDay } from '@/utils'
 import { ActionGateTimeoutError } from '@/utils/actionGate'
 import { acquireBossAction, getCurrentPaceMultiplier } from '@/utils/actionGateStore'
+import { assertBossSecurityCheckClear } from '@/utils/bossPageState'
 import { sampleHumanDelayMs } from '@/utils/humanPace'
 import { logger } from '@/utils/logger'
 import { getProviderHeartbeatDiagnostic, isProviderHeartbeatError } from '@/utils/providerHealth'
@@ -56,6 +60,10 @@ export type JobListHandleResult =
   | 'sourceLimit'
   | 'stopped'
   | 'terminalError'
+  | 'detailRefused'
+  | 'sessionUnavailable'
+  | 'securityCheck'
+  | 'sourceDeferred'
   | 'aiUnavailable'
   | 'rateLimited'
 type ProcessJobResult =
@@ -64,6 +72,10 @@ type ProcessJobResult =
   | 'sourceLimit'
   | 'stopped'
   | 'terminalError'
+  | 'detailRefused'
+  | 'sessionUnavailable'
+  | 'securityCheck'
+  | 'sourceDeferred'
   | 'aiUnavailable'
   | 'rateLimited'
 type ProcessMode = 'full' | 'greetingOnly'
@@ -197,6 +209,17 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     return countCommunicationAgainstDailyLimit(ctx, false)
   }
 
+  function countProcessedSource(ctx: logData, data: MyJobListData) {
+    const source = ctx.deliverySource ?? getDeliveryLimitSource()
+    const totalKey = source === 'group' ? 'groupTotal' : 'searchTotal'
+    statistics.todayData[totalKey] = (statistics.todayData[totalKey] ?? 0) + 1
+
+    if (ctx.deliveryStage === '已过滤' || data.status.status === 'filtered') {
+      const filteredKey = source === 'group' ? 'groupFiltered' : 'searchFiltered'
+      statistics.todayData[filteredKey] = (statistics.todayData[filteredKey] ?? 0) + 1
+    }
+  }
+
   function assertDeliveryNotStopped(message: string) {
     if (common.deliverStop) throw new DeliveryStoppedError(message)
   }
@@ -251,6 +274,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       setDeliveryStage(ctx, data, mode === 'greetingOnly' ? '正在打招呼' : 'JD筛选中', record)
       currentData.value = data
       try {
+        assertBossSecurityCheckClear()
         addLogTrace(
           ctx,
           '流程',
@@ -279,8 +303,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
               ),
           })
           assertDeliveryNotStopped('用户已停止投递，当前岗位未建立沟通')
-          await sendPublishReq(data, undefined, 3, {}, ctx)
+          await sendPublishReq(data, undefined, 3, {}, ctx, {
+            limitConfirmationAttempted: false,
+            shouldAbort: () => common.deliverStop,
+          })
           shouldWaitForBatchRest = countConfirmedCommunication(ctx)
+          // 公司去重记录必须在 BOSS 已确认建立沟通后立即落盘，不能等 AI 招呼语完成；
+          // 否则招呼语失败后重试会再次尝试同公司，导致公司额度和实际沟通不一致。
+          for (const handler of chandle.afterPublish ?? []) {
+            await handler({ data }, ctx)
+          }
           shouldWaitForHumanLikePace = true
           addLogTrace(ctx, '投递后处理', 'info', `开始执行 ${chandle.after.length} 个投递后处理`)
         }
@@ -343,6 +375,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         return 'success'
       } catch (e: any) {
         const publishPhase = getPublishPhase(ctx)
+        if (e instanceof SecurityCheckRequiredError) {
+          shouldCachePipeline = false
+          shouldCountTotal = false
+          data.status.setStatus('wait', '页面安全校验完成后继续')
+          addLogTrace(ctx, '流程', 'warning', e.message)
+          log.touchDelivery(record, ctx)
+          common.deliverStop = true
+          terminalError.value = e.message
+          return 'securityCheck'
+        }
         if (e instanceof ActionGateTimeoutError) {
           // 等到闸门超时，说明撞上了硬顶——那是「跑太快」的信号，不是这个岗位的错。
           // 原来它顺着未知错误走成岗位失败并清掉检查点，方向正好反了：应该停下来、
@@ -358,10 +400,10 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             data.status.setStatus('wait', '等待中')
           }
           addLogTrace(ctx, '流程', 'warning', `动作闸门限速超时，已暂停：${e.message}`)
-          AgentMessage.warning('操作过于频繁，已暂停投递')
+          AgentMessage.warning('本地动作队列拥塞，稍后将自动继续')
           common.deliverStop = true
           terminalError.value = e.message
-          return 'aiUnavailable'
+          return 'sourceDeferred'
         }
         if (
           (publishPhase === 'sent' || publishPhase === 'unknown') &&
@@ -458,11 +500,18 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           })
         }
         const isGreetingAfterPublishFailure = e instanceof GreetError && ctx.publish?.ok === true
+        const isDetailAccessFailure = e instanceof JobDetailAccessError
+        const isPageSessionFailure = e instanceof PageSessionUnavailableError
         const failureStage = inferFailureStage(ctx)
-        setDeliveryStage(ctx, data, e.state === 'warning' ? '已过滤' : '投递失败', record)
+        setDeliveryStage(
+          ctx,
+          data,
+          e.state === 'warning' && !isDetailAccessFailure ? '已过滤' : '投递失败',
+          record,
+        )
         ctx.failureStage = failureStage
         ctx.failureReason = e.message ?? ''
-        ctx.retryable = canRetryError(e, ctx)
+        ctx.retryable = isDetailAccessFailure || isPageSessionFailure || canRetryError(e, ctx)
         ctx.state = isGreetingAfterPublishFailure
           ? '招呼语失败'
           : e.state === 'warning'
@@ -480,31 +529,50 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           ctx,
         )
 
-        if (e instanceof JobUnavailableError || e instanceof JobDataIncompleteError) {
+        if (isPageSessionFailure) {
+          shouldCachePipeline = false
+          shouldCountTotal = false
+          data.status.setStatus('wait', '页面会话已失效，刷新页面后可继续')
+          addLogTrace(ctx, '流程', 'warning', `页面会话已失效，已暂停并保留岗位：${e.message}`)
+          AgentMessage.warning('页面状态已失效，刷新 BOSS 页面后可继续投递')
+          common.deliverStop = true
+          terminalError.value = e.message
+          return 'sessionUnavailable'
+        }
+
+        if (isDetailAccessFailure) {
           jobWasUnevaluable = true
           consecutiveUnevaluableJobs += 1
-          // 这里曾经有一条「看到『您的环境存在异常』就立刻收工」的短路，是 1.3.0 把它误判成
-          // 账号风控加的。那条短路正是用户每投十几个就得手动点一次继续的原因：一个放旧了的
-          // 岗位，判了整轮的死刑。真正的原因是凭据过期，现在在发请求之前就拦掉了
-          // （JobCredentialExpiredError，算过滤不算失败）。
-          //
-          // 只留三振：如果凭据没过期还连着三个评估不了，说明上面的判断不成立，那时候停才对。
-          if (consecutiveUnevaluableJobs >= unevaluableJobLimit) {
-            // 停下来，但不对原因下结论。连续失败说明问题不在单个岗位上——投递池里的岗位是
-            // 几分钟前刚抓的，连着三个恰好同时下线讲不通。至于是被限制、登录态失效还是
-            // 别的，日志里现在带着真实报错和 code，看了才知道。
-            const msg = `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，已暂停：${e.message}`
-            shouldCachePipeline = false
-            shouldCountTotal = false
-            data.status.setStatus('wait', '等待中')
-            addLogTrace(ctx, '流程', 'danger', msg)
-            AgentMessage.error('连续多个岗位无法评估，已暂停投递，请查看运行日志')
-            common.deliverStop = true
+          shouldCachePipeline = false
+          shouldCountTotal = false
+          data.credentialRefreshReason = e.kind
+          if (data.deliveryCredentialOrigin == null) {
+            jobWasUnevaluable = false
+            consecutiveUnevaluableJobs = 0
+            data.credentialRefreshRequired = false
+            data.credentialRefreshDeferred = true
+            data.status.setStatus('wait', '缺少原始来源，等待列表重新发现')
+            addLogTrace(ctx, '流程', 'warning', '岗位缺少凭据来源，已跳过当前批次并等待重新发现')
+            return 'failed'
+          }
+          data.credentialRefreshRequired = true
+          data.credentialRefreshDeferred = false
+          data.status.setStatus('wait', '详情暂不可用，等待刷新凭据后重试')
+          if (e.kind === 'credentials-stale' || consecutiveUnevaluableJobs >= unevaluableJobLimit) {
+            const msg = `连续 ${consecutiveUnevaluableJobs} 个岗位无法评估，重抓列表后继续：${e.message}`
+            addLogTrace(ctx, '流程', 'warning', msg)
             terminalError.value = msg
-            return 'terminalError'
+            return 'detailRefused'
           }
           return 'failed'
         }
+
+        if (e instanceof JobDataIncompleteError) {
+          shouldCachePipeline = false
+          return 'failed'
+        }
+
+        if (e instanceof JobUnavailableError) return 'failed'
 
         if (e instanceof AIProviderError || e instanceof RetryablePipelineError) {
           shouldCachePipeline = false
@@ -537,13 +605,12 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
 
         if (e instanceof PublishError) {
           shouldCachePipeline = false
-          shouldCountTotal = false
-          const msg = `投递接口异常，已暂停投递，当前岗位可重试：${e.message}`
-          addLogTrace(ctx, '流程', 'danger', msg)
-          AgentMessage.error('投递接口异常，任务已暂停，可稍后重试当前岗位')
-          common.deliverStop = true
-          terminalError.value = e.message
-          return 'terminalError'
+          // 明确的岗位级拒绝已经完成一次处理；手动重试使用 isRetry=true，避免重复计数。
+          shouldCountTotal = true
+          const msg = `投递接口拒绝当前岗位，已记录为可重试并继续后续岗位：${e.message}`
+          addLogTrace(ctx, '流程', 'warning', msg)
+          AgentMessage.warning('当前岗位投递失败，已继续处理后续岗位')
+          return 'failed'
         }
 
         if (e instanceof LimitError) {
@@ -605,6 +672,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
 
       if (shouldCountTotal || (!isRetry && ctx.communicationCounted === true)) {
         statistics.todayData.total++
+        countProcessedSource(ctx, data)
       }
       await flushJobRunState(ctx, record, delivered ? '岗位处理成功' : '岗位处理结束')
       if (shouldWaitForHumanLikePace) {
@@ -836,7 +904,15 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           )
           return 'stopped'
         }
-        if (result === 'terminalError' || result === 'aiUnavailable' || result === 'rateLimited') {
+        if (
+          result === 'terminalError' ||
+          result === 'detailRefused' ||
+          result === 'sessionUnavailable' ||
+          result === 'securityCheck' ||
+          result === 'sourceDeferred' ||
+          result === 'aiUnavailable' ||
+          result === 'rateLimited'
+        ) {
           log.info(
             '岗位处理',
             `当前页处理因运行错误终止\n${JSON.stringify({
@@ -957,6 +1033,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       // 招呼语续发同样要在 AI 失败时停下，否则会带着一个已知失效的模型把剩下的记录跑完。
       if (
         result === 'terminalError' ||
+        result === 'detailRefused' ||
+        result === 'sessionUnavailable' ||
         result === 'aiUnavailable' ||
         result === 'rateLimited' ||
         result === 'sourceLimit' ||

@@ -86,6 +86,10 @@ const {
       total: 50,
       groupSuccess: 4,
       searchSuccess: 30,
+      groupTotal: 8,
+      searchTotal: 42,
+      groupFiltered: 4,
+      searchFiltered: 10,
       company: 0,
       jobTitle: 1,
       jobContent: 0,
@@ -299,11 +303,11 @@ describe('operation panel', () => {
     expect(wrapper.find('.operation-panel__source-chart').exists()).toBe(false)
     expect(wrapper.find('.operation-panel__source-result-bar').exists()).toBe(false)
     expect(text).toContain('来源')
-    expect(text).toContain('获取')
-    expect(text).toContain('处理')
-    expect(text).toContain('成功')
-    expect(text).toContain('过滤')
-    expect(text).toContain('异常')
+    expect(text).toContain('待处理')
+    expect(text).toContain('今日处理')
+    expect(text).toContain('今日成功')
+    expect(text).toContain('今日过滤')
+    expect(text).toContain('今日异常')
     expect(text).toContain('成功率')
     expect(text).not.toContain('成功/失败')
     expect(text).not.toContain('过滤/异常')
@@ -318,24 +322,23 @@ describe('operation panel', () => {
       .find((row) => row.text().includes('求职期望'))
     expect(groupSourceRow?.find('strong').exists()).toBe(false)
     expect(groupSourceRow?.find('.operation-panel__source-name').exists()).toBe(true)
-    // 来源表恒定按投递记录统计；这个 fixture 里求职期望只有一条已过滤记录，
-    // 成功数不再从统计计数器借。
+    // 待处理来自统一投递队列，其余列来自全天持久统计。
     expect(groupSourceRow?.findAll('span').map((cell) => cell.text())).toEqual([
       '2',
-      '1',
+      '8',
+      '4',
+      '4',
       '0',
-      '1',
-      '0',
-      '0%',
+      '50%',
     ])
-    expect(text).toContain('失败归因')
+    expect(text).toContain('最近记录归因')
     expect(text).toContain('岗位方向不符')
     expect(text).toContain('接口/风控')
     expect(text).toContain('运行参数')
     expect(text).toContain('求职期望 50% / 搜索 50%')
   })
 
-  it('shows unassigned source records separately from search source metrics', () => {
+  it('does not let an unassigned recent record distort persistent source totals', () => {
     const previousLogs = logData.value
     logData.value = [
       ...previousLogs,
@@ -358,21 +361,9 @@ describe('operation panel', () => {
     try {
       const wrapper = mount(OperationPanel)
       const text = wrapper.text()
-      const unknownSourceRow = wrapper
-        .findAll('.operation-panel__source-table-row')
-        .find((row) => row.text().includes('未归因来源'))
-
-      expect(text).toContain('未归因来源')
-      expect(text).not.toContain('目标 0% / 实际 12.5%')
-      expect(unknownSourceRow?.findAll('span').map((cell) => cell.text())).toEqual([
-        '未归因来源',
-        '0',
-        '1',
-        '0',
-        '0',
-        '1',
-        '0%',
-      ])
+      expect(text).not.toContain('未归因历史')
+      expect(wrapper.findAll('.operation-panel__source-table-row')).toHaveLength(2)
+      expect(text).toContain('接口/风控')
     } finally {
       logData.value = previousLogs
     }
@@ -435,6 +426,42 @@ describe('operation panel', () => {
       logData.value = previousLogs
       delete (document as any).visibilityState
     }
+  })
+
+  it('coalesces overlapping statistics refreshes', async () => {
+    let resolveUpdate!: () => void
+    statistics.updateStatistics.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => (resolveUpdate = resolve))
+      return undefined
+    })
+
+    mount(OperationPanel)
+    await flushPromises()
+    window.dispatchEvent(new Event('focus'))
+    document.dispatchEvent(new Event('visibilitychange'))
+
+    expect(statistics.updateStatistics).toHaveBeenCalledTimes(1)
+    resolveUpdate()
+    await flushPromises()
+  })
+
+  it('defers statistics and task recovery until the host runtime is ready', async () => {
+    statistics.updateStatistics.mockClear()
+    const wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    await flushPromises()
+
+    expect(statistics.updateStatistics).not.toHaveBeenCalled()
+
+    await wrapper.setProps({ runtimeReady: true })
+    await flushPromises()
+
+    expect(statistics.updateStatistics).toHaveBeenCalledOnce()
+
+    await wrapper.setProps({ runtimeReady: true })
+    window.dispatchEvent(new Event('focus'))
+    await flushPromises()
+
+    expect(statistics.updateStatistics).toHaveBeenCalledTimes(2)
   })
 
   it('stops scheduled statistics refreshes when an extension update invalidates the page context', async () => {

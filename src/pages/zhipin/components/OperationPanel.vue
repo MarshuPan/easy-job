@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import { Pause, Play, RotateCcw, Square } from 'lucide-vue-next'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 
 import type {
   DeliveryTaskActivePhase,
@@ -8,7 +8,6 @@ import type {
   DurableDeliveryTask,
 } from '@/background/deliveryTaskCoordinator'
 import { DELIVERY_WORKER_LEASE_MS } from '@/background/deliveryTaskCoordinator'
-import { sameCompanyKey, sameHrKey } from '@/composables/useApplying/utils'
 import { useCommon } from '@/composables/useCommon'
 import { useStatistics } from '@/composables/useStatistics'
 import { getRootVue } from '@/composables/useVue'
@@ -16,6 +15,7 @@ import { decideAcquisition } from '@/delivery/acquisition/decide'
 import {
   buildDeliveryConfigSnapshot,
   buildDeliveryQueueConfigScope,
+  normalizeDeliverySourceKey,
   parseDeliveryConfigSnapshot,
   type DeliveryConfigSnapshot,
 } from '@/delivery/configSnapshot'
@@ -24,11 +24,13 @@ import { useConf } from '@/stores/conf'
 import { jobList, type MyJobListData } from '@/stores/jobs'
 import { useLog } from '@/stores/log'
 import { useUser } from '@/stores/user'
+import { SecurityCheckRequiredError } from '@/types/deliverError'
 import { AgentButton, AgentMessage } from '@/ui/instrument'
 import { delay, getCurDay } from '@/utils'
 import { createAccountStorageKey } from '@/utils/accountStorage'
 import { acquireBossAction } from '@/utils/actionGateStore'
 import { startBackgroundKeepAlive } from '@/utils/backgroundKeepAlive'
+import { assertBossSecurityCheckClear } from '@/utils/bossPageState'
 import {
   ExtensionRuntimeHealthError,
   getExtensionRuntimeHealthDiagnostic,
@@ -57,21 +59,18 @@ import {
   type DeliveryFailureCategoryId,
 } from '../utils/deliveryDashboard'
 import {
-  createPoolAdmission,
-  type DeliveredKeys,
-  explainImpossibleDelivery,
-  sameCompanyPoolQuota,
-} from '../utils/deliveryDedupe'
-import {
+  findNextRunnableTaskStepIndex,
   findNextTaskStepIndexBySource,
   getDeliverableJobs,
   getDeliveryJobKey,
   getDeliveryJobOrder,
   getDeliveryJobSource,
+  getNextTaskStepRetryAt,
   getTaskStepLabel,
   hasPrefetchableStep,
   isSameNavigationLocation,
   isSameTaskStep,
+  isTaskStepRunnable,
   summarizePools,
   summarizeTaskSteps,
 } from '../utils/deliveryEngine'
@@ -80,7 +79,6 @@ import {
   getDeliveryLimit,
   getDeliveryLimitSuccess,
   hasDailyDeliveryRemaining,
-  setRiskAdjustedDailyLimit,
   inferDeliveryLimitSource,
   setDeliveryLimitSourceOverride,
   type DeliveryLimitSource,
@@ -92,18 +90,23 @@ import {
   selectDeliveryBatch,
 } from '../utils/deliveryQueue'
 import {
+  chooseDeliveryStopReason,
+  keepsDeliveryCheckpoint,
+  shouldAutoResumeDelivery,
+  type DeliveryStopReason,
+} from '../utils/deliverySafety'
+import {
   advanceDeliveryTaskCycleProgress,
   clearDeliveryTask,
   createDeliveryTask,
   DELIVERY_TASK_HEARTBEAT_INTERVAL_MS,
   DELIVERY_TASK_HEARTBEAT_MAX_AGE_MS,
-  DELIVERY_TASK_MAX_EMPTY_CYCLES,
   findNextWarmupStepIndex,
   getFreshDeliveryTaskHeartbeat,
-  hasReachedDeliveryTaskEmptyCycleLimit,
   getCurrentTaskStep,
   getDefaultGroupUrl,
   markCurrentStepDone,
+  markWarmupStepAttempted,
   readDeliveryTask,
   restoreDeliveryTask,
   rotateToNextTaskStep,
@@ -122,20 +125,25 @@ import {
   getJobSourceLabel,
   getRecommendationJobExpectation,
   isGroupExpectationListReady,
-  isRecommendationExpectation,
   readNativeJobExpectationOptions,
   type JobExpectation,
 } from '../utils/jobExpectations'
 import { diffJobListSnapshot, type JobListSnapshot } from '../utils/jobListDelta'
 import {
   decideRiskBackoff,
-  getRiskAdjustedDailyLimit,
   readTodayRecord,
   riskBackoffKey,
+  withRiskBackoffStorageTimeout,
 } from '../utils/riskBackoff'
 import operationPanelRuntimeStyles from './OperationPanel.styles.css.txt?raw'
 
 const conf = useConf()
+const props = withDefaults(
+  defineProps<{
+    runtimeReady?: boolean
+  }>(),
+  { runtimeReady: true },
+)
 const common = useCommon()
 const deliver = useDeliver()
 const log = useLog()
@@ -168,7 +176,9 @@ const resumeNavigationPendingTimeoutMs = 15000
 const deliveryQueueBatchSize = 10
 const deliveryPoolBatchTargetSize = 100
 const sourcePoolMaxLowWaterMark = 20
-const sourcePoolPrefetchMaxPages = 1
+// BOSS 列表通常每页 15 个左右；一轮约 100 个岗位需要跨越多页。
+// 这是单次来源补池的保护上限，不代表来源耗尽。达到上限仍保留游标，下一轮继续。
+const sourcePoolPrefetchMaxPages = 8
 const sourcePoolPrefetchPageTimeoutMs = 30_000
 const deliveryReconnectRetryMs = 5_000
 const dailyDeliveryLimit = DAILY_DELIVERY_LIMIT
@@ -209,38 +219,19 @@ let activeRunToken: DeliveryRunToken | null = null
 /** 当前执行阶段，仅用于后台检查点上报。 */
 let activePhase: DeliveryTaskActivePhase = 'acquiring'
 const deliveryWorkerStorageKey = 'agent-delivery:worker-id'
-const durableDeliveryTask = ref<DurableDeliveryTask | null>(null)
-const activeDeliveryConfigSnapshot = ref<DeliveryConfigSnapshot | null>(null)
+// 后台任务和配置一样是跨消息通道的不可变快照；深度代理会让其中的 checkpoint
+// 无法再次 structuredClone（例如暂停后点击继续）。
+const durableDeliveryTask = shallowRef<DurableDeliveryTask | null>(null)
+// 运行快照会跨消息通道 structuredClone，不能被 Vue 深度代理成 reactive 对象。
+const activeDeliveryConfigSnapshot = shallowRef<DeliveryConfigSnapshot | null>(null)
 const deliveryWorkerSessionToken = getOrCreateDeliveryWorkerSessionToken()
 let deliveryWorkerIdPromise: Promise<string> | null = null
+let pendingBackgroundRegistrationTaskId: string | null = null
+let pendingManualPause: { accountUid: string; taskId: string } | null = null
 /**
  * 本次运行的终止原因。这四种情况互斥且有优先级，以前是四个独立布尔，
  * 退出时再用一串三元把它们推导回一个原因——那个推导才是真正的状态，这里直接持有它。
  */
-type DeliveryStopReason =
-  | 'manual-stop'
-  | 'manual-pause'
-  | 'ai-unavailable'
-  | 'daily-limit'
-  | 'terminal-error'
-  | 'runtime-reconnect'
-  | 'risk-control'
-  | 'rate-limited'
-// manual-pause 与 runtime-reconnect 同属「中断循环但保留任务」，区别只在于恢复由用户触发，
-// 因此优先级排在 manual-stop 之下：结束是终态，暂停不能盖过它。
-const stopReasonPriority: Record<DeliveryStopReason, number> = {
-  // 风控优先级最高：任何别的停止理由都不该盖过它，否则会被当成可自动恢复的中断。
-  'risk-control': 6,
-  // 冷却保留任务并自动恢复，优先级与手动暂停同级。
-  'rate-limited': 4,
-  'manual-stop': 5,
-  'manual-pause': 4,
-  // 模型不可用与手动暂停同属「保留任务」，都要能靠「继续」接着跑。
-  'ai-unavailable': 4,
-  'daily-limit': 3,
-  'terminal-error': 2,
-  'runtime-reconnect': 1,
-}
 let stopReason: DeliveryStopReason | null = null
 let terminalFailureMessage: string | null = null
 /**
@@ -250,9 +241,7 @@ let terminalFailureMessage: string | null = null
 let workerOwnershipBlocked = false
 
 function requestDeliveryStop(reason: DeliveryStopReason, message?: string) {
-  if (stopReason == null || stopReasonPriority[reason] > stopReasonPriority[stopReason]) {
-    stopReason = reason
-  }
+  stopReason = chooseDeliveryStopReason(stopReason, reason)
   if (reason === 'terminal-error') terminalFailureMessage ??= message ?? '投递任务发生运行错误'
 }
 let scheduledDeliveryResumeTimer: number | undefined
@@ -279,7 +268,8 @@ function getDeliveryWorkerId() {
     .deliveryWorkerIdentity(deliveryWorkerSessionToken)
     .catch((error) => {
       deliveryWorkerIdPromise = null
-      throw error
+      if (error instanceof ExtensionRuntimeHealthError) throw error
+      throw new ExtensionRuntimeHealthError('BACKGROUND_UNAVAILABLE')
     })
   return deliveryWorkerIdPromise
 }
@@ -344,7 +334,7 @@ const dashboard = computed(() =>
 const taskTitle = computed(() =>
   buildDeliveryTaskTitle(
     deliver.currentData?.jobName,
-    isDeliveryActive.value || isDeliveryPaused.value,
+    isDeliveryActive.value || isDeliveryWaiting.value || isDeliveryPaused.value,
   ),
 )
 const deliveryPaceText = computed(
@@ -356,18 +346,27 @@ const batchRestText = computed(
     `${getExecutionFormData().delay.batchSize} 个 / ${getExecutionFormData().delay.batchRestMinutes} 分钟`,
 )
 const currentSourceText = computed(() => sourceLabelMap[inferDeliveryLimitSource()])
-const hasDurableRunningTask = computed(() => {
+/**
+ * 后台的 waiting-for-page 是自动恢复态，不代表页面正在执行动作。
+ * common.deliverStop + running 覆盖了暂停、限流、来源重试和运行时重连的 RPC 过渡窗口，
+ * 避免在后台状态落盘前短暂又显示出「暂停」按钮或 loading。
+ */
+const isDeliveryWaiting = computed(() => {
   const status = durableDeliveryTask.value?.status
-  return status === 'running' || status === 'waiting-for-page'
+  return status === 'waiting-for-page' || (status === 'running' && common.deliverStop)
 })
 const isDeliveryActive = computed(
-  () => (common.deliverLock && !common.deliverStop) || hasDurableRunningTask.value,
+  () =>
+    !isDeliveryWaiting.value &&
+    ((common.deliverLock && !common.deliverStop) ||
+      durableDeliveryTask.value?.status === 'running'),
 )
 const isDeliveryPaused = computed(
   () => !isDeliveryActive.value && durableDeliveryTask.value?.status === 'paused',
 )
 const runState = computed(() => {
   if (isDeliveryActive.value) return { label: '投递中', type: 'success' as const }
+  if (isDeliveryWaiting.value) return { label: '等待中', type: 'warning' as const }
   if (isDeliveryPaused.value) return { label: '已暂停', type: 'warning' as const }
   if (durableDeliveryTask.value?.status === 'failed')
     return { label: '运行出错', type: 'warning' as const }
@@ -405,10 +404,11 @@ const queueContinuationText = computed(() => {
 })
 const heroStatusText = computed(() => {
   if (isDeliveryActive.value) return `${currentSourceText.value}来源 · 投递流程运行中`
+  if (isDeliveryWaiting.value) return `${currentSourceText.value}来源 · 等待自动继续`
   if (isDeliveryPaused.value) return `${currentSourceText.value}来源 · 已暂停，可继续或结束本轮`
   if (common.deliverStop || durableDeliveryTask.value?.status === 'stopped')
     return `${currentSourceText.value}来源 · 任务已停止`
-  const poolState = dashboard.value.summary.fetched > 0 ? '投递池已就绪' : '等待获取岗位'
+  const poolState = dashboard.value.summary.pending > 0 ? '投递池已就绪' : '等待获取岗位'
   return `${currentSourceText.value}来源 · ${poolState} · 下一步：JD 筛选`
 })
 const taskSequence = computed(() => {
@@ -421,17 +421,19 @@ const taskSequence = computed(() => {
     {
       number: '01',
       label: '获取岗位',
-      description: dashboard.value.summary.fetched > 0 ? '投递池已就绪' : '等待获取岗位',
-      state: dashboard.value.summary.fetched > 0 ? 'complete' : 'current',
+      description: dashboard.value.summary.pending > 0 ? '投递池已就绪' : '等待获取岗位',
+      state: dashboard.value.summary.pending > 0 ? 'complete' : 'current',
     },
     {
       number: '02',
       label: 'JD 筛选',
       description: running
         ? '投递流程正在筛选'
-        : common.deliverStop
-          ? '流程已暂停'
-          : '等待任务启动',
+        : isDeliveryWaiting.value
+          ? '等待自动继续'
+          : common.deliverStop
+            ? '流程已暂停'
+            : '等待任务启动',
       state: running ? 'current' : 'idle',
     },
     {
@@ -461,24 +463,41 @@ const taskSequence = computed(() => {
 let statisticsRefreshTimer: number | undefined
 let statisticsRefreshDisabled = false
 let statisticsReadyForDelivery = false
+let statisticsRefreshPromise: Promise<boolean> | null = null
+let operationPanelMounted = false
+let operationRuntimeActivated = false
 
 onMounted(() => {
+  operationPanelMounted = true
   statisticsRefreshDisabled = false
   jobList.setDeliveryPoolCaptureEnabled(false)
   ensureOperationPanelRuntimeStyles()
-  window.addEventListener('agent-delivery:job-runtime-ready', handleRuntimeReady)
+  if (props.runtimeReady) activateOperationRuntime()
+})
+
+watch(
+  () => props.runtimeReady,
+  (ready) => {
+    if (ready && operationPanelMounted) activateOperationRuntime()
+  },
+)
+
+function activateOperationRuntime() {
+  if (operationRuntimeActivated) return
+  operationRuntimeActivated = true
   window.addEventListener('focus', handleStatisticsFocus)
   document.addEventListener('visibilitychange', handleStatisticsVisibilityChange)
   statisticsRefreshTimer = window.setInterval(requestStatisticsRefresh, statisticsRefreshIntervalMs)
   void (async () => {
     await refreshStatisticsForCurrentDate()
+    if (!operationPanelMounted) return
     try {
       await resumeDeliveryTask('mounted')
     } catch (error) {
       logger.warn('读取后台投递任务失败，等待运行时恢复后重试', error)
     }
   })()
-})
+}
 
 /**
  * 投递运行期间保住 background service worker。
@@ -499,7 +518,7 @@ function endBackgroundKeepAlive() {
 }
 
 onUnmounted(() => {
-  window.removeEventListener('agent-delivery:job-runtime-ready', handleRuntimeReady)
+  operationPanelMounted = false
   if (scheduledDeliveryResumeTimer != null) {
     window.clearTimeout(scheduledDeliveryResumeTimer)
     scheduledDeliveryResumeTimer = undefined
@@ -519,23 +538,33 @@ function stopStatisticsRefresh() {
 
 async function refreshStatisticsForCurrentDate() {
   if (statisticsRefreshDisabled) return false
-  currentLocalDate.value = getCurDay()
-  try {
-    await statistics.updateStatistics()
-    statisticsReadyForDelivery = true
-    return true
-  } catch (error) {
-    statisticsReadyForDelivery = false
-    if (isExtensionContextInvalidatedError(error)) {
-      statisticsRefreshDisabled = true
-      common.deliverStop = true
-      stopStatisticsRefresh()
-      return false
-    }
-    logger.warn('刷新当日统计失败，已保留当前页面内存统计', error)
-    return false
-  } finally {
+  if (statisticsRefreshPromise != null) return statisticsRefreshPromise
+
+  const refreshPromise = (async () => {
     currentLocalDate.value = getCurDay()
+    try {
+      await statistics.updateStatistics()
+      statisticsReadyForDelivery = true
+      return true
+    } catch (error) {
+      statisticsReadyForDelivery = false
+      if (isExtensionContextInvalidatedError(error)) {
+        statisticsRefreshDisabled = true
+        common.deliverStop = true
+        stopStatisticsRefresh()
+        return false
+      }
+      logger.warn('刷新当日统计失败，已保留当前页面内存统计', error)
+      return false
+    } finally {
+      currentLocalDate.value = getCurDay()
+    }
+  })()
+  statisticsRefreshPromise = refreshPromise
+  try {
+    return await refreshPromise
+  } finally {
+    if (statisticsRefreshPromise === refreshPromise) statisticsRefreshPromise = null
   }
 }
 
@@ -550,25 +579,6 @@ function handleStatisticsFocus() {
 
 function handleStatisticsVisibilityChange() {
   if (document.visibilityState === 'visible') requestStatisticsRefresh()
-}
-
-function handleRuntimeReady() {
-  void (async () => {
-    try {
-      statisticsRefreshDisabled = false
-      window.addEventListener('focus', handleStatisticsFocus)
-      document.addEventListener('visibilitychange', handleStatisticsVisibilityChange)
-      if (statisticsRefreshTimer == null) {
-        statisticsRefreshTimer = window.setInterval(
-          requestStatisticsRefresh,
-          statisticsRefreshIntervalMs,
-        )
-      }
-      await resumeDeliveryTask('runtime-ready')
-    } catch (error) {
-      logger.warn('插件运行时恢复后读取投递任务失败', error)
-    }
-  })()
 }
 
 function ensureOperationPanelRuntimeStyles() {
@@ -623,86 +633,10 @@ function getConfiguredSourcePool(source: DeliveryLimitSource) {
   )
 }
 
-/**
- * 已投递过的公司与 HR。入池预判要用，但读取是异步的，而抓取页面是同步的，
- * 所以在每次补池之前刷新一份快照。没加载出来时预判一律放行，退化成原来的行为。
- *
- * 集合在运行中会随着投递成功而增长，快照稍旧只意味着少拦几个，处理岗位时的判定仍是权威。
- */
-let deliveredKeysSnapshot: DeliveredKeys | null = null
-
-async function refreshDeliveredKeys() {
-  const uid = getCurrentAccountUid()
-  if (uid == null) return
-  try {
-    const [companies, bosses] = await Promise.all([
-      counter.storageGet<Record<string, string[]>>(sameCompanyKey, {}),
-      counter.storageGet<Record<string, string[]>>(sameHrKey, {}),
-    ])
-    deliveredKeysSnapshot = {
-      companies: new Set(companies?.[uid] ?? []),
-      bosses: new Set(bosses?.[uid] ?? []),
-    }
-  } catch (error) {
-    // 预判失败不该拦住投递：保持上一次快照，继续按原来的行为抓取。
-    logger.warn('读取去重快照失败，本次跳过入池预判', { error })
-  }
-}
-
-function getDedupeSettings() {
-  const formData = getExecutionFormData()
-  return {
-    sameCompany: formData.sameCompanyFilter.value,
-    sameHr: formData.sameHrFilter.value,
-    friendStatus: formData.friendStatus.value,
-  }
-}
-
-/**
- * 把已经投过的公司留在池子里的同伴作废。
- *
- * 入池预判只能拦住入池那一刻就已知重复的岗位。一家还没投过的公司发了 20 个 JD，20 个都是
- * 合法候选；等第一个投出去，剩下的当场变成死数据，却仍然是待处理状态，继续把水位撑着。
- * 所以每次刷新快照之后再扫一遍池子，把新变成死数据的标掉。
- */
-function pruneDeliveredCompanySiblings() {
-  if (deliveredKeysSnapshot == null) return
-  const settings = getDedupeSettings()
-  const pruned: Record<string, number> = {}
-  for (const source of ['group', 'search'] as const) {
-    for (const job of getDeliverableJobs(getConfiguredSourcePool(source))) {
-      const reason = explainImpossibleDelivery(job, settings, deliveredKeysSnapshot)
-      if (reason == null) continue
-      job.status.setStatus('filtered', reason)
-      pruned[reason] = (pruned[reason] ?? 0) + 1
-    }
-  }
-  const total = Object.values(pruned).reduce((sum, count) => sum + count, 0)
-  if (total > 0) {
-    logBatchDiagnostic('投递池中已失效的岗位已作废', { pruned, total })
-  }
-}
-
-/**
- * 算出当前页有哪些岗位可以进池。
- *
- * 判据带状态（每放行一个就占掉该公司一个名额），所以只跑一遍，把结果固化成 id 集合再交给
- * store，避免第二次调用把配额算重。
- */
-function selectAdmissibleJobs(source: DeliveryLimitSource) {
-  const candidates = jobList._list.value
-  if (deliveredKeysSnapshot == null) return null
-  const admit = createPoolAdmission({
-    settings: getDedupeSettings(),
-    delivered: deliveredKeysSnapshot,
-    pooled: getDeliverableJobs(getConfiguredSourcePool(source)),
-  })
-  return new Set(candidates.filter(admit).map((job) => job.encryptJobId))
-}
-
 function captureCurrentPageToDeliveryPool(
   source: DeliveryLimitSource = inferDeliveryLimitSource(),
   groupTargetId?: string,
+  searchDirectionOverride?: string,
 ) {
   const currentTask = readCurrentAccountDeliveryTask()
   const currentStep = currentTask == null ? undefined : getCurrentTaskStep(currentTask)
@@ -713,7 +647,8 @@ function captureCurrentPageToDeliveryPool(
       : undefined
   const searchDirection =
     source === 'search'
-      ? currentStep?.searchDirection ||
+      ? searchDirectionOverride ||
+        currentStep?.searchDirection ||
         new URL(location.href).searchParams.get('query') ||
         undefined
       : undefined
@@ -732,8 +667,6 @@ function captureCurrentPageToDeliveryPool(
     })
     return 0
   }
-  const listLength = jobList._list.value.length
-  const admissibleIds = selectAdmissibleJobs(source)
   // 名字在这一刻是确定的（正在处理的就是这个期望），刻进岗位后就不再依赖启用列表。
   const resolvedGroupName =
     resolvedGroupTargetId == null
@@ -747,19 +680,10 @@ function captureCurrentPageToDeliveryPool(
     source,
     resolvedGroupTargetId,
     searchDirection,
-    admissibleIds == null ? undefined : (job) => admissibleIds.has(job.encryptJobId),
+    undefined,
     resolvedGroupName === '求职期望' ? undefined : resolvedGroupName,
+    Math.max(1, Number(page.value.page) || 1),
   )
-  const skipped = admissibleIds == null ? 0 : listLength - admissibleIds.size
-  if (skipped > 0) {
-    logBatchDiagnostic('入池前已排除的岗位', {
-      source,
-      skipped,
-      listLength,
-      companyQuota: sameCompanyPoolQuota,
-      reason: '同公司/同HR/已沟通，或同公司名额已满',
-    })
-  }
   if (added > 0) {
     logBatchDiagnostic('当前页面岗位已写入投递池', {
       source,
@@ -792,13 +716,63 @@ async function pauseDeliver() {
   const accountUid = getCurrentAccountUid()
   const taskId = readCurrentAccountDeliveryTask()?.id ?? durableDeliveryTask.value?.runId
   if (accountUid == null || taskId == null) return
-  const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskPause({ uid: accountUid, runId: taskId, workerId })
-  endBackgroundKeepAlive()
-  setDurableDeliveryTask(result.task)
-  if (!result.accepted) {
-    logBatchDiagnostic('暂停投递未被接受', { taskId, conflict: result.conflict ?? null })
-    AgentMessage.warning('任务已经结束，无法暂停')
+  try {
+    const workerId = await getDeliveryWorkerId()
+    const result = await callDeliveryTaskRpc(() =>
+      counter.deliveryTaskPause({ uid: accountUid, runId: taskId, workerId }),
+    )
+    endBackgroundKeepAlive()
+    setDurableDeliveryTask(result.task)
+    pendingManualPause = null
+    if (!result.accepted) {
+      logBatchDiagnostic('暂停投递未被接受', { taskId, conflict: result.conflict ?? null })
+      AgentMessage.warning('任务已经结束，无法暂停')
+    }
+  } catch (error) {
+    // 页面内的停止标志和本地检查点已经先落盘；后台恢复后重试 pause，不能把一次
+    // service worker 瞬断冒泡成未处理 Promise 或丢掉用户的暂停意图。
+    pendingManualPause = { accountUid, taskId }
+    logBatchDiagnostic('暂停投递等待后台重连', {
+      taskId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    scheduleDeliveryResumeAt(Date.now() + deliveryReconnectRetryMs)
+    AgentMessage.info('插件后台暂时不可用，暂停状态将在连接恢复后保存')
+  }
+}
+
+async function retryPendingManualPause() {
+  const pendingPause = pendingManualPause
+  if (pendingPause == null) return true
+  try {
+    const workerId = await getDeliveryWorkerId()
+    const result = await callDeliveryTaskRpc(() =>
+      counter.deliveryTaskPause({
+        uid: pendingPause.accountUid,
+        runId: pendingPause.taskId,
+        workerId,
+      }),
+    )
+    setDurableDeliveryTask(result.task)
+    pendingManualPause = null
+    if (result.accepted) {
+      endBackgroundKeepAlive()
+      logBatchDiagnostic('后台重连后暂停投递成功', { taskId: pendingPause.taskId })
+    } else {
+      logBatchDiagnostic('后台重连后暂停投递未被接受', {
+        taskId: pendingPause.taskId,
+        conflict: result.conflict ?? null,
+      })
+      AgentMessage.warning('任务已经结束，无法暂停')
+    }
+    return true
+  } catch (error) {
+    logBatchDiagnostic('后台重连后暂停投递仍未完成', {
+      taskId: pendingPause.taskId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    scheduleDeliveryResumeAt(Date.now() + deliveryReconnectRetryMs)
+    return false
   }
 }
 
@@ -809,25 +783,41 @@ async function resumeFromPause() {
     AgentMessage.warning('没有可继续的投递任务')
     return
   }
-  const workerId = await getDeliveryWorkerId()
-  // claim 把暂停中的任务重新置为 running 并取回租约；拿不到就说明别的标签页已经接管。
-  const result = await counter.deliveryTaskResume({ uid: accountUid, runId: taskId, workerId })
-  setDurableDeliveryTask(result.task)
-  if (result.accepted) beginBackgroundKeepAlive()
-  if (!result.accepted) {
-    logBatchDiagnostic('继续投递未被接受', { taskId, conflict: result.conflict ?? null })
-    AgentMessage.warning(
-      result.conflict === 'worker-owned'
-        ? '另一个标签页正在执行这个任务'
-        : '任务已结束，请重新开始',
-    )
+  if (restoreDeliveryTask(durableDeliveryTask.value?.checkpoint, accountUid) == null) {
+    logBatchDiagnostic('继续投递失败：后台检查点无效', { taskId })
+    AgentMessage.error('投递检查点已失效，请重新开始')
     return
   }
-  logBatchDiagnostic('用户继续投递', { taskId })
-  stopReason = null
-  common.deliverStop = false
-  jobList.setDeliveryPoolCaptureEnabled(true)
-  await resumeDeliveryTask('manual-resume')
+  try {
+    const workerId = await getDeliveryWorkerId()
+    // claim 把暂停中的任务重新置为 running 并取回租约；拿不到就说明别的标签页已经接管。
+    const result = await callDeliveryTaskRpc(() =>
+      counter.deliveryTaskResume({ uid: accountUid, runId: taskId, workerId }),
+    )
+    setDurableDeliveryTask(result.task)
+    if (!result.accepted) {
+      logBatchDiagnostic('继续投递未被接受', { taskId, conflict: result.conflict ?? null })
+      AgentMessage.warning(
+        result.conflict === 'worker-owned'
+          ? '另一个标签页正在执行这个任务'
+          : '任务已结束，请重新开始',
+      )
+      return
+    }
+    pendingManualPause = null
+    beginBackgroundKeepAlive()
+    logBatchDiagnostic('用户继续投递', { taskId })
+    stopReason = null
+    common.deliverStop = false
+    jobList.setDeliveryPoolCaptureEnabled(true)
+    await resumeDeliveryTask('manual-resume')
+  } catch (error) {
+    logBatchDiagnostic('继续投递等待后台重连', {
+      taskId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    AgentMessage.info('插件后台暂时不可用，请稍后再次继续')
+  }
 }
 
 async function stopDeliver() {
@@ -838,6 +828,7 @@ async function stopDeliver() {
     total: todayData.total,
   })
   requestDeliveryStop('manual-stop')
+  pendingManualPause = null
   if (scheduledDeliveryResumeTimer != null) {
     window.clearTimeout(scheduledDeliveryResumeTimer)
     scheduledDeliveryResumeTimer = undefined
@@ -882,7 +873,8 @@ async function hydratePersistentDeliveryTask() {
   const accountUid = getCurrentAccountUid()
   if (accountUid == null) return null
   const localTask = readDeliveryTask(accountUid)
-  const durableTask = await counter.deliveryTaskRead(accountUid)
+  const localSnapshot = activeDeliveryConfigSnapshot.value
+  const durableTask = await callDeliveryTaskRpc(() => counter.deliveryTaskRead(accountUid))
   setDurableDeliveryTask(durableTask)
   if (
     durableTask != null &&
@@ -895,6 +887,18 @@ async function hydratePersistentDeliveryTask() {
     return restoreDeliveryTask(durableTask.checkpoint, accountUid)
   }
 
+  if (durableTask?.status === 'paused' && durableTask.checkpoint != null) {
+    // 暂停任务也以后台检查点为准。否则刷新页面后旧逻辑会清掉本地任务，
+    // 用户点“继续”虽能 resume 后台状态，却没有页面执行上下文可接着跑。
+    return restoreDeliveryTask(durableTask.checkpoint, accountUid)
+  }
+
+  if (durableTask == null && localTask != null && localSnapshot != null) {
+    // 手动启动已写入本地检查点、但后台登记 RPC 暂时失败时，下一次重连必须拿这份任务重试
+    // start。清掉它会让“自动重连”只剩一个空定时器。
+    activeDeliveryConfigSnapshot.value = localSnapshot
+    return localTask
+  }
   if (localTask != null) {
     clearDeliveryTask(localTask.id)
   }
@@ -907,36 +911,43 @@ async function startPersistentDeliveryTask(
 ) {
   if (snapshot == null) throw new Error('投递运行配置快照无效')
   const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskStart({
-    uid: task.accountUid,
-    runId: task.id,
-    workerId,
-    checkpoint: task,
-    configSnapshot: snapshot,
-  })
+  const result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskStart({
+      uid: task.accountUid,
+      runId: task.id,
+      workerId,
+      checkpoint: task,
+      configSnapshot: snapshot,
+    }),
+  )
   setDurableDeliveryTask(result.task)
   if (!result.accepted) {
     const message =
       result.conflict === 'active-run' ? '同一账号已有投递任务在运行' : '投递任务后台登记失败'
     throw new Error(message)
   }
+  pendingBackgroundRegistrationTaskId = null
   beginBackgroundKeepAlive()
 }
 
 async function claimPersistentDeliveryTask(task: DeliveryTask) {
   const workerId = await getDeliveryWorkerId()
-  let result = await counter.deliveryTaskClaim({
-    uid: task.accountUid,
-    runId: task.id,
-    workerId,
-  })
-  if (!result.accepted && result.conflict === 'task-missing') {
-    await startPersistentDeliveryTask(task)
-    result = await counter.deliveryTaskClaim({
+  let result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskClaim({
       uid: task.accountUid,
       runId: task.id,
       workerId,
-    })
+    }),
+  )
+  if (!result.accepted && result.conflict === 'task-missing') {
+    await startPersistentDeliveryTask(task)
+    result = await callDeliveryTaskRpc(() =>
+      counter.deliveryTaskClaim({
+        uid: task.accountUid,
+        runId: task.id,
+        workerId,
+      }),
+    )
   }
   setDurableDeliveryTask(result.task)
   if (!result.accepted && result.conflict === 'worker-owned') {
@@ -963,13 +974,15 @@ async function claimPersistentDeliveryTask(task: DeliveryTask) {
 
 async function checkpointPersistentDeliveryTask(task: DeliveryTask) {
   const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskCheckpoint({
-    uid: task.accountUid,
-    runId: task.id,
-    workerId,
-    checkpoint: task,
-    phase: getPersistentDeliveryTaskPhase(),
-  })
+  const result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskCheckpoint({
+      uid: task.accountUid,
+      runId: task.id,
+      workerId,
+      checkpoint: task,
+      phase: getPersistentDeliveryTaskPhase(),
+    }),
+  )
   setDurableDeliveryTask(result.task)
   if (!result.accepted) {
     throw new Error(
@@ -989,11 +1002,13 @@ function getPersistentDeliveryTaskPhase(): DeliveryTaskActivePhase {
 
 async function releasePersistentDeliveryTask(task: DeliveryTask) {
   const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskRelease({
-    uid: task.accountUid,
-    runId: task.id,
-    workerId,
-  })
+  const result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskRelease({
+      uid: task.accountUid,
+      runId: task.id,
+      workerId,
+    }),
+  )
   endBackgroundKeepAlive()
   setDurableDeliveryTask(result.task)
 }
@@ -1006,13 +1021,15 @@ async function terminatePersistentDeliveryTask(
   const accountUid = getCurrentAccountUid()
   if (accountUid == null) return
   const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskTerminate({
-    uid: accountUid,
-    runId: taskId,
-    workerId,
-    reason,
-    message,
-  })
+  const result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskTerminate({
+      uid: accountUid,
+      runId: taskId,
+      workerId,
+      reason,
+      message,
+    }),
+  )
   endBackgroundKeepAlive()
   setDurableDeliveryTask(result.task)
 }
@@ -1021,8 +1038,27 @@ async function pausePersistentDeliveryTask(taskId: string) {
   const accountUid = getCurrentAccountUid()
   if (accountUid == null) return
   const workerId = await getDeliveryWorkerId()
-  const result = await counter.deliveryTaskPause({ uid: accountUid, runId: taskId, workerId })
+  const result = await callDeliveryTaskRpc(() =>
+    counter.deliveryTaskPause({ uid: accountUid, runId: taskId, workerId }),
+  )
   setDurableDeliveryTask(result.task)
+}
+
+async function callDeliveryTaskRpc<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call()
+  } catch (error) {
+    if (
+      error instanceof ExtensionRuntimeHealthError ||
+      isProviderHeartbeatError(error) ||
+      isExtensionContextInvalidatedError(error)
+    ) {
+      throw error
+    }
+    // Coordinator 的业务冲突通过 accepted/conflict 返回；真正抛出的异常意味着 RPC/后台不可用。
+    // 统一为运行时故障，确保上层保留本地检查点并重连，而不是把健康任务标成 failed。
+    throw new ExtensionRuntimeHealthError('BACKGROUND_UNAVAILABLE')
+  }
 }
 
 /**
@@ -1039,6 +1075,36 @@ function pauseForUnavailableAi(fallbackMessage: string) {
   return message
 }
 
+function pauseForUnavailableSession(fallbackMessage: string) {
+  const message = deliver.terminalError || fallbackMessage
+  requestDeliveryStop('session-unavailable', message)
+  common.deliverStop = true
+  return message
+}
+
+function pauseForSecurityCheck(fallbackMessage = 'BOSS 页面需要完成安全校验，投递已暂停') {
+  const message = deliver.terminalError || fallbackMessage
+  requestDeliveryStop('security-check', message)
+  common.deliverStop = true
+  AgentMessage.warning(message)
+  return message
+}
+
+async function deferForSourceRetry(
+  task: DeliveryTask,
+  fallbackMessage: string,
+  retryDelayMs = 60_000,
+) {
+  const message = deliver.terminalError || fallbackMessage
+  const retryAt = Date.now() + retryDelayMs
+  task.retryAt = retryAt
+  requestDeliveryStop('source-retry', message)
+  common.deliverStop = true
+  await saveAndCheckpointDeliveryTask(task, '来源级重试检查点写入失败')
+  scheduleDeliveryResumeAt(retryAt)
+  return message
+}
+
 /**
  * 命中频率限制之后怎么退。
  *
@@ -1048,12 +1114,13 @@ function pauseForUnavailableAi(fallbackMessage: string) {
  * 冷却而不是重试：被限流说明这一段行为已经被判定成异常，等一会儿接着投等于拿后面的岗位
  * 去验证同一个判定。冷却时长长于会话间隔，回来时节奏曲线也已经重置成「刚开工」。
  */
-async function backOffForRateLimit() {
+async function backOffForRateLimit(task?: DeliveryTask) {
   const today = getCurDay()
   const uid = getCurrentAccountUid()
-  const stored = await counter
-    .storageGet<unknown>(riskBackoffKey, null)
-    .catch(() => null as unknown)
+  const stored = await withRiskBackoffStorageTimeout(
+    counter.storageGet<unknown>(riskBackoffKey, null),
+    null,
+  )
   const all = (stored != null && typeof stored === 'object' ? stored : {}) as Record<
     string,
     unknown
@@ -1062,44 +1129,99 @@ async function backOffForRateLimit() {
   const hits = record.hits + 1
   const decision = decideRiskBackoff(hits)
   if (uid != null) {
-    await counter
-      .storageSet(riskBackoffKey, {
+    await withRiskBackoffStorageTimeout(
+      counter.storageSet(riskBackoffKey, {
         ...all,
         [String(uid)]: { date: today, hits, lastHitAt: Date.now() },
-      })
-      .catch(() => undefined)
+      }),
+      true,
+    )
   }
   // 记账与提示不能影响退避本身。这条路径的失效方向必须是「少记一笔」，
   // 绝不能因为一次日志或额度写入出错，就让本该暂停的任务被外层当成运行异常而终止——
   // 那会连检查点一起清掉，比不退避更糟。
   try {
-    // 下调当日额度：算出来不用等于没做。
-    setRiskAdjustedDailyLimit(getRiskAdjustedDailyLimit(DAILY_DELIVERY_LIMIT, hits))
     logBatchDiagnostic('触发频率限制，进入退避', {
       hitsToday: hits,
       action: decision.action,
       coolDownMs: decision.coolDownMs,
-      adjustedDailyLimit: getRiskAdjustedDailyLimit(DAILY_DELIVERY_LIMIT, hits),
+      dailyLimit: DAILY_DELIVERY_LIMIT,
     })
     log.info('风控', decision.message)
     AgentMessage.warning(decision.message)
   } catch (error) {
     logger.warn('退避记账失败，不影响暂停本身', { error })
   }
-  if (decision.action === 'stop-for-today') {
-    requestDeliveryStop('risk-control', decision.message)
-    common.deliverStop = true
-    return decision.message
-  }
   requestDeliveryStop('rate-limited', decision.message)
   common.deliverStop = true
-  scheduleDeliveryResumeAt(Date.now() + decision.coolDownMs)
+  const retryAt = Date.now() + decision.coolDownMs
+  if (task != null) {
+    task.retryAt = retryAt
+    await saveAndCheckpointDeliveryTask(task, '频率限制冷却检查点写入失败')
+  }
+  scheduleDeliveryResumeAt(retryAt)
   return decision.message
 }
 
 function markTerminalFailure(message: string) {
   requestDeliveryStop('terminal-error', message)
   common.deliverStop = true
+}
+
+/** 一次故障段最多真实刷新几次列表，之后让来源级任务退避。 */
+const maxDetailRefusalRecoveries = 3
+const detailSourceRetryDelayMs = 60_000
+
+/**
+ * 详情接口连着拒了三个岗位之后怎么办。
+ *
+ * 之前是直接收工，于是用户每投十几个就得手动点一次继续——而手动继续做的事，无非是把
+ * 列表页重抓一遍。这里就直接做那件事：把 poolWarmup 打回未完成，上层下一轮会重新导航、
+ * 重新抓页、拿到一批新的 securityId，然后接着投。
+ *
+ * 日志不足以判断平台为什么拒绝详情请求，但能确认重新抓取列表后可以继续。因此恢复策略只
+ * 依赖这个已观察到的行为，不把某一种平台内部机制写死在客户端。
+ *
+ * 但要数着来。真出了系统性问题（登录态没了、接口改了），重抓多少次都一样，那时候停才对。
+ */
+async function recoverFromDetailRefusal(
+  task: DeliveryTask,
+  runToken: DeliveryRunToken,
+  message: string,
+) {
+  task.detailRecoveryAttempts = Math.max(0, task.detailRecoveryAttempts ?? 0) + 1
+  if (task.detailRecoveryAttempts > maxDetailRefusalRecoveries) {
+    const msg = `岗位来源刷新连续失败，已保留 FIFO 批次，稍后自动重试：${message}`
+    await deferForSourceRetry(task, msg, detailSourceRetryDelayMs)
+    logBatchDiagnostic('岗位来源刷新失败，进入来源级自动重试', {
+      ...summarizeTask(task),
+      recoveries: maxDetailRefusalRecoveries,
+      retryAt: task.retryAt,
+      message,
+    })
+    AgentMessage.warning(msg)
+    return false
+  }
+
+  let refreshed = false
+  do {
+    const currentRefresh = await refreshCurrentJobListForDetailRecovery(task, runToken)
+    if (!currentRefresh) {
+      task.detailRecoveryAttempts = maxDetailRefusalRecoveries
+      return recoverFromDetailRefusal(task, runToken, `列表刷新失败；${message}`)
+    }
+    refreshed = true
+  } while (findFirstCredentialBlockedJob(task) != null && canContinueDeliveryRun(runToken))
+  if (!refreshed || !canContinueDeliveryRun(runToken)) return false
+  task.poolWarmup = { completed: false, attemptedStepIndexes: [], lowWaterArmed: false }
+  await saveAndCheckpointDeliveryTask(task, '详情接口恢复检查点写入失败')
+  logBatchDiagnostic('详情接口连续被拒，重抓列表后继续', {
+    ...summarizeTask(task),
+    recovery: task.detailRecoveryAttempts,
+    maxRecoveries: maxDetailRefusalRecoveries,
+    message,
+  })
+  return true
 }
 
 function scheduleDeliveryResumeAt(retryAt: number) {
@@ -1110,6 +1232,7 @@ function scheduleDeliveryResumeAt(retryAt: number) {
   const delayMs = Math.max(0, retryAt - Date.now())
   scheduledDeliveryResumeTimer = window.setTimeout(() => {
     scheduledDeliveryResumeTimer = undefined
+    if (!operationPanelMounted) return
     const trigger = stopReason === 'runtime-reconnect' ? 'runtime-reconnect' : 'acquisition-retry'
     void resumeDeliveryTask(trigger).finally(() => {
       // 停止原因互斥，等待重连时不可能同时是手动停止，无需再排除后者。
@@ -1243,9 +1366,25 @@ async function startBatch() {
       logBatchDiagnostic('创建投递任务失败：持久任务已变化', summarizeTask(task))
       return
     }
+    activeDeliveryConfigSnapshot.value = configSnapshot
     try {
       await startPersistentDeliveryTask(task, configSnapshot)
     } catch (error) {
+      if (
+        error instanceof ExtensionRuntimeHealthError ||
+        isProviderHeartbeatError(error) ||
+        isExtensionContextInvalidatedError(error)
+      ) {
+        pendingBackgroundRegistrationTaskId = task.id
+        requestDeliveryStop('runtime-reconnect')
+        scheduleDeliveryResumeAt(Date.now() + deliveryReconnectRetryMs)
+        logBatchDiagnostic('创建投递任务等待：后台连接暂时中断，保留本地检查点', {
+          ...summarizeTask(task),
+          error: error instanceof Error ? error.message : String(error),
+        })
+        AgentMessage.info('插件后台正在重连，投递任务会自动继续')
+        return
+      }
       clearDeliveryTask(task.id)
       logBatchDiagnostic('创建投递任务失败：后台任务登记失败', {
         ...summarizeTask(task),
@@ -1254,7 +1393,6 @@ async function startBatch() {
       AgentMessage.error(error instanceof Error ? error.message : '投递任务启动失败')
       return
     }
-    activeDeliveryConfigSnapshot.value = configSnapshot
     jobList.setDeliveryPoolCaptureEnabled(true)
     await persistSearchRotation(task)
     await runDeliveryTask(task, runToken)
@@ -1395,18 +1533,6 @@ async function restartAcquisitionCycle(
   if (!canContinueDeliveryRun(runToken) || !hasDailyDeliveryRemaining(todayData)) return 'stopped'
   const previousCycle = task.acquisitionCycle ?? 1
   const { madeProgress, noProgressCycles } = advanceDeliveryTaskCycleProgress(task, todayData)
-  if (hasReachedDeliveryTaskEmptyCycleLimit(task)) {
-    task.retryAt = undefined
-    saveDeliveryTask(task, task.id)
-    logBatchDiagnostic('连续多轮没有可处理岗位，投递任务停止', {
-      ...summarizeTask(task),
-      previousCycle,
-      noProgressCycles,
-      maxEmptyCycles: DELIVERY_TASK_MAX_EMPTY_CYCLES,
-    })
-    markTerminalFailure(`连续 ${DELIVERY_TASK_MAX_EMPTY_CYCLES} 轮没有获取到可处理岗位`)
-    return 'stopped'
-  }
   // 本轮取岗失败属于岗位/来源边界内的问题（读简历、读轮转位置都可能临时失败），
   // 按契约 §6 应当重试或降级，不能升级成任务级错误把整个投递任务终止。
   let nextCycle: DeliveryTask | null
@@ -1426,18 +1552,29 @@ async function restartAcquisitionCycle(
     return 'waiting'
   }
   if (nextCycle == null) {
-    markTerminalFailure('没有可继续使用的岗位来源')
-    return 'stopped'
+    const retryAt = Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** Math.min(4, noProgressCycles))
+    task.retryAt = retryAt
+    saveDeliveryTask(task, task.id)
+    logBatchDiagnostic('暂时没有可继续使用的岗位来源，保留任务并等待补充', {
+      ...summarizeTask(task),
+      previousCycle,
+      noProgressCycles,
+      retryAt,
+    })
+    scheduleDeliveryResumeAt(retryAt)
+    return 'waiting'
   }
 
   task.currentIndex = nextCycle.currentIndex
   task.steps = nextCycle.steps
+  task.groupExpectationCursorId =
+    task.groupExpectationCursorId ?? nextCycle.groupExpectationCursorId
   task.poolWarmup = nextCycle.poolWarmup
   task.searchRotation = nextCycle.searchRotation
   task.runtimeHeartbeat = undefined
   task.acquisitionCycle = previousCycle + 1
   const retryDelaySeconds =
-    noProgressCycles > 0 ? Math.min(300, Math.max(60, noProgressCycles * 60)) : 0
+    noProgressCycles > 0 ? Math.min(900, 60 * 2 ** Math.min(4, noProgressCycles - 1)) : 0
   task.retryAt = retryDelaySeconds > 0 ? Date.now() + retryDelaySeconds * 1000 : undefined
   if (!saveDeliveryTask(task, task.id)) {
     markTerminalFailure('下一轮取岗检查点写入失败')
@@ -1574,6 +1711,7 @@ async function resumeDeliveryTask(trigger = 'unknown') {
 }
 
 async function resumeDeliveryTaskOnce(trigger = 'unknown') {
+  if (!(await retryPendingManualPause())) return
   if (!common.deliverLock) {
     try {
       await hydratePersistentDeliveryTask()
@@ -1588,6 +1726,9 @@ async function resumeDeliveryTaskOnce(trigger = 'unknown') {
   }
   const task = readCurrentAccountDeliveryTask()
   if (task == null) return
+  // paused 只允许 resumeFromPause 显式转换为 running。页面挂载、focus 或 runtime-ready
+  // 都只能恢复它的检查点和界面，不能把用户暂停的任务自动接管，也不能清掉本地任务。
+  if (durableDeliveryTask.value?.status === 'paused') return
   if (!statisticsReadyForDelivery && !(await refreshStatisticsForCurrentDate())) {
     logBatchDiagnostic('恢复投递任务等待：当日统计尚未就绪', {
       ...summarizeTask(task),
@@ -1608,6 +1749,9 @@ async function resumeDeliveryTaskOnce(trigger = 'unknown') {
   }
   if (task.retryAt != null) {
     task.retryAt = undefined
+    // 一轮冷却结束后允许下一次真实列表刷新重新计数；否则上一轮的累计次数会把每次
+    // 自动恢复都当成第四次失败，永远跳过刷新直接再次冷却。
+    if (task.detailRecoveryAttempts != null) task.detailRecoveryAttempts = 0
     saveDeliveryTask(task, task.id)
   }
   // 用户主动结束或暂停时不得把停止标志清掉。暂停是异步的（要先落盘再调后台），
@@ -1676,7 +1820,13 @@ async function resumeDeliveryTaskOnce(trigger = 'unknown') {
     (task.legacyMigrationPending !== true || Boolean(task.activeBatch?.items.length)) &&
     (durableDeliveryTask.value.status === 'running' ||
       durableDeliveryTask.value.status === 'waiting-for-page')
-  if (resumeNavigation == null && !resumeFromHeartbeat && !resumeFromPersistentTask) {
+  const resumeFromPendingRegistration = pendingBackgroundRegistrationTaskId === task.id
+  if (
+    resumeNavigation == null &&
+    !resumeFromHeartbeat &&
+    !resumeFromPersistentTask &&
+    !resumeFromPendingRegistration
+  ) {
     const heartbeatAgeMs =
       task.runtimeHeartbeat == null ? null : Date.now() - task.runtimeHeartbeat.at
     logBatchDiagnostic('恢复投递任务跳过：缺少主动恢复标记', {
@@ -1967,6 +2117,136 @@ async function waitForJobListChanged(beforePageSnapshot: JobListSnapshot) {
   return false
 }
 
+async function refreshCurrentJobListForDetailRecovery(
+  task: DeliveryTask,
+  runToken: DeliveryRunToken,
+) {
+  const blockedJob = findFirstCredentialBlockedJob(task)
+  const origin = blockedJob?.deliveryCredentialOrigin
+  if (blockedJob == null) return true
+  if (origin == null) {
+    deferCredentialRefreshJob(blockedJob, '缺少原始来源，等待后续列表重新发现')
+    logPaginationDiagnostic('FIFO 受阻岗位缺少来源，已跳过并等待重新发现', {
+      encryptJobId: blockedJob.encryptJobId,
+      queueOrder: blockedJob.deliveryQueueOrder ?? null,
+    })
+    return true
+  }
+  const stepIndex = findCredentialOriginStepIndex(task, origin)
+  if (stepIndex < 0) {
+    deferCredentialRefreshJob(blockedJob, '原始来源已不在当前任务，等待后续列表重新发现')
+    logPaginationDiagnostic('FIFO 受阻岗位来源已不在任务中，已等待重新发现', {
+      encryptJobId: blockedJob.encryptJobId,
+      source: origin.source,
+      queueOrder: blockedJob.deliveryQueueOrder ?? null,
+    })
+    return true
+  }
+  const step = task.steps[stepIndex]
+  if (step == null || !canContinueDeliveryRun(runToken)) return false
+
+  task.currentIndex = stepIndex
+  step.status = 'running'
+  step.prefetchExhausted = false
+  saveDeliveryTask(task, task.id)
+
+  if (
+    inferDeliveryLimitSource() !== step.source ||
+    (step.source === 'search' && !isSearchStepLocation(step))
+  ) {
+    const navigated = await navigateToStep(step.url, '详情接口拒绝后刷新当前来源', runToken)
+    if (!navigated || !canContinueDeliveryRun(runToken)) return false
+  }
+  setDeliveryLimitSourceOverride(step.source)
+  const expectationReady = await ensureGroupExpectationStep(
+    step,
+    runToken,
+    '详情接口拒绝后刷新求职期望',
+  )
+  if (!expectationReady || !canContinueDeliveryRun(runToken)) return false
+  if (!(await refreshBossRuntimeBinding('详情接口拒绝后准备重新加载列表'))) return false
+
+  const beforePageSnapshot = getCurrentJobListSnapshot()
+  const targetPage = Math.max(1, origin?.page ?? (Number(page.value.page) || 1))
+  const acquired = await acquireBossAction('pageNext', {
+    shouldAbort: () => common.deliverStop,
+    onWait: (waitMs) => logPaginationDiagnostic('详情恢复刷新被闸门限速', { waitMs }),
+  })
+  if (!acquired || !canContinueDeliveryRun(runToken)) return false
+  try {
+    await Promise.resolve(pager.reload(targetPage))
+  } catch (error) {
+    logPaginationDiagnostic('详情恢复刷新当前列表失败', {
+      error: error instanceof Error ? error.message : String(error),
+      source: step.source,
+    })
+    return false
+  }
+  const changed = await waitForJobListChanged(beforePageSnapshot)
+  if (!changed || !canContinueDeliveryRun(runToken)) return false
+  captureCurrentPageToDeliveryPool(
+    step.source,
+    step.source === 'group' ? origin?.groupTargetId || step.expectation?.id : undefined,
+    step.source === 'search' ? step.searchDirection : undefined,
+  )
+  const refreshedJob = blockedJob == null ? null : jobList.get?.(blockedJob.encryptJobId)
+  if (
+    blockedJob != null &&
+    (refreshedJob == null || refreshedJob.credentialRefreshRequired === true)
+  ) {
+    deferCredentialRefreshJob(blockedJob, '原始列表已找不到该岗位，等待后续列表重新发现')
+    logPaginationDiagnostic('详情恢复刷新未找到 FIFO 受阻岗位', {
+      encryptJobId: blockedJob.encryptJobId,
+      source: step.source,
+      targetPage,
+    })
+    return true
+  }
+  return blockedJob == null || refreshedJob != null
+}
+
+function findFirstCredentialBlockedJob(task: DeliveryTask) {
+  const orderedIds = task.activeBatch?.items ?? []
+  if (orderedIds.length > 0) {
+    for (const { source, encryptJobId } of orderedIds) {
+      const item = jobList
+        .listBySource(source)
+        .find((candidate) => candidate.encryptJobId === encryptJobId)
+      if (item?.credentialRefreshRequired === true) return item
+    }
+    // An active FIFO batch owns the recovery decision. An unrelated blocked
+    // job elsewhere in the pool must not hold the current batch hostage.
+    return undefined
+  }
+  return (['group', 'search'] as const)
+    .flatMap((source) => jobList.listBySource(source))
+    .filter((item) => item.credentialRefreshRequired === true)
+    .sort((left, right) => (left.deliveryQueueOrder ?? 0) - (right.deliveryQueueOrder ?? 0))[0]
+}
+
+function deferCredentialRefreshJob(job: MyJobListData, message: string) {
+  job.credentialRefreshRequired = false
+  job.credentialRefreshDeferred = true
+  job.status.setStatus('wait', message)
+}
+
+function findCredentialOriginStepIndex(
+  task: DeliveryTask,
+  origin: NonNullable<MyJobListData['deliveryCredentialOrigin']>,
+) {
+  const index = task.steps.findIndex((step) => {
+    if (step.source !== origin.source) return false
+    if (step.source === 'group') {
+      return !origin.groupTargetId || step.expectation?.id === origin.groupTargetId
+    }
+    return (
+      !origin.searchDirectionKey ||
+      normalizeDeliverySourceKey(step.searchDirection ?? '') === origin.searchDirectionKey
+    )
+  })
+  return index
+}
+
 async function refreshBossRuntimeBinding(reason: string) {
   const runtimeVue = document.querySelector<any>(
     '#wrap .page-job-wrapper,.job-recommend-main,.page-jobs-main',
@@ -2155,10 +2435,24 @@ async function runDeliveryBatch(
   batchTarget = '当前页',
 ) {
   if (!canContinueDeliveryRun(runToken)) return 'stopped'
+  try {
+    assertBossSecurityCheckClear()
+  } catch (error) {
+    if (error instanceof SecurityCheckRequiredError) {
+      deliver.terminalError = error.message
+      return 'securityCheck'
+    }
+    throw error
+  }
   setDeliveryPhase(runToken, 'processing')
   await assertDeliveryRuntimeHealthy(`${batchTarget}处理前`, summarizeTask(task))
   if (!canContinueDeliveryRun(runToken)) return 'stopped'
-  return deliver.jobListHandle(batchItems, getExecutionFormData())
+  const result = await deliver.jobListHandle(batchItems, getExecutionFormData())
+  if (result === 'completed' && (task.detailRecoveryAttempts ?? 0) > 0) {
+    task.detailRecoveryAttempts = 0
+    saveDeliveryTask(task, task.id)
+  }
+  return result
 }
 
 async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
@@ -2198,10 +2492,6 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
     logger.debug('start combined delivery task', { task, page })
     logBatchDiagnostic('投递任务启动', summarizeTask(task))
     while (canContinueDeliveryRun(runToken)) {
-      // 每批开始前刷一次去重快照并清理池子。不能只在补池时做：补池要等水位跌到低水位线，
-      // 而死数据把水位撑住正是要解决的问题，只挂在补池上就成了循环，永远等不到那一刻。
-      await refreshDeliveredKeys()
-      pruneDeliveredCompanySiblings()
       setDeliveryPhase(runToken, 'acquiring')
       if (!hasDailyDeliveryRemaining(todayData)) {
         requestDeliveryStop('daily-limit')
@@ -2210,7 +2500,7 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
         await flushRunState('今日额度完成')
         break
       }
-      const step = getCurrentTaskStep(task)
+      let step = getCurrentTaskStep(task)
       if (step == null) {
         stepMsg = '当前投递池已处理完，正在补充下一轮岗位'
         logBatchDiagnostic('当前投递池已处理完，准备补充下一轮岗位', summarizeTask(task))
@@ -2234,6 +2524,21 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
       }
       if (mixedQueueResult === 'finished') break
       if (mixedQueueResult === 'continue') continue
+      const runnableStepIndex = findNextRunnableTaskStepIndex(task)
+      if (runnableStepIndex < 0) {
+        if (await waitForDeferredAcquisitionSteps(task, '所有取岗步骤仍在重试窗口内')) {
+          stepMsg = '来源暂时不可用，等待自动重试'
+          break
+        }
+      } else if (runnableStepIndex !== task.currentIndex) {
+        task.currentIndex = runnableStepIndex
+        step = task.steps[runnableStepIndex]
+        saveDeliveryTask(task, task.id)
+        logBatchDiagnostic('当前取岗步骤尚未到重试时间，改用其他可运行步骤', {
+          ...summarizeTask(task),
+          nextStep: getTaskStepLabel(step),
+        })
+      }
       const actualSource = inferDeliveryLimitSource()
       const searchLocationMismatch = step.source === 'search' && !isSearchStepLocation(step)
       const searchPoolReadyOnCurrentPage =
@@ -2410,12 +2715,29 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
         firstJobId: jobList._list.value[0]?.encryptJobId ?? '',
       })
       if (result === 'rateLimited') {
-        stepMsg = await backOffForRateLimit()
+        stepMsg = await backOffForRateLimit(task)
         break
       }
       if (result === 'aiUnavailable') {
         stepMsg = pauseForUnavailableAi('AI 请求失败，投递已暂停')
         break
+      }
+      if (result === 'sessionUnavailable') {
+        stepMsg = pauseForUnavailableSession('页面会话已失效，投递已暂停')
+        break
+      }
+      if (result === 'securityCheck') {
+        stepMsg = pauseForSecurityCheck()
+        break
+      }
+      if (result === 'sourceDeferred') {
+        stepMsg = await deferForSourceRetry(task, '本地动作队列暂时拥塞，稍后自动继续')
+        break
+      }
+      if (result === 'detailRefused') {
+        stepMsg = deliver.terminalError || '详情接口连续被拒'
+        if (!(await recoverFromDetailRefusal(task, runToken, stepMsg))) break
+        continue
       }
       if (result === 'terminalError') {
         stepMsg = deliver.terminalError || '岗位处理发生运行错误'
@@ -2479,14 +2801,13 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
       if (stopReason === 'manual-stop') {
         await terminatePersistentDeliveryTask(task.id, 'manual-stop', '用户手动停止投递')
         clearDeliveryTask(task.id)
-      } else if (
-        stopReason === 'risk-control' ||
-        stopReason === 'rate-limited' ||
-        stopReason === 'ai-unavailable'
-      ) {
+      } else if (keepsDeliveryCheckpoint(stopReason)) {
         // 检查点必须留着：模型修好后点「继续」要能接着原来的位置跑，
         // 而 terminate 会连同检查点一起清掉，等于让用户从头再来。
         await pausePersistentDeliveryTask(task.id)
+      } else if (stopReason === 'rate-limited') {
+        activePhase = 'waiting'
+        await releasePersistentDeliveryTask(task)
       } else if (stopReason === 'daily-limit' || !hasDailyDeliveryRemaining(todayData)) {
         await terminatePersistentDeliveryTask(task.id, 'daily-limit', '今日投递额度已完成')
         clearDeliveryTask(task.id)
@@ -2500,14 +2821,12 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
     } catch (error) {
       logger.warn('保存后台投递任务退出状态失败', { error })
     }
-    const shouldScheduleResume =
-      // 风控命中之后绝不能自动重试：人工过掉校验之前每一次请求都在加重判定。
-      !(stopReason === 'risk-control') &&
-      !(stopReason === 'manual-stop') &&
-      !(stopReason === 'daily-limit') &&
-      terminalFailureMessage == null &&
-      !workerOwnershipBlocked &&
-      hasDailyDeliveryRemaining(todayData)
+    const shouldScheduleResume = shouldAutoResumeDelivery({
+      reason: stopReason,
+      terminalFailureMessage,
+      workerOwnershipBlocked,
+      hasDailyDeliveryRemaining: hasDailyDeliveryRemaining(todayData),
+    })
     if (shouldScheduleResume) {
       scheduleDeliveryResumeAt(
         task.retryAt != null && task.retryAt > Date.now()
@@ -2564,7 +2883,7 @@ async function runDeliveryTask(task: DeliveryTask, runToken: DeliveryRunToken) {
           terminalMessage: terminalFailureMessage,
           waitingForReconnect: exitReason === 'runtime-reconnect',
           willResume:
-            exitReason === 'manual-pause' ||
+            exitReason === 'rate-limited' ||
             exitReason === 'runtime-reconnect' ||
             exitReason === 'worker-handoff' ||
             exitReason === 'waiting-for-page',
@@ -2603,18 +2922,18 @@ async function startDeliveryTaskHeartbeat(task: DeliveryTask, runToken: Delivery
     }
   } catch (error) {
     const reconnectRequested =
-      isProviderHeartbeatError(error) || isExtensionContextInvalidatedError(error)
-    if (stopReason === 'runtime-reconnect') requestDeliveryStop('runtime-reconnect')
+      error instanceof ExtensionRuntimeHealthError ||
+      isProviderHeartbeatError(error) ||
+      isExtensionContextInvalidatedError(error)
+    if (reconnectRequested) requestDeliveryStop('runtime-reconnect')
     logBatchDiagnostic(
-      stopReason === 'runtime-reconnect'
-        ? '投递任务等待：后台连接暂时中断'
-        : '投递任务停止：后台运行态登记失败',
+      reconnectRequested ? '投递任务等待：后台连接暂时中断' : '投递任务停止：后台运行态登记失败',
       {
         ...summarizeTask(task),
         error: error instanceof Error ? error.message : String(error),
       },
     )
-    if (!(stopReason === 'runtime-reconnect')) {
+    if (!reconnectRequested) {
       markTerminalFailure(error instanceof Error ? error.message : '后台运行态登记失败')
     } else {
       scheduleDeliveryResumeAt(Date.now() + deliveryReconnectRetryMs)
@@ -2660,8 +2979,11 @@ async function startDeliveryTaskHeartbeat(task: DeliveryTask, runToken: Delivery
         }
 
         window.clearInterval(timer)
-        const reconnectRequested = isExtensionContextInvalidatedError(error)
-        if (stopReason === 'runtime-reconnect') {
+        if (
+          error instanceof ExtensionRuntimeHealthError ||
+          isProviderHeartbeatError(error) ||
+          isExtensionContextInvalidatedError(error)
+        ) {
           requestDeliveryStop('runtime-reconnect')
           scheduleDeliveryResumeAt(Date.now() + deliveryReconnectRetryMs)
         } else {
@@ -2734,6 +3056,17 @@ async function runMixedQueueBatchIfReady(task: DeliveryTask, runToken: DeliveryR
   }
   const enabledSources = (['group', 'search'] as const).filter((source) => weights[source] > 0)
   if (enabledSources.length === 0) return 'fallback'
+
+  // 少于连续故障阈值的详情拒绝会让当前批次返回 completed；此时 activeBatch 已清掉，
+  // 但岗位仍被 credentialRefreshRequired 排除在可投池之外。不能让这种岗位成为孤儿，
+  // 没有活动批次时也要按它自己的来源分页刷新一次。
+  if (task.activeBatch == null && findFirstCredentialBlockedJob(task) != null) {
+    const recovered = await recoverFromDetailRefusal(task, runToken, '投递池发现岗位等待刷新凭据')
+    if (!recovered) {
+      await flushRunState('投递池详情恢复等待')
+      return 'finished'
+    }
+  }
 
   const resumedBatchResult = await resumeActiveDeliveryBatch(task, runToken)
   if (resumedBatchResult != null) return resumedBatchResult
@@ -2853,6 +3186,18 @@ async function runMixedQueueBatchIfReady(task: DeliveryTask, runToken: DeliveryR
     if (prefetchResult === 'finished') return 'finished'
     if (prefetchResult === 'grew') return 'continue'
 
+    if (prefetchResult === 'deferred') {
+      const deferredStep = getCurrentTaskStep(task)
+      if (deferredStep?.source === currentSource) {
+        deferAcquisitionStepForRetry(
+          task,
+          deferredStep,
+          '本轮没有确认来源耗尽，保留分页游标并稍后重试',
+        )
+      }
+      return 'continue'
+    }
+
     // 当前来源抓不动了：标记该步骤耗尽，若同来源还有后续步骤就切过去，
     // 否则回到常规路径消费现有投递池。
     const unavailableStep = getCurrentTaskStep(task)
@@ -2945,7 +3290,7 @@ async function runMixedQueueBatchIfReady(task: DeliveryTask, runToken: DeliveryR
     return 'finished'
   }
   if (result === 'rateLimited') {
-    await backOffForRateLimit()
+    await backOffForRateLimit(task)
     await flushRunState('混合投递池触发频率限制')
     return 'finished'
   }
@@ -2953,6 +3298,30 @@ async function runMixedQueueBatchIfReady(task: DeliveryTask, runToken: DeliveryR
     pauseForUnavailableAi('AI 请求失败，投递已暂停')
     await flushRunState('混合投递池等待可用模型')
     return 'finished'
+  }
+  if (result === 'sessionUnavailable') {
+    pauseForUnavailableSession('页面会话已失效，投递已暂停')
+    await flushRunState('混合投递池等待页面刷新')
+    return 'finished'
+  }
+  if (result === 'securityCheck') {
+    pauseForSecurityCheck()
+    await flushRunState('混合投递池等待安全校验')
+    return 'finished'
+  }
+  if (result === 'sourceDeferred') {
+    await deferForSourceRetry(task, '本地动作队列暂时拥塞，稍后自动继续')
+    await flushRunState('混合投递池等待来源重试')
+    return 'finished'
+  }
+  if (result === 'detailRefused') {
+    if (
+      !(await recoverFromDetailRefusal(task, runToken, deliver.terminalError || '详情接口连续被拒'))
+    ) {
+      await flushRunState('混合投递池详情恢复等待')
+      return 'finished'
+    }
+    return 'continue'
   }
   if (result === 'terminalError') {
     markTerminalFailure(deliver.terminalError || '岗位处理发生运行错误')
@@ -2970,6 +3339,17 @@ async function runMixedQueueBatchIfReady(task: DeliveryTask, runToken: DeliveryR
 async function resumeActiveDeliveryBatch(task: DeliveryTask, runToken: DeliveryRunToken) {
   const activeBatch = task.activeBatch
   if (activeBatch == null) return null
+  if (findFirstCredentialBlockedJob(task) != null) {
+    const recovered = await recoverFromDetailRefusal(
+      task,
+      runToken,
+      '恢复 FIFO 批次前发现仍有岗位等待刷新凭据',
+    )
+    if (!recovered) {
+      await flushRunState('恢复批次详情恢复等待')
+      return 'finished' as const
+    }
+  }
   const items = getPendingActiveDeliveryBatchItems(task)
   const skippedCount = activeBatch.items.length - items.length
   if (items.length === 0) {
@@ -3008,7 +3388,7 @@ async function resumeActiveDeliveryBatch(task: DeliveryTask, runToken: DeliveryR
     return 'finished' as const
   }
   if (result === 'rateLimited') {
-    await backOffForRateLimit()
+    await backOffForRateLimit(task)
     await flushRunState('恢复批次触发频率限制')
     return 'finished' as const
   }
@@ -3016,6 +3396,30 @@ async function resumeActiveDeliveryBatch(task: DeliveryTask, runToken: DeliveryR
     pauseForUnavailableAi('AI 请求失败，投递已暂停')
     await flushRunState('恢复批次等待可用模型')
     return 'finished' as const
+  }
+  if (result === 'sessionUnavailable') {
+    pauseForUnavailableSession('页面会话已失效，投递已暂停')
+    await flushRunState('恢复批次等待页面刷新')
+    return 'finished' as const
+  }
+  if (result === 'securityCheck') {
+    pauseForSecurityCheck()
+    await flushRunState('恢复批次等待安全校验')
+    return 'finished' as const
+  }
+  if (result === 'sourceDeferred') {
+    await deferForSourceRetry(task, '本地动作队列暂时拥塞，稍后自动继续')
+    await flushRunState('恢复批次等待来源重试')
+    return 'finished' as const
+  }
+  if (result === 'detailRefused') {
+    if (
+      !(await recoverFromDetailRefusal(task, runToken, deliver.terminalError || '详情接口连续被拒'))
+    ) {
+      await flushRunState('恢复批次详情恢复等待')
+      return 'finished' as const
+    }
+    return 'continue' as const
   }
   if (result === 'terminalError') {
     markTerminalFailure(deliver.terminalError || '恢复批次处理发生运行错误')
@@ -3057,9 +3461,12 @@ async function warmupDeliveryPool(
       getDeliveryJobKey,
       getDeliveryJobSource,
     )
-    const underfilledSources = enabledSources.filter(
-      (source) => pools[source].length < targetPoolPlan[source],
-    )
+    const underfilledSources = enabledSources
+      .filter((source) => pools[source].length < targetPoolPlan[source])
+      .sort(
+        (left, right) =>
+          targetPoolPlan[right] - pools[right].length - (targetPoolPlan[left] - pools[left].length),
+      )
     if (underfilledSources.length === 0) {
       warmup.completed = true
       saveDeliveryTask(task, task.id)
@@ -3088,6 +3495,7 @@ async function warmupDeliveryPool(
     }
 
     const step = task.steps[nextStepIndex]
+    markWarmupStepAttempted(task, nextStepIndex)
     const activated = await activateWarmupStep(task, nextStepIndex, runToken, {
       missingSources: underfilledSources,
       plan: targetPoolPlan,
@@ -3126,6 +3534,7 @@ async function warmupDeliveryPool(
     }
     if (prefetchResult.outcome === 'source-exhausted') {
       step.prefetchExhausted = true
+      step.prefetchRetryAt = undefined
       step.status = 'done'
     }
 
@@ -3165,6 +3574,7 @@ async function activateWarmupStep(
   ) {
     task.currentIndex = stepIndex
     step.status = 'running'
+    step.prefetchRetryAt = undefined
     step.resumeNavigationAttempt = undefined
     setDeliveryLimitSourceOverride(step.source)
     saveDeliveryTask(task, task.id)
@@ -3186,8 +3596,9 @@ async function activateWarmupStep(
         stepIndex,
         step: getTaskStepLabel(step),
       })
-      if (isCurrentJobListKnownEmpty()) {
+      if (expectationReady && isCurrentJobListKnownEmpty()) {
         step.prefetchExhausted = true
+        step.prefetchRetryAt = undefined
         step.status = 'done'
         saveDeliveryTask(task, task.id)
         return true
@@ -3200,18 +3611,16 @@ async function activateWarmupStep(
     acceptEmptyPage: true,
     targetStepIndex: stepIndex,
   })
-  if (switchResult !== 'switched' && isCurrentJobListKnownEmpty()) {
-    step.prefetchExhausted = true
-    step.status = 'done'
-    step.resumeNavigationAttempt = undefined
-    saveDeliveryTask(task, task.id)
-    return true
-  }
   return switchResult === 'switched'
 }
 
-/** 补池结果：运行已终止 / 池子确实变大了 / 当前来源抓不动了。 */
-type PrefetchOutcome = 'finished' | 'grew' | 'exhausted'
+/**
+ * 补池结果。
+ *
+ * `deferred` 表示本次翻页没有形成可确认的增长（例如临时加载失败或本轮页预算用尽）。
+ * 它不能被翻译成 `exhausted`：来源游标仍然可以继续，且统一 FIFO 队列不能因此丢工作。
+ */
+type PrefetchOutcome = 'finished' | 'grew' | 'deferred' | 'exhausted'
 
 async function prefetchCurrentSourceIfLowWater(
   task: DeliveryTask,
@@ -3222,7 +3631,7 @@ async function prefetchCurrentSourceIfLowWater(
   const poolSize = getDeliverableJobs(getConfiguredSourcePool(source)).length
   const lowWaterMark = getSourcePoolLowWaterMark(source)
   // 单来源已经够深：整池低水位由另一个来源造成，这里无需抓取。
-  if (poolSize >= lowWaterMark) return 'exhausted'
+  if (poolSize >= lowWaterMark) return 'deferred'
 
   logBatchDiagnostic('混合投递池低水位补充', {
     ...summarizeTask(task),
@@ -3235,17 +3644,20 @@ async function prefetchCurrentSourceIfLowWater(
   const prepared = await prepareCurrentSourceForPrefetch(task, runToken, source)
   if (!prepared) return 'finished'
   const result = await prefetchCurrentSourcePool(task, source, runToken)
-  if (result.outcome === 'load-failed') {
+  if (result.outcome === 'load-failed' || result.outcome === 'page-budget-reached') {
     logBatchDiagnostic('混合投递池低水位来源补充失败，继续处理现有岗位', {
       ...summarizeTask(task),
       source,
       result,
     })
   }
-  if (result.outcome === 'load-failed' || result.outcome === 'source-exhausted') {
+  if (result.outcome === 'load-failed' || result.outcome === 'page-budget-reached') {
+    return 'deferred'
+  }
+  if (result.outcome === 'source-exhausted') {
     return 'exhausted'
   }
-  return result.after > result.before ? 'grew' : 'exhausted'
+  return result.after > result.before ? 'grew' : 'deferred'
 }
 
 /** 池子未达目标容量时的补充，与低水位补充共用同一套执行步骤，只是不看低水位线。 */
@@ -3264,7 +3676,11 @@ async function prefetchUnderfilledCurrentSource(
       prefetchResult: result,
     })
   }
-  return result.after > result.before ? 'grew' : 'exhausted'
+  if (result.outcome === 'load-failed' || result.outcome === 'page-budget-reached') {
+    return 'deferred'
+  }
+  if (result.outcome === 'source-exhausted') return 'exhausted'
+  return result.after > result.before ? 'grew' : 'deferred'
 }
 
 async function prepareCurrentSourceForPrefetch(
@@ -3358,34 +3774,16 @@ async function prepareCurrentSourceForPrefetch(
   return ensureGroupExpectationStep(nextStep, runToken, '混合投递池轮转求职期望补充')
 }
 
-function getPrefetchPool(task: DeliveryTask, source: DeliveryLimitSource) {
-  const pool = getConfiguredSourcePool(source)
-  const expectation = source === 'group' ? getCurrentTaskStep(task)?.expectation : undefined
-  if (!expectation) return pool
-  return filterJobsByGroupTargets(
-    pool,
-    isRecommendationExpectation(expectation) ? [] : [expectation.id],
-    isRecommendationExpectation(expectation),
-  )
+function getPrefetchPool(_task: DeliveryTask, source: DeliveryLimitSource) {
+  // 期望和搜索词是同一来源下的抓取游标，不是独立投递池。
+  // 补池水位必须按来源总池计算，否则第一个期望/搜索词会把自己的小目标填满，
+  // 但整个来源仍远未达到配置比例，随后又被反复切换和重复计数。
+  return getConfiguredSourcePool(source)
 }
 
-function getPrefetchTargetSize(task: DeliveryTask, source: DeliveryLimitSource) {
-  const sourceTarget = getSourcePoolTargetSize(source)
-  if (sourceTarget <= 0) return 0
-  if (source === 'search') {
-    const searchStepCount = task.steps.filter((step) => step.source === 'search').length
-    if (searchStepCount <= 1) return sourceTarget
-    const currentStep = getCurrentTaskStep(task)
-    const entrySize = Math.max(0, currentStep?.poolSizeAtEntry ?? 0)
-    const directionShare = Math.max(1, Math.ceil(sourceTarget / searchStepCount))
-    return Math.min(sourceTarget, entrySize + directionShare)
-  }
-  const expectationCount = task.steps.filter(
-    (step) => step.source === 'group' && step.expectation != null,
-  ).length
-  return expectationCount > 0
-    ? Math.max(1, Math.ceil(sourceTarget / expectationCount))
-    : sourceTarget
+function getPrefetchTargetSize(_task: DeliveryTask, source: DeliveryLimitSource) {
+  // 目标属于来源，不属于当前步骤。分页超额岗位全部保留，达到目标后才停止翻页。
+  return getSourcePoolTargetSize(source)
 }
 
 function getSourcePoolTargetSize(source: DeliveryLimitSource) {
@@ -3408,8 +3806,6 @@ async function prefetchCurrentSourcePool(
   runToken: DeliveryRunToken,
 ) {
   setDeliveryLimitSourceOverride(source)
-  await refreshDeliveredKeys()
-  pruneDeliveredCompanySiblings()
   const currentStep = getCurrentTaskStep(task)
   const groupTargetId = source === 'group' ? currentStep?.expectation?.id : undefined
   const targetSize = getPrefetchTargetSize(task, source)
@@ -3467,10 +3863,14 @@ async function prefetchCurrentSourcePool(
       outcome = 'stopped'
       break
     }
-    await acquireBossAction('pageNext', {
+    const acquired = await acquireBossAction('pageNext', {
       shouldAbort: () => common.deliverStop,
       onWait: (waitMs) => logPaginationDiagnostic('翻页被闸门限速', { waitMs }),
     })
+    if (!acquired || !canContinueDeliveryRun(runToken)) {
+      outcome = 'stopped'
+      break
+    }
     if (!next()) {
       outcome = 'source-exhausted'
       logBatchDiagnostic('混合投递池补充停止：没有下一页', {
@@ -3662,6 +4062,7 @@ async function switchToSourceForPrefetch(
   const previousListSignature = getCurrentJobListSignature()
   task.currentIndex = nextIndex
   nextStep.status = 'running'
+  nextStep.prefetchRetryAt = undefined
   prepareStepNavigation(task, nextStep)
   logBatchDiagnostic('混合投递池切换来源补充', {
     ...summarizeTask(task),
@@ -3682,7 +4083,7 @@ async function switchToSourceForPrefetch(
   }
   if (!navigated) {
     jobList.setDeliveryPoolCaptureEnabled(true)
-    markAcquisitionStepUnavailable(task, nextStep, '投递池补充切换来源失败')
+    deferAcquisitionStepForRetry(task, nextStep, '投递池补充切换来源失败')
     return 'skipped' as const
   }
   setDeliveryLimitSourceOverride(source)
@@ -3701,7 +4102,7 @@ async function switchToSourceForPrefetch(
       targetSource: source,
       targetStepIndex: nextIndex,
     })
-    markAcquisitionStepUnavailable(task, nextStep, '求职期望岗位列表未就绪')
+    deferAcquisitionStepForRetry(task, nextStep, '求职期望岗位列表未就绪')
     return 'skipped' as const
   }
   const ready =
@@ -3726,10 +4127,11 @@ async function switchToSourceForPrefetch(
       targetSource: source,
       targetStepIndex: nextIndex,
     })
-    markAcquisitionStepUnavailable(task, nextStep, '目标来源岗位列表未就绪')
+    deferAcquisitionStepForRetry(task, nextStep, '目标来源岗位列表未就绪')
     return 'skipped' as const
   }
   nextStep.resumeNavigationAttempt = undefined
+  nextStep.prefetchRetryAt = undefined
   saveDeliveryTask(task, task.id)
   return 'switched' as const
 }
@@ -3933,11 +4335,48 @@ function markAcquisitionStepUnavailable(
   })
 }
 
+function deferAcquisitionStepForRetry(
+  task: DeliveryTask,
+  step: DeliveryTask['steps'][number],
+  reason: string,
+) {
+  step.prefetchExhausted = false
+  step.prefetchRetryAt = Date.now() + 60_000
+  step.status = 'waiting'
+  step.resumeNavigationAttempt = undefined
+  saveDeliveryTask(task, task.id)
+  logBatchDiagnostic('当前取岗步骤暂时不可用，保留并稍后自动重试', {
+    ...summarizeTask(task),
+    step: getTaskStepLabel(step),
+    source: step.source,
+    reason,
+    retryAt: step.prefetchRetryAt,
+  })
+}
+
+async function waitForDeferredAcquisitionSteps(task: DeliveryTask, reason: string) {
+  const retryAt = getNextTaskStepRetryAt(task)
+  if (retryAt == null) return false
+  task.retryAt = retryAt
+  await saveAndCheckpointDeliveryTask(task, '来源重试检查点写入失败')
+  scheduleDeliveryResumeAt(retryAt)
+  logBatchDiagnostic('所有可用取岗步骤暂未到重试时间，任务保持运行', {
+    ...summarizeTask(task),
+    reason,
+    retryAt,
+    waitMs: Math.max(0, retryAt - Date.now()),
+  })
+  return true
+}
+
 async function finishCurrentStep(task: DeliveryTask, runToken: DeliveryRunToken) {
   const previousStep = getCurrentTaskStep(task)
   markCurrentStepDone(task)
   const nextStep = getNextRunnableStep(task)
   if (nextStep == null) {
+    if (await waitForDeferredAcquisitionSteps(task, '当前步骤完成，其他来源仍在重试窗口内')) {
+      return true
+    }
     logBatchDiagnostic('当前取岗轮次完成：准备下一轮', summarizeTask(task))
     await flushRunState()
     if (!canContinueDeliveryRun(runToken)) return true
@@ -3991,6 +4430,16 @@ async function rotateToNextPool(task: DeliveryTask, runToken: DeliveryRunToken) 
   const currentSource = currentStep?.source
   const previousListSignature = getCurrentJobListSignature()
   let nextStep = rotateToNextTaskStep(task)
+  if (nextStep != null && !isTaskStepRunnable(nextStep)) {
+    const runnableStepIndex = findNextRunnableTaskStepIndex(task)
+    if (runnableStepIndex < 0) {
+      await waitForDeferredAcquisitionSteps(task, '轮转后的来源步骤仍在重试窗口内')
+      return true
+    }
+    task.currentIndex = runnableStepIndex
+    nextStep = task.steps[runnableStepIndex]
+    saveDeliveryTask(task, task.id)
+  }
   if (nextStep == null) {
     logBatchDiagnostic('轮转下一来源结束：准备下一轮取岗', summarizeTask(task))
     await flushRunState()
@@ -4084,7 +4533,8 @@ async function rotateToNextPool(task: DeliveryTask, runToken: DeliveryRunToken) 
 }
 
 function getNextRunnableStep(task: DeliveryTask) {
-  return task.steps.find((step) => step.status !== 'done') ?? null
+  const index = findNextRunnableTaskStepIndex(task)
+  return index >= 0 ? task.steps[index] : null
 }
 
 async function jumpToTaskPage(targetPage: number, runToken: DeliveryRunToken) {
@@ -4114,10 +4564,11 @@ async function jumpToTaskPage(targetPage: number, runToken: DeliveryRunToken) {
       listLength: jobList._list.value.length,
       firstJobId: beforePageFirstJobId,
     })
-    await acquireBossAction('pageNext', {
+    const acquired = await acquireBossAction('pageNext', {
       shouldAbort: () => common.deliverStop,
       onWait: (waitMs) => logPaginationDiagnostic('翻页被闸门限速', { waitMs }),
     })
+    if (!acquired || !canContinueDeliveryRun(runToken)) return false
     if (!next()) return false
     logPaginationDiagnostic('等待下一页岗位列表加载', {
       currentPage,
@@ -4199,11 +4650,11 @@ async function navigateToStep(url: string, reason: string, runToken: DeliveryRun
   if (isSameNavigationLocation(location.href, url)) return true
   // 换来源、换搜索方向都会让 BOSS 重新加载一整页数据，代价不比翻页小，所以同样要过闸门。
   // 这一类原本只在闸门里定义了限额、没有任何调用点——那是看起来有覆盖、其实没有。
-  await acquireBossAction('navigate', {
+  const acquired = await acquireBossAction('navigate', {
     shouldAbort: () => common.deliverStop,
     onWait: (waitMs) => logBatchDiagnostic('来源切换被闸门限速', { waitMs, reason, url }),
   })
-  if (!canContinueDeliveryRun(runToken)) return false
+  if (!acquired || !canContinueDeliveryRun(runToken)) return false
   const target = new URL(url, location.origin)
   const route = `${target.pathname}${target.search}${target.hash}`
   try {
@@ -4302,10 +4753,18 @@ function resetFilter() {
             </AgentButton>
           </template>
           <AgentButton
+            v-else-if="isDeliveryWaiting"
+            class="operation-panel__command-button"
+            disabled
+            aria-live="polite"
+          >
+            等待中
+          </AgentButton>
+          <AgentButton
             v-else
             class="operation-panel__command-button is-primary"
             type="primary"
-            :loading="common.deliverLock"
+            :loading="common.deliverLock && !common.deliverStop"
             @click="startBatch"
           >
             <Play :size="15" :stroke-width="0" fill="currentColor" aria-hidden="true" />
@@ -4344,14 +4803,14 @@ function resetFilter() {
       </div>
       <div class="operation-panel__metric-card">
         <div>
-          <p>已获取 / 可重试</p>
+          <p>已获取 / 待重新发现</p>
           <strong>
             {{ formatInstrumentNumber(dashboard.summary.fetched, 3) }} /
-            {{ formatInstrumentNumber(dashboard.summary.retryableFailures, 2) }}
+            {{ formatInstrumentNumber(dashboard.summary.deferred, 2) }}
           </strong>
         </div>
         <span>
-          {{ queueContinuationText }}
+          {{ queueContinuationText }} · 可重试 {{ dashboard.summary.retryableFailures }}
         </span>
       </div>
     </section>
@@ -4360,18 +4819,16 @@ function resetFilter() {
       <div class="operation-panel__dashboard-card operation-panel__dashboard-card--sources">
         <div class="operation-panel__section-head">
           <p>来源效率</p>
-          <!-- 这张表按投递记录统计，而记录只保留最近 200 条；上方摘要用的是全量统计计数器。
-               标明口径，免得两处数字对不上时被当成 bug。 -->
-          <span>SOURCE / 按记录</span>
+          <span>SOURCE / 今日累计</span>
         </div>
         <div class="operation-panel__source-table" role="table" aria-label="来源效率">
           <div class="operation-panel__source-table-head" role="row">
             <span>来源</span>
-            <span>获取</span>
-            <span>处理</span>
-            <span>成功</span>
-            <span>过滤</span>
-            <span>异常</span>
+            <span>待处理</span>
+            <span>今日处理</span>
+            <span>今日成功</span>
+            <span>今日过滤</span>
+            <span>今日异常</span>
             <span>成功率</span>
           </div>
           <div
@@ -4389,7 +4846,7 @@ function resetFilter() {
               {{ item.label }}
             </AgentButton>
             <span v-else class="operation-panel__source-name">{{ item.label }}</span>
-            <span>{{ item.fetched }}</span>
+            <span>{{ item.pending }}</span>
             <span>{{ item.processed }}</span>
             <span>{{ item.success }}</span>
             <span>{{ item.filtered }}</span>
@@ -4398,8 +4855,8 @@ function resetFilter() {
           </div>
         </div>
         <div class="operation-panel__section-head operation-panel__section-head--subsection">
-          <p>失败归因</p>
-          <span>FILTER / ERROR</span>
+          <p>最近记录归因</p>
+          <span>RECENT / FILTER + ERROR</span>
         </div>
         <div v-if="activeFailureCategories.length > 0" class="operation-panel__failure-list">
           <div

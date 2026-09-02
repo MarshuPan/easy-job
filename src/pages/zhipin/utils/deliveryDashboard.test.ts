@@ -169,6 +169,10 @@ describe('delivery dashboard metrics', () => {
         success: 34,
         searchSuccess: 30,
         groupSuccess: 4,
+        searchTotal: 40,
+        groupTotal: 10,
+        searchFiltered: 7,
+        groupFiltered: 3,
         total: 50,
         jobContent: 0,
         aiFiltering: 0,
@@ -182,8 +186,7 @@ describe('delivery dashboard metrics', () => {
       weights: { group: 40, search: 60 },
     })
 
-    // 摘要来自统计计数器（全量），表格来自投递记录（最近 200 条的窗口）。
-    // 两者不再按「今天有没有成功记录」互相切换，各自恒定同源。
+    // 摘要和来源表都来自同一份全天统计；池数量只表示当前库存。
     expect(dashboard.summary).toMatchObject({ processed: 50, success: 34, failed: 16 })
     expect(dashboard.summary.successRate).toBe(68)
     expect(dashboard.summary.remaining).toBe(116)
@@ -192,24 +195,24 @@ describe('delivery dashboard metrics', () => {
     expect(dashboard.sources.group).toMatchObject({
       fetched: 3,
       pending: 2,
-      processed: 2,
-      success: 1,
-      filtered: 1,
-      failed: 0,
-      actualPercent: 50,
+      processed: 10,
+      success: 4,
+      filtered: 3,
+      failed: 3,
+      actualPercent: 20,
       targetPercent: 40,
-      successRate: 50,
+      successRate: 40,
     })
     expect(dashboard.sources.search).toMatchObject({
       fetched: 3,
       pending: 3,
-      processed: 2,
-      success: 1,
-      filtered: 0,
-      failed: 1,
-      actualPercent: 50,
+      processed: 40,
+      success: 30,
+      filtered: 7,
+      failed: 3,
+      actualPercent: 80,
       targetPercent: 60,
-      successRate: 50,
+      successRate: 75,
     })
     expect(dashboard.failureCategories.find((item) => item.id === 'jobFit')?.count).toBe(1)
     expect(dashboard.failureCategories.find((item) => item.id === 'publish')?.count).toBe(1)
@@ -254,14 +257,44 @@ describe('delivery dashboard metrics', () => {
     expect(dashboard.sources.search.failed).toBe(0)
     expect(dashboard.summary.failed).toBe(1)
     expect(dashboard.sourceRows.find((item) => item.source === 'unknown')).toMatchObject({
-      label: '未归因来源',
+      label: '未归因历史',
       fetched: 0,
       processed: 1,
       filtered: 0,
       failed: 1,
-      actualPercent: 0,
+      actualPercent: 100,
       targetPercent: 0,
     })
+  })
+
+  it('reconciles legacy all-day totals without shrinking success to the recent record window', () => {
+    const targetDate = '2026-07-09'
+    const dashboard = buildDeliveryDashboard({
+      dailyLimit: 150,
+      pools: { group: [], search: [] },
+      records: [],
+      todayData: {
+        date: targetDate,
+        success: 104,
+        groupSuccess: 4,
+        searchSuccess: 100,
+        // 老版本还没有来源处理/过滤计数，只有顶层全天累计。
+        total: 130,
+      } as any,
+      targetDate,
+      weights: { group: 50, search: 50 },
+    })
+
+    expect(dashboard.sources.group).toMatchObject({ processed: 4, success: 4 })
+    expect(dashboard.sources.search).toMatchObject({ processed: 100, success: 100 })
+    expect(dashboard.sourceRows.find((item) => item.source === 'unknown')).toMatchObject({
+      label: '未归因历史',
+      processed: 26,
+      success: 0,
+      failed: 26,
+    })
+    expect(dashboard.sourceRows.reduce((sum, item) => sum + item.processed, 0)).toBe(130)
+    expect(dashboard.sourceRows.reduce((sum, item) => sum + item.success, 0)).toBe(104)
   })
 
   it('counts only records created on the target local date', () => {
@@ -305,7 +338,7 @@ describe('delivery dashboard metrics', () => {
       weights: { group: 50, search: 50 },
     })
 
-    expect(dashboard.sources.group.failed).toBe(1)
+    expect(dashboard.sources.group.failed).toBe(0)
     expect(dashboard.summary.fetched).toBe(0)
     expect(dashboard.failureCategories.find((item) => item.id === 'publish')?.count).toBe(1)
   })
@@ -350,7 +383,7 @@ describe('delivery dashboard metrics', () => {
     expect(dashboard.sourceRows.some((item) => item.source === 'unknown')).toBe(false)
   })
 
-  it('deduplicates successful and processed jobs globally across sources', () => {
+  it('uses persistent source counters instead of deduplicating the recent record window', () => {
     const targetDate = '2026-07-10'
     const duplicate = job('same-success')
     const dashboard = buildDeliveryDashboard({
@@ -385,10 +418,9 @@ describe('delivery dashboard metrics', () => {
       weights: { group: 50, search: 50 },
     })
 
-    // 同一岗位被两个来源各记一次，来源行必须只算一次（归给较晚的那条记录）。
-    // 摘要不参与这个去重：它用的是统计计数器，答的是「今天总共处理了多少次」。
+    // 来源累计不能受最近记录窗口的去重影响，否则记录超过 200 条后数字会倒退。
     expect(dashboard.summary).toMatchObject({ processed: 2, success: 2 })
-    expect(dashboard.sources.group).toMatchObject({ processed: 0, success: 0 })
+    expect(dashboard.sources.group).toMatchObject({ processed: 1, success: 1 })
     expect(dashboard.sources.search).toMatchObject({ processed: 1, success: 1 })
   })
 })
@@ -432,5 +464,22 @@ describe('pool pending accounting', () => {
     expect(dashboard.sources.group.fetched).toBe(3)
     expect(dashboard.sources.group.pending).toBe(1)
     expect(dashboard.summary.pending).toBe(1)
+  })
+
+  it('reports jobs waiting for rediscovery separately from deliverable jobs', () => {
+    const dashboard = buildDeliveryDashboard({
+      dailyLimit: 150,
+      pools: {
+        group: [job('ready'), { ...job('deferred'), credentialRefreshDeferred: true }],
+        search: [],
+      },
+      records: [],
+      targetDate,
+      todayData: emptyStatistics,
+      weights: { group: 50, search: 50 },
+    })
+
+    expect(dashboard.summary).toMatchObject({ fetched: 2, pending: 1, deferred: 1 })
+    expect(dashboard.sources.group).toMatchObject({ pending: 1, deferred: 1 })
   })
 })

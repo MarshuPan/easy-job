@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { loader } from './index'
+import { delay, loader } from './index'
 
 describe('extension request loader isolation', () => {
   beforeEach(() => {
@@ -46,5 +46,16 @@ describe('extension request loader isolation', () => {
 
     expect(document.querySelector('#agent-delivery-loader')).toBeNull()
     expect(window.requestAnimationFrame).not.toHaveBeenCalled()
+  })
+
+  it('keeps timing waits silent even when the extension root exists', async () => {
+    document.body.innerHTML = '<div id="agent-delivery-job"></div>'
+
+    const waiting = delay(0)
+
+    expect(document.querySelector('#agent-delivery-loader')).toBeNull()
+    expect(window.requestAnimationFrame).not.toHaveBeenCalled()
+
+    await waiting
   })
 })

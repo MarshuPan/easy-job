@@ -62,24 +62,48 @@ export function isSameTaskStep(
   return left.expectation?.id === right.expectation?.id
 }
 
+export function isTaskStepRunnable(step: DeliveryTask['steps'][number], now = Date.now()) {
+  const retryAt = Number(step.prefetchRetryAt)
+  return step.status !== 'done' && (!Number.isFinite(retryAt) || retryAt <= now)
+}
+
+export function findNextRunnableTaskStepIndex(task: DeliveryTask, now = Date.now()) {
+  return task.steps.findIndex((step) => isTaskStepRunnable(step, now))
+}
+
+export function getNextTaskStepRetryAt(task: DeliveryTask, now = Date.now()) {
+  const retryTimes = task.steps.flatMap((step) => {
+    const retryAt = Number(step.prefetchRetryAt)
+    return step.status !== 'done' && Number.isFinite(retryAt) && retryAt > now ? [retryAt] : []
+  })
+  return retryTimes.length > 0 ? Math.min(...retryTimes) : null
+}
+
 export function findNextTaskStepIndexBySource(task: DeliveryTask, source: DeliveryLimitSource) {
   const orderedIndexes = [
     ...task.steps.slice(task.currentIndex + 1).map((_, index) => task.currentIndex + 1 + index),
     ...task.steps.slice(0, task.currentIndex + 1).map((_, index) => index),
   ]
   return (
-    orderedIndexes.find(
-      (index) =>
-        task.steps[index]?.source === source &&
-        task.steps[index]?.status !== 'done' &&
-        !task.steps[index]?.prefetchExhausted,
-    ) ?? -1
+    orderedIndexes.find((index) => {
+      const step = task.steps[index]
+      return (
+        step?.source === source &&
+        isTaskStepRunnable(step) &&
+        !step.prefetchExhausted &&
+        step.status !== 'done'
+      )
+    }) ?? -1
   )
 }
 
 export function hasPrefetchableStep(task: DeliveryTask, source: DeliveryLimitSource) {
   return task.steps.some(
-    (step) => step.source === source && step.status !== 'done' && !step.prefetchExhausted,
+    (step) =>
+      step.source === source &&
+      isTaskStepRunnable(step) &&
+      !step.prefetchExhausted &&
+      step.status !== 'done',
   )
 }
 
@@ -93,6 +117,9 @@ export function hasPrefetchableStep(task: DeliveryTask, source: DeliveryLimitSou
  */
 export function getDeliverableJobs(items: MyJobListData[]) {
   return items.filter((item) => {
+    if (item.credentialRefreshRequired === true || item.credentialRefreshDeferred === true) {
+      return false
+    }
     const status = item.status?.status
     return status === 'pending' || status === 'wait' || status === 'running'
   })

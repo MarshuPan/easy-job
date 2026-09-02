@@ -52,6 +52,8 @@ type WorkspaceSection = 'dashboard' | 'records' | 'filters' | 'settings' | 'pers
 
 const panelOpen = ref(false)
 const activeSection = ref<WorkspaceSection>('dashboard')
+const mountedSections = ref<Set<WorkspaceSection>>(new Set(['dashboard']))
+const jobRuntimeReady = ref(false)
 let sectionSelectionVersion = 0
 let previouslyFocusedElement: HTMLElement | null = null
 const navigation = [
@@ -193,11 +195,12 @@ onMounted(async () => {
   } catch (e) {
     logger.error(`初始化职位列表失败：${describeInitFailure(e)}`)
     AgentMessage.error('岗位列表初始化失败，请刷新后重试')
+    return
   }
 
   try {
     await initPager()
-    window.dispatchEvent(new CustomEvent('agent-delivery:job-runtime-ready'))
+    jobRuntimeReady.value = true
   } catch (e) {
     logger.error(`初始化分页器失败：${describeInitFailure(e)}`)
     AgentMessage.error('岗位分页初始化失败，请刷新后重试')
@@ -237,7 +240,14 @@ async function selectSection(section: WorkspaceSection) {
     }
   }
   if (selectionVersion !== sectionSelectionVersion) return
+  if (!mountedSections.value.has(section)) {
+    mountedSections.value = new Set([...mountedSections.value, section])
+  }
   activeSection.value = section
+}
+
+function isSectionMounted(section: WorkspaceSection) {
+  return mountedSections.value.has(section)
 }
 
 function handleJobUiVisibility(event: Event) {
@@ -392,6 +402,7 @@ function handlePersonalFrameMessage(event: MessageEvent) {
             data-view="dashboard"
           >
             <OperationPanel
+              :runtime-ready="jobRuntimeReady"
               @open-settings="selectSection('settings')"
               @show-search="selectSection('filters')"
               @show-group="selectSection('filters')"
@@ -403,21 +414,28 @@ function handlePersonalFrameMessage(event: MessageEvent) {
             class="agent-delivery-view agent-delivery-view--records"
             data-view="records"
           >
-            <DeliveryRecords :visible="panelOpen && activeSection === 'records'" />
+            <DeliveryRecords
+              v-if="isSectionMounted('records')"
+              :visible="panelOpen && activeSection === 'records'"
+            />
           </section>
           <section
             v-show="activeSection === 'filters'"
             class="agent-delivery-view agent-delivery-view--filters"
             data-view="filters"
           >
-            <Config :visible="panelOpen && activeSection === 'filters'" section="filter" />
+            <Config
+              v-if="isSectionMounted('filters')"
+              :visible="panelOpen && activeSection === 'filters'"
+              section="filter"
+            />
           </section>
           <section
             v-show="activeSection === 'settings'"
             class="agent-delivery-view agent-delivery-view--settings"
             data-view="settings"
           >
-            <RuntimeSettingsDrawer />
+            <RuntimeSettingsDrawer v-if="isSectionMounted('settings')" />
           </section>
           <section
             v-show="activeSection === 'personal'"
@@ -425,7 +443,7 @@ function handlePersonalFrameMessage(event: MessageEvent) {
             data-view="personal"
           >
             <iframe
-              v-if="personalFrameUrl"
+              v-if="isSectionMounted('personal') && personalFrameUrl"
               ref="personalFrameRef"
               class="agent-delivery-personal-frame"
               :src="personalFrameUrl"
@@ -438,7 +456,7 @@ function handlePersonalFrameMessage(event: MessageEvent) {
             class="agent-delivery-view agent-delivery-view--logs"
             data-view="logs"
           >
-            <Logs />
+            <Logs v-if="isSectionMounted('logs')" />
           </section>
         </main>
       </div>
