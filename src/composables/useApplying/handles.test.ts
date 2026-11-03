@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { GreetingChannelUnavailableError } from '@/composables/useWebSocket/greetingChannelError'
+
 const {
   todayData,
   addLogTraceMock,
@@ -17,11 +19,15 @@ const {
   resolveAmapLocationMock,
   runBackgroundAiTaskMock,
   sendMessageMock,
+  localDiagnosticAppendMock,
   storageGetMock,
+  storageRmMock,
   storageSetMock,
 } = vi.hoisted(() => {
   const sendMessageMock = vi.fn(() => 'MockChannel')
+  const localDiagnosticAppendMock = vi.fn(async (_event: unknown) => true)
   const storageGetMock = vi.fn()
+  const storageRmMock = vi.fn()
   const storageSetMock = vi.fn()
   return {
     // 与 createEmptyStatistics 的字段全集保持一致；beforeEach 会重置为 0。
@@ -63,7 +69,9 @@ const {
     resolveAmapLocationMock: vi.fn(),
     runBackgroundAiTaskMock: vi.fn(),
     sendMessageMock,
+    localDiagnosticAppendMock,
     storageGetMock,
+    storageRmMock,
     storageSetMock,
   }
 })
@@ -88,8 +96,10 @@ vi.mock('@/utils/actionGateStore', () => ({
 
 vi.mock('@/message', () => ({
   counter: {
+    localDiagnosticAppend: localDiagnosticAppendMock,
     openChatTab: openChatTabMock,
     storageGet: storageGetMock,
+    storageRm: storageRmMock,
     storageSet: storageSetMock,
   },
   runBackgroundAiTask: runBackgroundAiTaskMock,
@@ -182,7 +192,7 @@ vi.mock('@/utils/amap', () => ({
   resolveAmapLocation: resolveAmapLocationMock,
 }))
 
-import { AIFilteringError, AIProviderError } from '@/types/deliverError'
+import { AIFilteringError, AIProviderError, GreetingGenerationError } from '@/types/deliverError'
 import { acquireBossAction } from '@/utils/actionGateStore'
 
 import { getPendingGreetingWaitTimeoutMs, handles } from './handles'
@@ -244,7 +254,6 @@ function recentGreeting(primaryFactId: string) {
   return {
     sentAt: Date.now(),
     usedFactIds: [primaryFactId],
-    openingPattern: 'history',
     messages: ['历史第一条', '历史第二条', '历史第三条'],
     fingerprint: '1234abcd',
   }
@@ -277,7 +286,7 @@ describe('useApplying handles greeting flow', () => {
     enqueuePendingGreetingMock.mockReset()
     getPendingGreetingMock.mockReset()
     openChatTabMock.mockReset()
-    openChatTabMock.mockResolvedValue({ id: 1 })
+    openChatTabMock.mockResolvedValue({ tabId: 1, ready: true, code: 'READY', reason: 'ready' })
     removePendingGreetingMock.mockReset()
     sendMessageMock.mockReset()
     sendMessageMock.mockReturnValue('MockChannel')
@@ -289,8 +298,9 @@ describe('useApplying handles greeting flow', () => {
           '期待进一步沟通。',
         ],
         usedFactIds: ['fact-agent-content'],
+        segmentFactIds: [['fact-agent-content'], [], []],
         claimMode: 'direct',
-        openingPattern: 'jd-hook',
+        anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       }),
       reasoning_content: 'reasoning',
     })
@@ -319,7 +329,56 @@ describe('useApplying handles greeting flow', () => {
     recentAiGreetingsMock.mockReturnValue([])
     logHydrateMock.mockClear()
     storageGetMock.mockReset()
+    storageRmMock.mockReset()
     storageSetMock.mockReset()
+  })
+
+  it('resets only the stored HR history once before applying weekly dedupe', async () => {
+    confState.formData.sameHrFilter.value = true
+    const storage = new Map<string, unknown>([
+      [
+        'local:sameHr',
+        {
+          '10001': [
+            {
+              id: 'old-hr',
+              date: '2026-10-26',
+              deliveredAt: Date.now(),
+              week: '2026-10-26',
+              origin: 'delivery',
+            },
+          ],
+        },
+      ],
+      ['local:unrelated', { keep: true }],
+    ])
+    storageGetMock.mockImplementation(async <T>(key: string, fallback: T) =>
+      storage.has(key) ? (storage.get(key) as T) : fallback,
+    )
+    storageRmMock.mockImplementation(async (key: string) => {
+      storage.delete(key)
+      return true
+    })
+    storageSetMock.mockImplementation(async (key: string, value: unknown) => {
+      storage.set(key, value)
+      return true
+    })
+
+    const step = handles().SameHrFilter() as { fn: Handler; afterPublish: Handler }
+    const data = { ...createJobData(), encryptBossId: 'new-hr' }
+    await step.fn({ data }, createCtx())
+    await step.afterPublish({ data }, createCtx())
+
+    expect(storageRmMock).toHaveBeenCalledOnce()
+    expect(storageRmMock).toHaveBeenCalledWith('local:sameHr')
+    expect(storage.get('local:unrelated')).toEqual({ keep: true })
+    expect(storage.get('local:sameHrResetVersion')).toBe('1.3.38')
+    expect(storage.get('local:sameHr')).toEqual({
+      '10001': [expect.objectContaining({ id: 'new-hr', origin: 'delivery' })],
+    })
+
+    await expect(step.fn({ data }, createCtx())).rejects.toThrow('本周已投递给相同招聘者')
+    expect(storageRmMock).toHaveBeenCalledOnce()
   })
 
   it('migrates the legacy company list and allows three distinct jobs before limiting the company', async () => {
@@ -388,10 +447,8 @@ describe('useApplying handles greeting flow', () => {
       expect.arrayContaining([
         '开始生成AI招呼语，超时 180 秒',
         expect.stringContaining('AI招呼语已生成 3 条'),
-        '准备发送第 1/3 条招呼语',
-        '准备发送第 2/3 条招呼语',
-        '准备发送第 3/3 条招呼语',
-        'AI招呼语样本已记录，可用于后续复盘',
+        expect.stringContaining('第 1/3 条招呼语已通过'),
+        expect.stringContaining('第 3/3 条招呼语已通过'),
         'AI招呼语3条已全部发送',
       ]),
     )
@@ -400,6 +457,66 @@ describe('useApplying handles greeting flow', () => {
         task: 'aiGreeting',
         timeout: 180,
       }),
+    )
+
+    const feedbackEvents = localDiagnosticAppendMock.mock.calls
+      .map(([event]) => event as { event?: string; data?: Record<string, unknown> })
+      .filter((event) => event.event?.startsWith('greeting.'))
+    expect(feedbackEvents.map((event) => event.event)).toEqual([
+      'greeting.generated',
+      'greeting.sent',
+      'greeting.sent',
+      'greeting.sent',
+    ])
+    expect(feedbackEvents[0]?.data).toMatchObject({
+      jobId: 'job-1',
+      conversationKey: 'boss:20002',
+      conversationKeys: ['boss:20002', 'boss:boss-enc-1'],
+      segments: expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('AI Agent') }),
+      ]),
+    })
+  })
+
+  it('generates the AI greeting before publishing and reuses it when sending', async () => {
+    requestBossDataMock.mockClear()
+    const ctx = createCtx()
+    const greetingStep = handles().greeting() as { fn: Handler; after: Handler }
+
+    await greetingStep.fn({ data: ctx.listData }, ctx)
+    expect(runBackgroundAiTaskMock).toHaveBeenCalledTimes(1)
+    expect(ctx.aiGreetingMessages).toHaveLength(3)
+    expect(requestBossDataMock).not.toHaveBeenCalled()
+
+    await greetingStep.after({ data: ctx.listData }, ctx)
+    expect(runBackgroundAiTaskMock).toHaveBeenCalledTimes(1)
+    expect(ctx.greetingSend).toMatchObject({ ok: true, type: 'ai', messageCount: 3 })
+  })
+
+  it('fails only the current job when a greeting draft is unusable before publishing', async () => {
+    runBackgroundAiTaskMock.mockRejectedValueOnce(
+      Object.assign(new Error('后台AI响应格式异常（第2次：FORBIDDEN_CLAIM）'), {
+        name: 'AI_TASK_RESPONSE_INVALID',
+      }),
+    )
+    const ctx = createCtx()
+    const greetingStep = handles().greeting() as { fn: Handler }
+
+    await expect(greetingStep.fn({ data: ctx.listData }, ctx)).rejects.toBeInstanceOf(
+      GreetingGenerationError,
+    )
+    expect(ctx.greetingWarning).toBeUndefined()
+  })
+
+  it('pauses the run when the model service is unavailable before publishing', async () => {
+    runBackgroundAiTaskMock.mockRejectedValueOnce(
+      Object.assign(new Error('后台AI任务超时'), { name: 'AI_TASK_TIMEOUT' }),
+    )
+    const ctx = createCtx()
+    const greetingStep = handles().greeting() as { fn: Handler }
+
+    await expect(greetingStep.fn({ data: ctx.listData }, ctx)).rejects.toBeInstanceOf(
+      AIProviderError,
     )
   })
 
@@ -489,8 +606,9 @@ describe('useApplying handles greeting flow', () => {
       content: JSON.stringify({
         messages: ['第一条', '第二条', '第三条'],
         usedFactIds: ['fact-agent-content'],
+        segmentFactIds: [['fact-agent-content'], [], []],
         claimMode: 'direct',
-        openingPattern: 'jd-hook',
+        anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       }),
       reasoning_content: 'reasoning',
     })
@@ -857,8 +975,8 @@ describe('useApplying handles greeting flow', () => {
 
     expect(ctx.aiGreetingMeta).toEqual({
       usedFactIds: ['fact-agent-content'],
-      claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      segmentFactIds: [['fact-agent-content'], [], []],
+      anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       fingerprint: expect.stringMatching(/^[0-9a-f]{8}$/),
     })
   })
@@ -974,7 +1092,7 @@ describe('useApplying handles greeting flow', () => {
     ctx.aiGreetingMeta = {
       usedFactIds: ['fact-agent-content'],
       claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       fingerprint: '1234abcd',
     }
     ctx.greetingSend = {
@@ -1032,7 +1150,7 @@ describe('useApplying handles greeting flow', () => {
       type: 'ai' as const,
     }
     sendMessageMock.mockImplementation(() => {
-      throw new Error('WebSocket unavailable')
+      throw new GreetingChannelUnavailableError('WebSocket unavailable')
     })
     enqueuePendingGreetingMock.mockResolvedValue(pending)
     getPendingGreetingMock.mockResolvedValue(pending)
@@ -1043,7 +1161,7 @@ describe('useApplying handles greeting flow', () => {
     ctx.aiGreetingMeta = {
       usedFactIds: ['fact-agent-content'],
       claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       fingerprint: '1234abcd',
     }
     ctx.greetingSend = { ok: false, type: 'ai', messages: [] }
@@ -1079,7 +1197,7 @@ describe('useApplying handles greeting flow', () => {
       type: 'ai' as const,
     }
     sendMessageMock.mockImplementation(() => {
-      throw new Error('WebSocket unavailable')
+      throw new GreetingChannelUnavailableError('WebSocket unavailable')
     })
     enqueuePendingGreetingMock.mockResolvedValue(pending)
     getPendingGreetingMock.mockResolvedValue(pending)
@@ -1089,7 +1207,7 @@ describe('useApplying handles greeting flow', () => {
     ctx.aiGreetingMeta = {
       usedFactIds: ['fact-agent-content'],
       claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       fingerprint: '1234abcd',
     }
     ctx.greetingSend = { ok: false, type: 'ai', messages: [] }
@@ -1105,6 +1223,126 @@ describe('useApplying handles greeting flow', () => {
     })
   })
 
+  it.each(['connection', 'pacing'] as const)(
+    'cuts only an unconnected wait after 15s: %s',
+    async (waitingFor) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date('2030-01-01T00:00:00Z'))
+      const pending = {
+        id: 'wait-boundary',
+        createdAt: Date.now(),
+        fromUid: '10001',
+        toUid: '20002',
+        toName: 'boss',
+        content: '您好',
+        type: 'ai' as const,
+        status: { stage: 'waiting' as const, waitingFor, observedAt: Date.now() },
+      }
+      enqueuePendingGreetingMock.mockResolvedValue(pending)
+      getPendingGreetingMock.mockResolvedValue(pending)
+      sendMessageMock.mockImplementation(() => {
+        throw new GreetingChannelUnavailableError('not submitted')
+      })
+      removePendingGreetingMock.mockResolvedValue(true)
+      const ctx = createCtx()
+      ctx.aiGreetingMessages = ['您好']
+      ctx.aiGreetingMeta = {
+        usedFactIds: ['fact-agent-content'],
+        segmentFactIds: [['fact-agent-content'], [], []],
+        anchor: { need: 'AI', jdQuote: 'AI' },
+        fingerprint: '1234abcd',
+      }
+      let settled = false
+      const result = handles()
+        .retryGreeting({ data: ctx.listData }, ctx)
+        .then(
+          () => {
+            settled = true
+            return undefined
+          },
+          (error) => {
+            settled = true
+            return error
+          },
+        )
+      try {
+        await vi.advanceTimersByTimeAsync(14_999)
+        expect(settled).toBe(false)
+        await vi.advanceTimersByTimeAsync(501)
+        if (waitingFor === 'connection') {
+          expect((await result)?.message).toContain('未在本次投递中确认发送成功')
+          expect(removePendingGreetingMock).toHaveBeenCalledWith(pending.id, 10001)
+        } else {
+          expect(settled).toBe(false)
+          expect(removePendingGreetingMock).not.toHaveBeenCalled()
+          getPendingGreetingMock.mockResolvedValue(undefined)
+          await vi.advanceTimersByTimeAsync(500)
+          expect(await result).toBeUndefined()
+          expect(ctx.greetingSend.ok).toBe(true)
+        }
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('does not enqueue a second copy after the direct send function throws ambiguously', async () => {
+    sendMessageMock.mockImplementation(() => {
+      throw new Error('platform threw after handoff')
+    })
+    const ctx = createCtx()
+    ctx.aiGreetingMessages = ['您好']
+    ctx.aiGreetingMeta = {
+      usedFactIds: ['fact-agent-content'],
+      anchor: { need: 'AI', jdQuote: 'AI' },
+      fingerprint: '1234abcd',
+    }
+    await expect(handles().retryGreeting({ data: ctx.listData }, ctx)).rejects.toThrow(
+      '招呼语发送结果不确定',
+    )
+    expect(enqueuePendingGreetingMock).not.toHaveBeenCalled()
+    expect(ctx.greetingSend).toMatchObject({ ok: false, detail: { resultUnknown: true } })
+  })
+
+  it('returns a specific readiness failure without spending another 15 seconds waiting on the queue', async () => {
+    const pending = {
+      id: 'readiness-failed',
+      createdAt: Date.now(),
+      fromUid: '10001',
+      toUid: '20002',
+      toName: 'boss',
+      content: '您好',
+      type: 'ai' as const,
+      status: { stage: 'queued' as const, observedAt: Date.now() },
+    }
+    sendMessageMock.mockImplementation(() => {
+      throw new GreetingChannelUnavailableError('not submitted')
+    })
+    enqueuePendingGreetingMock.mockResolvedValue(pending)
+    openChatTabMock.mockResolvedValue({
+      ready: false,
+      code: 'ACCOUNT_UNAVAILABLE',
+      reason: '聊天页账号尚未初始化',
+      loaded: false,
+      reused: true,
+      handshakeMs: 12_000,
+    })
+    removePendingGreetingMock.mockResolvedValue(true)
+    const ctx = createCtx()
+    ctx.aiGreetingMessages = ['您好']
+    ctx.aiGreetingMeta = {
+      usedFactIds: ['fact-agent-content'],
+      anchor: { need: 'AI', jdQuote: 'AI' },
+      fingerprint: '1234abcd',
+    }
+    await expect(handles().retryGreeting({ data: ctx.listData }, ctx)).rejects.toThrow(
+      'ACCOUNT_UNAVAILABLE',
+    )
+    expect(openChatTabMock).toHaveBeenCalledWith(expect.stringContaining('/web/geek/chat'), '10001')
+    expect(getPendingGreetingMock).not.toHaveBeenCalled()
+    expect(removePendingGreetingMock).toHaveBeenCalledWith(pending.id, 10001)
+  })
+
   it('marks the result unknown when a queued greeting cannot be removed', async () => {
     const pending = {
       id: 'pending-remove-failed',
@@ -1118,7 +1356,7 @@ describe('useApplying handles greeting flow', () => {
       type: 'ai' as const,
     }
     sendMessageMock.mockImplementation(() => {
-      throw new Error('WebSocket unavailable')
+      throw new GreetingChannelUnavailableError('WebSocket unavailable')
     })
     enqueuePendingGreetingMock.mockResolvedValue(pending)
     openChatTabMock.mockRejectedValue(new Error('聊天页打开失败'))
@@ -1129,7 +1367,7 @@ describe('useApplying handles greeting flow', () => {
     ctx.aiGreetingMeta = {
       usedFactIds: ['fact-agent-content'],
       claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      anchor: { need: 'AI Agent 产品落地', jdQuote: 'AI Agent 产品' },
       fingerprint: '1234abcd',
     }
     ctx.greetingSend = { ok: false, type: 'ai', messages: [] }
@@ -1187,7 +1425,7 @@ describe('useApplying handles greeting flow', () => {
       releasePendingRead = resolve
     })
     sendMessageMock.mockImplementation(() => {
-      throw new Error('WebSocket unavailable')
+      throw new GreetingChannelUnavailableError('WebSocket unavailable')
     })
     enqueuePendingGreetingMock.mockResolvedValue(pending)
     getPendingGreetingMock.mockReturnValueOnce(deferredPendingRead).mockResolvedValue(pending)

@@ -11,6 +11,9 @@ describe('delivery safety state policy', () => {
     expect(chooseDeliveryStopReason('manual-stop', 'runtime-reconnect')).toBe('manual-stop')
     expect(chooseDeliveryStopReason('runtime-reconnect', 'manual-stop')).toBe('manual-stop')
     expect(chooseDeliveryStopReason('security-check', 'manual-stop')).toBe('manual-stop')
+    expect(chooseDeliveryStopReason('ai-retry', 'manual-pause')).toBe('manual-pause')
+    expect(chooseDeliveryStopReason('ai-retry', 'security-check')).toBe('security-check')
+    expect(chooseDeliveryStopReason('ai-retry', 'daily-limit')).toBe('daily-limit')
   })
 
   it('does not overwrite equal-priority reasons by timing', () => {
@@ -31,6 +34,7 @@ describe('delivery safety state policy', () => {
     }
     expect(shouldAutoResumeDelivery({ ...base, reason: 'rate-limited' })).toBe(true)
     expect(shouldAutoResumeDelivery({ ...base, reason: 'source-retry' })).toBe(true)
+    expect(shouldAutoResumeDelivery({ ...base, reason: 'ai-retry' })).toBe(true)
     expect(shouldAutoResumeDelivery({ ...base, reason: 'manual-pause' })).toBe(false)
     expect(shouldAutoResumeDelivery({ ...base, reason: 'security-check' })).toBe(false)
     expect(shouldAutoResumeDelivery({ ...base, reason: 'terminal-error' })).toBe(false)

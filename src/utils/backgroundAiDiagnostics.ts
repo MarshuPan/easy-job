@@ -5,6 +5,8 @@ export interface AiTaskAttemptDiagnostic {
   durationMs: number
   error?: string
   ok: boolean
+  /** Full provider error body for local diagnosis; credentials are filtered by the local sink. */
+  providerResponse?: unknown
   status?: number
   statusText?: string
 }

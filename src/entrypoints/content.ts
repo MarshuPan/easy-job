@@ -8,6 +8,9 @@ import '@/main.scss'
 
 export default defineContentScript({
   matches: ['*://zhipin.com/*', '*://*.zhipin.com/*'],
+  // Install the passive socket listener before the site's chat connection is created.
+  // UI startup still waits for the site's Vue root.
+  runAt: 'document_start',
   async main(_ctx) {
     const bridgeToken = crypto.randomUUID()
     setBridgeToken(bridgeToken)

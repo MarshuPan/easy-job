@@ -6,6 +6,7 @@ import {
   DEFAULT_SEARCH_DIRECTIONS,
   DEFAULT_SEARCH_SALARY,
 } from '@/config/defaults'
+import { DEFAULT_GREETING_TARGET } from '@/config/greetingLength'
 import type { FormData, FormInfoData } from '@/types/formData'
 
 export const formInfoData: FormInfoData = {
@@ -44,7 +45,7 @@ export const formInfoData: FormInfoData = {
   },
   sameHrFilter: {
     label: '相同Hr过滤',
-    'data-help': '投递过的hr存储到浏览器本地，避免多次向同hr投递。',
+    'data-help': '招聘者 ID 永久保留；同一自然周最多投递一次，跨周允许再次投递。',
   },
   useCache: {
     label: '启用缓存',
@@ -274,7 +275,7 @@ export const defaultFormData: FormData = {
   aiGreeting: {
     enable: false,
     messageCount: 3,
-    targetTotalCharacters: 150,
+    targetTotalCharacters: DEFAULT_GREETING_TARGET,
     prompt: DEFAULT_AI_GREETING_PROMPT,
   },
   aiFiltering: {

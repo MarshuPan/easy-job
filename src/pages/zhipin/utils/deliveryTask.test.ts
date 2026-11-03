@@ -429,6 +429,17 @@ describe('delivery task storage', () => {
     ).toBeNull()
   })
 
+  it('does not store the post-verification _security_check marker in the group step url', () => {
+    const created = createDeliveryTask({
+      accountUid: 'account-a',
+      currentSource: 'group',
+      currentUrl: 'https://www.zhipin.com/web/geek/jobs?_security_check=1_1790144828656',
+      hasRemaining: (source) => source === 'group',
+    })
+
+    expect(created?.steps[0]?.url).toBe('https://www.zhipin.com/web/geek/jobs')
+  })
+
   it('keeps recommendation and every configured expectation under the existing source class', () => {
     const created = createDeliveryTask({
       accountUid: 'account-a',

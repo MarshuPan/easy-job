@@ -1,6 +1,8 @@
+import { TARGET_ROLE_MAX_CHARACTERS } from '@/profile/targetRole'
 import { jsonClone } from '@/utils/deepmerge'
 
 import { migrateBuiltInGreetingPrompt } from './builtInPrompt'
+import { DEFAULT_GREETING_TARGET, greetingBoundsFromTarget } from './greetingLength'
 import {
   CONFIG_FORMAT,
   CONFIG_SCHEMA_VERSION,
@@ -15,6 +17,7 @@ import {
 export const CONFIG_LIMITS = Object.freeze({
   importFileBytes: 2 * 1024 * 1024,
   displayNameCharacters: 10,
+  targetRoleCharacters: TARGET_ROLE_MAX_CHARACTERS,
   resumeCharacters: 5000,
   promptCharacters: 8 * 1024,
   modelCount: 1,
@@ -56,7 +59,7 @@ export const DEFAULT_AI_FILTERING_PROMPT = `你要回答的问题是：这个人
 
 一、先看这是不是同一类工作
 职能不同就是不匹配，先判断这个，再谈能力。
-- 职能 = 这份工作主要产出什么：定义产品、做运营增长、写代码、做销售、做人事。候选人的职能看简历事实里的 role 和实际做过的事。
+- 职能 = 这份工作主要产出什么：定义产品、做运营增长、写代码、做销售、做人事。候选人的职能以求职定位为准，结合简历里的职位和实际做过的事。
 - 职能不同不能靠可迁移能力补。一个做产品的人搭过内容矩阵、看过投放数据，不等于他要做运营总监；一个写过 SQL 的产品经理不是数据工程师。能力能迁到别的职能上去，不代表那就是他的职能。
 - 「职能不同」和「场景不同」是两回事，别混。产品换个行业做还是产品，不扣分；产品换成运营，那是另一份工作。
 
@@ -88,14 +91,19 @@ export const DEFAULT_AI_FILTERING_PROMPT = `你要回答的问题是：这个人
 
 七、理由保持简洁：说清楚能力覆盖在哪里、最大的实质差距是什么，并选出最适合后续招呼语使用的主事实。`
 
-export const DEFAULT_AI_GREETING_PROMPT = `请以候选人本人主动求职的自然、专业口吻构思一段完整话术。
+export const DEFAULT_AI_GREETING_PROMPT = `请以候选人本人的口吻写一段求职开场话术，读的人是招聘方。要让对方读完觉得：这个人做过的事，正好对得上这份 JD 最要紧的那件事。
+写法像资深从业者的简短自我介绍：陈述做过什么、结果如何、擅长什么，不表态、不许愿。
 
-写作要求：
-1. 完整话术按“招聘者称呼、自我介绍、工作年限、主要领域”的顺序开头。优先使用 bossName 中可识别的姓氏加“老师您好”，无法识别时使用“老师您好”；随后使用“我是”加 candidateName；candidateExperience 非空时接“目前有”加 candidateExperience；再按简历事实概括主要工作领域，领域表述随本次岗位调整，不要固定成同一句话。
-2. 交代身份之后，呈现与完整 JD 最强的职责重合点。整体使用一个主事实，确有必要时再补充一个辅助事实；不让日期、弱相关背景或空话挤占核心信息。
-3. 收尾说明这些经验能为这个岗位带来什么。写完后自检：这句话换成另一个候选人是否同样成立？如果成立，说明它没有信息量，重写或删去。「流程梳理」「持续优化」「效果跟踪」「需求拆解」这类任何产品经理都能说的动作，不能单独作为收尾内容。沟通意愿只能是简短尾句。
-4. 表达专业、直接、自然，避免第三方简历摘要、营销式判断以及“非常匹配”“一定能”“完全胜任”“我更能”“更关注”“提供参考”等空泛或偏弱表达。
-5. 本提示词规定的是每部分要传达的信息，不是句式模板。不同岗位之间应当在切入角度、句子结构和信息组织上真正不同，而不是只替换公司名、岗位名和项目名；参考 recentGreetings 主动避开近期已用过的开头方式和事实组合。`
+整段围绕 anchor.need 来写，按下面的顺序组织：
+1. 我是谁：称呼（bossName 中可识别姓氏时用“X老师您好”，否则用“老师您好”）之后，一句话直接说我是做什么的。身份按 targetRole，侧重点跟着 need 走，可以带工作年限，不复述姓名，不提求职或应聘。
+2. 做过什么：从 facts 里选最能回应 need 的真实经历，按岗位需求和表达需要引用，讲清做了什么、结果如何，优先带数字。同样贴近时选 recentFactUses 少的；与这个岗位无关的数字不写。
+3. 能力：点出支撑 need 的核心能力，来自 facts，说得具体。
+4. 能带来什么：对准 need，说我做成过的事放到对方的业务里，能解决什么、带来什么结果。用具体的做法或结果说，不以“经验”“认识”“参考”这类虚词收尾；不复述 JD，不写流程套话。
+5. 收尾：一句简短的期待沟通，不提问。
+
+用这个行业的标准说法，HR 不一定懂技术，冷僻术语不用；不用营销式判断。
+篇幅按设置的总字数来：字数少时把第 2、3 部分合成一句；不用客套和空话填篇幅。
+这里规定的是每部分传达什么，不是句式模板。写完自检：把公司名和岗位名换掉，这段话对另一个岗位是否同样成立？成立就重写。`
 
 export function migrateBuiltInAiGreetingPrompt(value: string) {
   return migrateBuiltInGreetingPrompt(value, DEFAULT_AI_GREETING_PROMPT)
@@ -104,6 +112,7 @@ export function migrateBuiltInAiGreetingPrompt(value: string) {
 export function createDefaultProfile(): PersonalProfileConfig {
   return {
     displayName: '',
+    targetRole: '',
     resume: {
       markdown: '',
       sourceHash: null,
@@ -128,8 +137,7 @@ export function createDefaultAiTasks(): AiTaskConfig {
       enabled: false,
       modelId: null,
       messageCount: 3,
-      minTotalCharacters: 125,
-      maxTotalCharacters: 175,
+      ...greetingBoundsFromTarget(DEFAULT_GREETING_TARGET),
       prompt: DEFAULT_AI_GREETING_PROMPT,
     },
   }

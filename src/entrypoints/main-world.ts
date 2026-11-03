@@ -1,10 +1,27 @@
 import { defineUnlistedScript } from '#imports'
 import { getRootVue } from '@/composables/useVue'
-import { startPendingGreetingConsumer } from '@/composables/useWebSocket/pendingGreeting'
+import { startChatFeedbackObserver } from '@/composables/useWebSocket/chatFeedback'
+import { startChatNetworkFeedbackObserver } from '@/composables/useWebSocket/chatNetworkFeedback'
+import {
+  consumePendingGreetings,
+  getSendChannelReadiness,
+  startPendingGreetingConsumer,
+} from '@/composables/useWebSocket/pendingGreeting'
+import {
+  CHAT_RUNTIME_RESPONSE,
+  isChatRuntimeRequest,
+  type ChatRuntimeState,
+} from '@/message/chatRuntimeProtocol'
+import { isPendingGreetingWake } from '@/message/pendingGreetingProtocol'
+import { useUser } from '@/stores/user'
+import { getCurrentAppVersion } from '@/utils/extensionRuntimeHealth'
 import { logger } from '@/utils/logger'
+import { startRuntimeObservation } from '@/utils/runtimeObservation'
 import { isGeekChatUrl, JOB_UI_VISIBILITY_EVENT } from '@/utils/zhipinRoute'
 
 let chatConsumerStarted = false
+let chatAccountInitialization: Promise<void> | undefined
+let chatAccountInitialized = false
 let routeHookRegistered = false
 let routeInvocation = 0
 const extensionLogoUrl = resolveExtensionLogoUrl()
@@ -94,7 +111,74 @@ function setJobUiVisible(visible: boolean) {
 function startChatConsumerOnce() {
   if (chatConsumerStarted) return
   startPendingGreetingConsumer()
+  startChatFeedbackObserver()
   chatConsumerStarted = true
+  void initializeChatAccount()
+    .then(() => consumePendingGreetings())
+    .catch(reportChatRuntimeError)
+}
+
+async function initializeChatAccount() {
+  const uid = useUser().getUserId()
+  if (chatAccountInitialized && uid != null && String(uid).length > 0) return
+  if (chatAccountInitialization == null) {
+    chatAccountInitialization = (async () => {
+      await useUser().initUser({ pollIntervalMs: 100, timeoutMs: 1500 })
+      const initializedUid = useUser().getUserId()
+      chatAccountInitialized = initializedUid != null && String(initializedUid).length > 0
+    })().finally(() => {
+      chatAccountInitialization = undefined
+    })
+  }
+  await chatAccountInitialization
+}
+
+function reportChatRuntimeError(error: unknown) {
+  logger.warn('聊天页发送器初始化或消费失败', error)
+}
+
+async function chatRuntimeState(expectedUid: string): Promise<ChatRuntimeState> {
+  if (!isCurrentChatRoute())
+    return {
+      ready: false,
+      code: 'NOT_CHAT_PAGE',
+      reason: '目标页面已离开聊天页',
+      mainVersion: getCurrentAppVersion(),
+    }
+  startChatConsumerOnce()
+  await initializeChatAccount()
+  const uid = useUser().getUserId()
+  const accountReady = uid != null && String(uid).length > 0
+  const accountMatches = accountReady && String(uid) === expectedUid
+  const channel = getSendChannelReadiness()
+  const code = !isCurrentChatRoute()
+    ? 'NOT_CHAT_PAGE'
+    : !accountReady
+      ? 'ACCOUNT_UNAVAILABLE'
+      : !accountMatches
+        ? 'ACCOUNT_MISMATCH'
+        : !channel.ready
+          ? 'CHANNEL_UNAVAILABLE'
+          : 'READY'
+  return {
+    ready: code === 'READY',
+    code,
+    mainVersion: getCurrentAppVersion(),
+    reason:
+      code === 'READY'
+        ? '聊天页发送器已就绪'
+        : code === 'NOT_CHAT_PAGE'
+          ? '目标页面已离开聊天页'
+          : !accountReady
+            ? '聊天页账号尚未初始化'
+            : !accountMatches
+              ? '聊天页账号与投递账号不一致'
+              : (channel.reason ?? '聊天页发送通道尚未就绪'),
+    accountReady,
+    accountMatches,
+    consumerStarted: chatConsumerStarted,
+    channelReady: channel.ready,
+  }
 }
 
 function isCurrentChatRoute() {
@@ -116,6 +200,60 @@ async function start() {
 }
 
 export default defineUnlistedScript(() => {
+  window.addEventListener('message', (event) => {
+    if (
+      event.source === window &&
+      event.origin === location.origin &&
+      isChatRuntimeRequest(event.data) &&
+      (event.data as { bridgeToken?: unknown }).bridgeToken === extensionInstanceId
+    ) {
+      const request = event.data
+      void chatRuntimeState(request.expectedUid)
+        .then((state) => {
+          window.postMessage(
+            {
+              ...state,
+              type: CHAT_RUNTIME_RESPONSE,
+              requestId: request.requestId,
+              bridgeToken: extensionInstanceId,
+              wakeDelivered: request.wake && state.accountMatches === true,
+            },
+            location.origin,
+          )
+          if (request.wake && state.accountMatches)
+            void consumePendingGreetings().catch(reportChatRuntimeError)
+        })
+        .catch(() => {
+          window.postMessage(
+            {
+              type: CHAT_RUNTIME_RESPONSE,
+              requestId: request.requestId,
+              bridgeToken: extensionInstanceId,
+              ready: false,
+              code: 'CHAT_INITIALIZATION_FAILED',
+              reason: '聊天页账号初始化失败',
+              mainVersion: getCurrentAppVersion(),
+            },
+            location.origin,
+          )
+        })
+      return
+    }
+    if (
+      event.source !== window ||
+      event.origin !== location.origin ||
+      !isPendingGreetingWake(event.data) ||
+      !('bridgeToken' in event.data) ||
+      event.data.bridgeToken !== extensionInstanceId ||
+      !isCurrentChatRoute()
+    )
+      return
+    void initializeChatAccount()
+      .then(() => consumePendingGreetings())
+      .catch(reportChatRuntimeError)
+  })
+  startChatNetworkFeedbackObserver()
+  startRuntimeObservation()
   start().catch((e) => {
     logger.error(e)
   })

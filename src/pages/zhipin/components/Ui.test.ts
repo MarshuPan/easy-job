@@ -2,6 +2,7 @@ import type { VueWrapper } from '@vue/test-utils'
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { assertAllowedStorageKey, LAUNCHER_POSITION_STORAGE_KEY } from '@/message/storageKeys'
 import { AGENT_MESSAGE_BRIDGE_CHANNEL } from '@/ui/message'
 import { ExtensionRuntimeHealthError } from '@/utils/extensionRuntimeHealth'
 import { JOB_UI_VISIBILITY_EVENT } from '@/utils/zhipinRoute'
@@ -20,6 +21,7 @@ const {
   initJobList,
   initPager,
   initUser,
+  launcherStorage,
   loggerError,
   loggerWarn,
   messageError,
@@ -31,6 +33,8 @@ const {
   setJobAccountScope,
   setLogAccountScope,
   setStatisticsAccountScope,
+  storageGet,
+  storageSet,
 } = vi.hoisted(() => ({
   confInit: vi.fn(async () => undefined),
   formData: {
@@ -50,6 +54,7 @@ const {
   initJobList: vi.fn(async () => undefined),
   initPager: vi.fn(async () => undefined),
   initUser: vi.fn(async () => undefined),
+  launcherStorage: new Map<string, unknown>(),
   loggerError: vi.fn(),
   loggerWarn: vi.fn(),
   messageError: vi.fn(),
@@ -61,6 +66,8 @@ const {
   setJobAccountScope: vi.fn(async () => undefined),
   setLogAccountScope: vi.fn(async () => undefined),
   setStatisticsAccountScope: vi.fn(async () => undefined),
+  storageGet: vi.fn(),
+  storageSet: vi.fn(),
 }))
 
 vi.mock('@/composables/useStatistics', () => ({
@@ -83,6 +90,7 @@ vi.mock('@/stores/conf', () => ({
 
 vi.mock('@/message', () => ({
   probeExtensionRuntimeHealth,
+  counter: { storageGet, storageSet },
 }))
 
 vi.mock('@/stores/jobs', () => ({
@@ -111,6 +119,7 @@ vi.mock('@/utils/logger', () => ({
   logger: {
     error: loggerError,
     info: vi.fn(),
+    debug: vi.fn(),
     warn: loggerWarn,
   },
 }))
@@ -209,6 +218,23 @@ function mountUi() {
   })
 }
 
+function pointer(target: Element, type: string, clientX: number, clientY: number) {
+  const event = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    button: 0,
+    clientX,
+    clientY,
+  })
+  Object.defineProperty(event, 'pointerId', { value: 1 })
+  target.dispatchEvent(event)
+}
+
+async function clickLauncher(target: Element, detail = 1) {
+  target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail }))
+  await flushPromises()
+}
+
 describe('zhipin popup UI shell', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -220,7 +246,102 @@ describe('zhipin popup UI shell', () => {
     initPager.mockResolvedValue(undefined)
     initUser.mockResolvedValue(undefined)
     probeExtensionRuntimeHealth.mockResolvedValue(undefined)
+    launcherStorage.clear()
+    storageGet.mockImplementation(async (key: string) => {
+      assertAllowedStorageKey(key)
+      return launcherStorage.get(key) ?? null
+    })
+    storageSet.mockImplementation(async (key: string, value: unknown) => {
+      assertAllowedStorageKey(key)
+      launcherStorage.set(key, structuredClone(value))
+      return true
+    })
     formData.useCache.value = false
+  })
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('drags freely without opening the workspace and restores the position after remount', async () => {
+    const wrapper = mountUi()
+    await flushPromises()
+    const launcher = wrapper.get<HTMLButtonElement>('.agent-delivery-launcher')
+    vi.spyOn(launcher.element, 'getBoundingClientRect').mockReturnValue({
+      left: 24,
+      top: 690,
+      width: 54,
+      height: 54,
+    } as DOMRect)
+
+    pointer(launcher.element, 'pointerdown', 44, 710)
+    pointer(launcher.element, 'pointermove', 344, 310)
+    pointer(launcher.element, 'pointerup', 344, 310)
+    await clickLauncher(launcher.element)
+    await flushPromises()
+
+    expect(launcher.element.style.left).toBe('324px')
+    expect(launcher.element.style.top).toBe('290px')
+    expect(wrapper.get('.agent-delivery-overlay').isVisible()).toBe(false)
+    expect(launcherStorage.get(LAUNCHER_POSITION_STORAGE_KEY)).toEqual({ x: 324, y: 290 })
+    wrapper.unmount()
+
+    const restored = mountUi()
+    await flushPromises()
+    const restoredLauncher = restored.get<HTMLButtonElement>('.agent-delivery-launcher')
+    expect(restoredLauncher.element.style.left).toBe('324px')
+    expect(restoredLauncher.element.style.top).toBe('290px')
+    await clickLauncher(restoredLauncher.element)
+    expect(restored.get('.agent-delivery-overlay').isVisible()).toBe(true)
+  })
+
+  it('keeps a moved launcher reachable after viewport shrink even while the workspace hides it', async () => {
+    launcherStorage.set(LAUNCHER_POSITION_STORAGE_KEY, { x: 800, y: 600 })
+    const wrapper = mountUi()
+    await flushPromises()
+    const launcher = wrapper.get<HTMLButtonElement>('.agent-delivery-launcher')
+    await launcher.trigger('click')
+    vi.stubGlobal('innerWidth', 400)
+    vi.stubGlobal('innerHeight', 300)
+    window.dispatchEvent(new Event('resize'))
+    await wrapper.get('.agent-delivery-workspace__close').trigger('click')
+    expect(launcher.element.style.left).toBe('346px')
+    expect(launcher.element.style.top).toBe('246px')
+
+    pointer(launcher.element, 'pointerdown', 360, 260)
+    pointer(launcher.element, 'pointermove', -100, -100)
+    pointer(launcher.element, 'pointercancel', -100, -100)
+    await clickLauncher(launcher.element, 0)
+    expect(launcher.element.style.left).toBe('0px')
+    expect(launcher.element.style.top).toBe('0px')
+    expect(launcher.classes()).not.toContain('is-dragging')
+    expect(wrapper.get('.agent-delivery-overlay').isVisible()).toBe(true)
+  })
+
+  it('keeps a new drag when stored coordinates arrive late and preserves ordinary clicks', async () => {
+    let restore: (value: { x: number; y: number }) => void = () => {}
+    storageGet.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          restore = resolve
+        }),
+    )
+    const wrapper = mountUi()
+    await flushPromises()
+    const launcher = wrapper.get<HTMLButtonElement>('.agent-delivery-launcher')
+    pointer(launcher.element, 'pointerdown', 10, 10)
+    pointer(launcher.element, 'pointermove', 210, 160)
+    pointer(launcher.element, 'pointerup', 210, 160)
+    restore({ x: 50, y: 50 })
+    await flushPromises()
+    expect(launcher.element.style.left).toBe('200px')
+    expect(launcher.element.style.top).toBe('150px')
+    await clickLauncher(launcher.element)
+    expect(wrapper.get('.agent-delivery-overlay').isVisible()).toBe(false)
+
+    pointer(launcher.element, 'pointerdown', 210, 160)
+    pointer(launcher.element, 'pointermove', 212, 161)
+    pointer(launcher.element, 'pointerup', 212, 161)
+    await clickLauncher(launcher.element)
+    expect(wrapper.get('.agent-delivery-overlay').isVisible()).toBe(true)
   })
 
   it('waits for a sleeping background instead of failing startup on the first probe', async () => {

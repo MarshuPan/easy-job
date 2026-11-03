@@ -199,6 +199,43 @@ describe('runtime settings drawer', () => {
     expect(confPersist).not.toHaveBeenCalled()
   })
 
+  // 真机上「目标总字数」改不了：删掉 150 准备重填时，空值已经被逐键保存出去，后台静默忽略、
+  // 配置刷新又把 150 写回来。数值框要等输入完成（失焦/回车）才生效。
+  it('does not save a number while it is still being typed', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(RuntimeSettingsDrawer)
+    await flushPromises()
+    persistAiTasks.mockClear()
+
+    const input = wrapper.get('[aria-label="AI 招呼语目标总字数"]')
+    ;(input.element as HTMLInputElement).value = ''
+    await input.trigger('input')
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // 用户看到的是输入框：正在输入的内容不能被改回去。
+    expect((input.element as HTMLInputElement).value).toBe('')
+    expect(conf.formData.aiGreeting.targetTotalCharacters).toBe(150)
+    expect(persistAiTasks).not.toHaveBeenCalled()
+  })
+
+  it('pulls an out-of-range AI number back into range instead of silently dropping it', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(RuntimeSettingsDrawer)
+    await flushPromises()
+    persistAiTasks.mockClear()
+
+    await wrapper.get('[aria-label="AI 招呼语目标总字数"]').setValue('30')
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(conf.formData.aiGreeting.targetTotalCharacters).toBe(45)
+    expect(persistAiTasks).toHaveBeenCalledOnce()
+
+    await wrapper.get('[aria-label="AI 招呼语目标总字数"]').setValue('')
+    await vi.advanceTimersByTimeAsync(1_000)
+    // 清空后确认：回到进入页面时的值，而不是留一个空框。
+    expect(conf.formData.aiGreeting.targetTotalCharacters).toBe(150)
+  })
+
   it('rolls back to the latest successful runtime save when a newer save fails', async () => {
     vi.useFakeTimers()
     let resolveFirst!: (saved: boolean) => void

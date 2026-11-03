@@ -1,3 +1,4 @@
+import { pruneRemovedEvidenceFields } from '@/profile/resumeEvidenceRules'
 import deepmerge, { isPlainObject, jsonClone } from '@/utils/deepmerge'
 
 import {
@@ -24,7 +25,13 @@ export function backfillStoredConfigState(stored: unknown): unknown {
   if (!isPlainObject(stored)) return stored
   const next = jsonClone(stored) as Record<string, unknown>
 
-  if (isPlainObject(next.profile)) next.profile = fill(createDefaultProfile(), next.profile)
+  if (isPlainObject(next.profile)) {
+    next.profile = fill(createDefaultProfile(), next.profile)
+    // 删字段和加字段一样会被严格校验判成损坏，简历证据里删掉的字段要先清掉。
+    pruneRemovedEvidenceFields(
+      (next.profile as { resume?: { evidence?: unknown } }).resume?.evidence,
+    )
+  }
   if (isPlainObject(next.tasks)) next.tasks = fill(createDefaultAiTasks(), next.tasks)
 
   if (isPlainObject(next.accountSettings)) {

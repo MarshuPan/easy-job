@@ -94,13 +94,18 @@ export async function verifyPublicConfigPaths() {
   const manifest = JSON.parse(await readFile(resolve(chromeOutputDir, 'manifest.json'), 'utf8'))
   assert.deepEqual(manifest.optional_host_permissions, ['http://*/*', 'https://*/*'])
   assert.equal(
-    (manifest.host_permissions ?? []).some((permission) =>
-      /api\.|localhost|127\.0\.0\.1/i.test(permission),
-    ),
+    (manifest.host_permissions ?? []).some((permission) => isUnexpectedHostPermission(permission)),
     false,
   )
 
   console.log('Universal public build and configuration isolation checks passed.')
+}
+
+/** The local diagnostic sink is the only fixed loopback capability in the contract. */
+export function isUnexpectedHostPermission(permission) {
+  return (
+    permission !== 'http://127.0.0.1:3210/*' && /api\.|localhost|127\.0\.0\.1/i.test(permission)
+  )
 }
 
 function runNodeScript(path, args = []) {

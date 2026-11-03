@@ -12,9 +12,22 @@ import {
   formatSensitiveLeakMessage,
   readExtensionArtifacts,
   readPublicSourceArtifacts,
+  isUnexpectedHostPermission,
 } from './verify-public-config-paths.mjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+
+test('only the exact local diagnostic endpoint is allowed as a fixed loopback permission', () => {
+  assert.equal(isUnexpectedHostPermission('http://127.0.0.1:3210/*'), false)
+  for (const permission of [
+    'http://127.0.0.1/*',
+    'http://127.0.0.1:3211/*',
+    'http://localhost:3210/*',
+    'https://api.example.test/*',
+  ]) {
+    assert.equal(isUnexpectedHostPermission(permission), true)
+  }
+})
 
 test('artifact scan includes every emitted text asset', async () => {
   const outputDir = await mkdtemp(join(tmpdir(), 'agent-delivery-artifacts-'))

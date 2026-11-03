@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { runConfiguredAiTask } from './backgroundAi'
+import { MAX_AI_REQUEST_BODY_BYTES, runConfiguredAiTask } from './backgroundAi'
 
 /**
  * 生产环境使用的模型配置形状。此前这里造的是页面侧旧模型对象，再经一层
@@ -470,18 +470,19 @@ describe('background AI requests', () => {
         data: {},
         json: true,
         model: createOpenaiModel(),
-        template: 'x'.repeat(1024 * 1024 + 1),
+        template: 'x'.repeat(MAX_AI_REQUEST_BODY_BYTES + 1),
         task: 'aiFiltering',
       }),
     ).rejects.toThrow('AI请求体过大')
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it('rejects non-JSON provider responses without retrying', async () => {
+  it('keeps a non-JSON provider response in the local diagnostic event', async () => {
     const fetchMock = vi.mocked(fetch)
     fetchMock.mockResolvedValue(
       createResponse(200, '<html>unexpected</html>', 'OK', { 'Content-Type': 'text/html' }),
     )
+    const diagnostics: any[] = []
 
     await expect(
       runConfiguredAiTask({
@@ -490,16 +491,46 @@ describe('background AI requests', () => {
         model: createOpenaiModel(),
         template: '判断 {{ jobName }}',
         task: 'aiFiltering',
+        onDiagnostic: (event) => {
+          diagnostics.push(event)
+        },
       }),
     ).rejects.toThrow('AI响应 Content-Type 必须是 application/json')
     expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(diagnostics.at(-1)).toMatchObject({
+      phase: 'failed',
+      providerResponse: '<html>unexpected</html>',
+    })
+  })
+
+  it('keeps malformed JSON response text in the local diagnostic event', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockResolvedValue(createResponse(200, '{"choices":', 'OK'))
+    const diagnostics: any[] = []
+
+    await expect(
+      runConfiguredAiTask({
+        data: { jobName: 'AI产品经理' },
+        json: true,
+        model: createOpenaiModel(),
+        template: '判断 {{ jobName }}',
+        task: 'aiFiltering',
+        onDiagnostic: (event) => {
+          diagnostics.push(event)
+        },
+      }),
+    ).rejects.toThrow('AI响应不是合法 JSON')
+    expect(diagnostics.at(-1)).toMatchObject({
+      phase: 'failed',
+      providerResponse: '{"choices":',
+    })
   })
 
   it('stops reading an oversized successful provider response stream', async () => {
     const fetchMock = vi.mocked(fetch)
     const chunks = [
       '{"choices":[{"message":{"content":"',
-      ...Array.from({ length: 40 }, () => 'x'.repeat(64 * 1024)),
+      ...Array.from({ length: 270 }, () => 'x'.repeat(64 * 1024)),
       '"}}]}',
     ]
     const { response, streamState } = createChunkedJsonResponse(200, chunks, 'OK')
@@ -525,7 +556,7 @@ describe('background AI requests', () => {
     const providerSecret = 'provider-echoed-super-secret'
     const chunks = [
       `{"error":{"message":"${providerSecret}`,
-      ...Array.from({ length: 40 }, () => 'x'.repeat(64 * 1024)),
+      ...Array.from({ length: 270 }, () => 'x'.repeat(64 * 1024)),
       '"}}',
     ]
     const { response, streamState } = createChunkedJsonResponse(400, chunks, 'Bad Request')

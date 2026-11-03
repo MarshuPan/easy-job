@@ -1,3 +1,4 @@
+import { GreetingChannelUnavailableError } from './greetingChannelError'
 import type { TechwolfChatProtocol } from './type'
 import { AwesomeMessage } from './type'
 
@@ -59,6 +60,8 @@ export class Message {
       geekClient.send(this)
       return 'GeekChatCore'
     } else if (window.ChatWebsocket?.send != null) {
+      if (window.ChatWebsocket.client?.isConnected?.() === false)
+        throw new GreetingChannelUnavailableError('ChatWebsocket 尚未连接')
       window.ChatWebsocket.send(this)
       return 'ChatWebsocket'
     }
@@ -83,7 +86,7 @@ export class Message {
     //   })
     // }
     else {
-      throw new Error('无可用发送渠道，可暂时关闭招呼语功能后重试')
+      throw new GreetingChannelUnavailableError('无可用发送渠道，可暂时关闭招呼语功能后重试')
     }
   }
 }

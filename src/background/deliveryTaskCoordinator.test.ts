@@ -374,6 +374,25 @@ describe('DeliveryTaskCoordinator', () => {
     expect(await coordinator.isActive('account-a', 3_000)).toBe(false)
   })
 
+  it('keeps the complete terminal diagnostic message for local analysis', async () => {
+    const storage = memoryStorage()
+    const coordinator = new DeliveryTaskCoordinator(storage.adapter)
+    await coordinator.start(startRequest(), 1_000)
+    const message = '终止原因：' + '详细上下文 '.repeat(200)
+    const result = await coordinator.terminate(
+      {
+        uid: 'account-a',
+        runId: 'run-a',
+        workerId: 'worker-a',
+        reason: 'terminal-error',
+        message,
+      },
+      2_000,
+    )
+    expect(result.task?.terminalMessage).toHaveLength(message.length)
+    expect(result.task?.terminalMessage).toBe(message)
+  })
+
   it('serializes concurrent mutations without losing the latest checkpoint', async () => {
     const storage = memoryStorage()
     const coordinator = new DeliveryTaskCoordinator(storage.adapter)
@@ -457,6 +476,38 @@ describe('pausing a delivery run', () => {
     expect(resumed.task?.checkpoint).toMatchObject({ id: 'run-a' })
 
     expect(await coordinator.resume(worker)).toMatchObject({ accepted: false })
+  })
+
+  it('resets recovery on manual resume in the authoritative checkpoint and preserves queued work', async () => {
+    const storage = memoryStorage()
+    const coordinator = new DeliveryTaskCoordinator(storage.adapter)
+    const saved = checkpoint('run-a', {
+      retryAt: Date.now() + 300_000,
+      aiUnavailableAttempts: 3,
+      detailRecoveryAttempts: 3,
+      interruption: { reason: 'ai-unavailable', message: 'HTTP 502' },
+      activeBatch: { id: 'batch-a', items: [{ source: 'group', encryptJobId: 'job-a' }] },
+      groupExpectationCursorId: 'expect-a',
+    })
+    await coordinator.start({ ...startRequest(), checkpoint: saved })
+    await coordinator.pause(worker)
+    const resumed = await coordinator.resume(worker)
+    const stored = (await coordinator.read(worker.uid))!
+    expect(stored.checkpoint).toEqual(resumed.task?.checkpoint)
+    expect(stored.configSnapshot).toEqual(startRequest().configSnapshot)
+    expect(stored.checkpoint).toMatchObject({
+      id: 'run-a',
+      activeBatch: { id: 'batch-a', items: [{ source: 'group', encryptJobId: 'job-a' }] },
+      groupExpectationCursorId: 'expect-a',
+    })
+    for (const field of [
+      'retryAt',
+      'aiUnavailableAttempts',
+      'detailRecoveryAttempts',
+      'interruption',
+    ]) {
+      expect(stored.checkpoint).not.toHaveProperty(field)
+    }
   })
 
   it('still lets 结束 terminate a paused run', async () => {

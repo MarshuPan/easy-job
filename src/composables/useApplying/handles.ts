@@ -1,6 +1,7 @@
 import { useCommon } from '@/composables/useCommon'
 import { useStatistics } from '@/composables/useStatistics'
 import { Message } from '@/composables/useWebSocket'
+import { GreetingChannelUnavailableError } from '@/composables/useWebSocket/greetingChannelError'
 import {
   claimPendingGreetingForFallback,
   enqueuePendingGreeting,
@@ -11,10 +12,15 @@ import {
 import { COMMUTE_FEATURE_AVAILABLE, DEFAULT_AI_FILTERING_SCORE } from '@/config/defaults'
 import { counter, runBackgroundAiTask } from '@/message'
 import { useConf } from '@/stores/conf'
+import { reportDeliveryStage } from '@/stores/deliveryActivity'
 import { addLogTrace, useLog } from '@/stores/log'
 import type { logData } from '@/stores/log'
 import { useUser } from '@/stores/user'
-import type { GreetingFilteringContext, RecentGreetingSummary } from '@/types/aiGreeting'
+import type {
+  GreetingFilteringContext,
+  GreetingReview,
+  RecentGreetingSummary,
+} from '@/types/aiGreeting'
 import type { messageReps } from '@/types/aiProtocol'
 import {
   ActivityError,
@@ -25,6 +31,7 @@ import {
   FriendStatusError,
   GoldHunterError,
   GreetError,
+  GreetingGenerationError,
   JobAddressError,
   JobDataIncompleteError,
   JobDescriptionError,
@@ -37,7 +44,16 @@ import { acquireBossAction } from '@/utils/actionGateStore'
 import { parseGreetingDraft } from '@/utils/aiGreetingDraft'
 import { amapDistance, resolveAmapLocation } from '@/utils/amap'
 import { getAiTaskDiagnostics, type AiTaskDiagnostics } from '@/utils/backgroundAiDiagnostics'
+import {
+  appendGreetingFailed,
+  appendGreetingGenerated,
+  appendGreetingSent,
+  conversationKeyFromBossId,
+  conversationKeysFromBossIds,
+  createGreetingId,
+} from '@/utils/greetingFeedback'
 import { fingerprintGreeting } from '@/utils/greetingHistory'
+import { STYLE_ISSUE_LABELS } from '@/utils/greetingQuality'
 import { greetingSegmentDelayMs } from '@/utils/humanPace'
 import { shouldRejectJobContent } from '@/utils/jobContentFilter'
 import { logger } from '@/utils/logger'
@@ -52,6 +68,14 @@ import {
   normalizeSameCompanyStore,
   recordSameCompanyDelivery,
 } from './sameCompanyPolicy'
+import {
+  getNaturalWeekKey,
+  hasSameHr,
+  normalizeSameHrStore,
+  recordSameHr,
+  resetSameHrHistoryOnce,
+  sameHrStorageMutex,
+} from './sameHrPolicy'
 import type { Handler, StepFactory } from './type'
 import {
   errorHandle,
@@ -72,6 +96,19 @@ class AiGreetingDisabledError extends Error {
     super('AI招呼语已关闭，已取消待发送文本')
     this.name = 'AiGreetingDisabledError'
   }
+}
+
+/** 招呼语复核结果的日志附注：重写过几次、还剩哪些风格问题（照发，计入体检）。 */
+function greetingReviewNote(review: GreetingReview | undefined) {
+  if (!review) return ''
+  const notes: string[] = []
+  if (review.attempts > 1) notes.push(`重写 ${review.attempts - 1} 次`)
+  if (review.styleIssues.length > 0) {
+    notes.push(
+      `仍有：${review.styleIssues.map((code) => STYLE_ISSUE_LABELS[code] ?? code).join('、')}`,
+    )
+  }
+  return notes.length > 0 ? `（${notes.join('；')}）` : ''
 }
 
 export function getPendingGreetingWaitTimeoutMs(configuredSeconds: number, total: number) {
@@ -98,6 +135,39 @@ export function handles(runtimeFormData?: FormData) {
   let commuteOriginCache:
     | { key: string; promise: ReturnType<typeof resolveAmapLocation> }
     | undefined
+
+  function ensureGreetingId(ctx: logData) {
+    ctx.greetingId ??= createGreetingId()
+  }
+
+  function beginGreetingSendAttempt(ctx: logData) {
+    ensureGreetingId(ctx)
+    ctx.greetingAttempt = (ctx.greetingAttempt ?? 0) + 1
+  }
+
+  function greetingFeedbackContext(ctx: logData) {
+    if (!ctx.greetingId) return null
+    const boss = ctx.bossData?.data
+    const conversationKeys = conversationKeysFromBossIds(boss?.bossId, boss?.encryptBossId)
+    return {
+      greetingId: ctx.greetingId,
+      attempt: ctx.greetingAttempt ?? 1,
+      conversationKey: conversationKeyFromBossId(boss?.bossId ?? boss?.encryptBossId),
+      conversationKeys,
+      jobId: ctx.listData.encryptJobId,
+      jobName: ctx.listData.jobName,
+      brandName: ctx.listData.brandName,
+      bossUid: boss?.bossId != null ? String(boss.bossId) : undefined,
+      resumeEvidenceVersion: ctx.aiGreetingMeta?.resumeEvidenceVersion,
+      resumeSourceHash: ctx.aiGreetingMeta?.resumeSourceHash,
+      promptFingerprint:
+        ctx.aiGreetingMeta?.promptFingerprint ??
+        (typeof conf.formData.aiGreeting.prompt === 'string' &&
+        conf.formData.aiGreeting.prompt.trim()
+          ? fingerprintGreeting([conf.formData.aiGreeting.prompt])
+          : undefined),
+    }
+  }
 
   const isAiGreetingRuntimeEnabled = () =>
     conf.formData.aiGreeting.enable && liveConf.formData.aiGreeting.enable
@@ -170,6 +240,17 @@ export function handles(runtimeFormData?: FormData) {
         drivingDuration: (ctx.amap?.distance?.driving.duration ?? 0) / 60,
         walkingDistance: (ctx.amap?.distance?.walking.distance ?? 0) / 1000,
         walkingDuration: (ctx.amap?.distance?.walking.duration ?? 0) / 60,
+      },
+      diagnosticContext: {
+        jobId: ctx.listData.encryptJobId,
+        encryptBossId: ctx.listData.encryptBossId,
+        securityId: ctx.listData.securityId,
+        lid: ctx.listData.lid,
+        encryptBrandId: ctx.listData.encryptBrandId,
+        jobName: ctx.listData.jobName,
+        brandName: ctx.listData.brandName,
+        greetingId: ctx.greetingId,
+        ...(ctx.greetingAttempt == null ? {} : { greetingAttempt: ctx.greetingAttempt }),
       },
       ...contextExtras,
       // 阈值只在需要筛选上下文的招呼语任务里带上。匹配任务不能看到它——看到了模型就会
@@ -289,38 +370,55 @@ export function handles(runtimeFormData?: FormData) {
     if (!conf.formData.sameHrFilter.value) {
       return
     }
-    let someSet: Set<string> | null = null
+    let sameHrStore: ReturnType<typeof normalizeSameHrStore>['store'] | null = null
     let uid: string | number | null = null
+    let storeWeek = ''
+    let resetPromise: Promise<void> | null = null
     return {
       fn: async ({ data }) => {
+        if (resetPromise == null) {
+          resetPromise = sameHrStorageMutex(async () => {
+            await resetSameHrHistoryOnce(counter)
+          })
+        }
+        await resetPromise
         uid ??= useUser().getUserId()
         if (uid == null) {
           throw new RetryablePipelineError('没有获取到uid，无法执行同HR去重')
         }
-        if (someSet == null) {
-          someSet = new Set<string>()
-          const data = await counter.storageGet<Record<string, string[]>>(sameHrKey, {})
-          for (const id of data[uid] ?? []) {
-            someSet.add(id)
-          }
+        const now = Date.now()
+        const week = getNaturalWeekKey(now)
+        if (sameHrStore == null || storeWeek !== week) {
+          const normalized = normalizeSameHrStore(
+            await counter.storageGet<unknown>(sameHrKey, {}),
+            now,
+          )
+          sameHrStore = normalized.store
+          storeWeek = week
+          if (normalized.migrated) await counter.storageSet(sameHrKey, sameHrStore)
         }
         const id = data.encryptBossId
-        if (id != null && someSet.has(id)) {
+        if (id != null && hasSameHr(sameHrStore, String(uid), id, now)) {
           statistics.todayData.repeat++
-          throw new RepeatError('相同hr已投递')
+          throw new RepeatError('本周已投递给相同招聘者')
         }
       },
-      after: async ({ data }) => {
+      afterPublish: async ({ data }) => {
         uid ??= useUser().getUserId()
         if (uid == null) {
           throw new RetryablePipelineError('没有获取到uid，无法记录同HR去重')
         }
         if (data.encryptBossId == null) return
-        someSet?.add(data.encryptBossId)
-        const oldData = await counter.storageGet<Record<string, string[]>>(sameHrKey, {})
-        await counter.storageSet(sameHrKey, {
-          ...oldData,
-          [uid]: Array.from(someSet ?? []),
+        const now = Date.now()
+        await sameHrStorageMutex(async () => {
+          const normalized = normalizeSameHrStore(
+            await counter.storageGet<unknown>(sameHrKey, {}),
+            now,
+          )
+          const next = recordSameHr(normalized.store, String(uid), data.encryptBossId!, now)
+          await counter.storageSet(sameHrKey, next)
+          sameHrStore = next
+          storeWeek = getNaturalWeekKey(now)
         })
       },
     }
@@ -647,13 +745,6 @@ export function handles(runtimeFormData?: FormData) {
       content,
     }
     assertDeliveryNotStopped()
-    addLogTrace(ctx, '招呼语发送', 'info', `准备发送${label}招呼语`, {
-      index,
-      total,
-      type,
-      contentLength: content.length,
-      ...getGreetingChannelProbe(),
-    })
     assertCurrentGreetingUid(uid)
     try {
       const buf = new Message(messageArgs)
@@ -664,29 +755,25 @@ export function handles(runtimeFormData?: FormData) {
         channel,
         contentLength: content.length,
       }
-      addLogTrace(ctx, '招呼语发送', 'success', `${label}招呼语已通过 ${channel} 发送`, {
-        index,
-        total,
-        channel,
-        contentLength: content.length,
-        content,
-      })
+      addLogTrace(ctx, '招呼语发送', 'success', `${label}招呼语已通过 ${channel} 发送`)
       return channel
     } catch (e) {
+      if (!(e instanceof GreetingChannelUnavailableError)) {
+        throwGreetingResultUnknown(ctx, 'direct-channel', label, undefined)
+      }
       // 岗位列表页本来就没有聊天 WebSocket，转交聊天页是预期内的常规路径，不是故障。
       // 原先把底层的「无可用发送渠道，可暂时关闭招呼语功能后重试」原样拼进来，
       // 会让每条招呼语都报出一句看似需要用户处理的告警，而它其实随后就发送成功了。
       const detail = getGreetingChannelProbe()
-      const expectedFallback = detail.chatWebsocket === 'undefined'
-      addLogTrace(
-        ctx,
-        '招呼语发送',
-        'info',
-        expectedFallback
-          ? `${label}招呼语转交聊天页发送（当前页面没有聊天通道）`
-          : `${label}招呼语当前页面 WebSocket 通道不可用，转交聊天页发送：${errorHandle(e)}`,
-        detail,
-      )
+      if (detail.chatWebsocket !== 'undefined') {
+        addLogTrace(
+          ctx,
+          '招呼语发送',
+          'info',
+          `${label}招呼语当前页面 WebSocket 通道不可用，转交聊天页发送：${errorHandle(e)}`,
+          detail,
+        )
+      }
     }
 
     const pending = await enqueuePendingGreeting({
@@ -699,17 +786,10 @@ export function handles(runtimeFormData?: FormData) {
       brandName: ctx.listData.brandName,
     })
     assertCurrentGreetingUid(uid)
-    addLogTrace(ctx, '招呼语发送', 'info', `${label}招呼语已入队，等待聊天页 WebSocket 发送`, {
-      pendingId: pending.id,
-      index,
-      total,
-      contentLength: content.length,
-      ...getGreetingChannelProbe(),
-    })
 
     if (chatPageState?.prepared !== true) {
       try {
-        await openChatPageForGreeting(ctx, pending.id, index, total)
+        await openChatPageForGreeting(ctx, pending.id, uid, index, total)
         assertCurrentGreetingUid(uid)
         if (chatPageState) {
           chatPageState.prepared = true
@@ -723,10 +803,11 @@ export function handles(runtimeFormData?: FormData) {
           error: errorHandle(e),
         })
         await cancelPendingGreeting(ctx, pending.id, uid, label)
+        if (common.deliverStop) throw new DeliveryStoppedError('用户已停止投递，待发送招呼语已取消')
         throw new GreetError(`打开聊天页失败：${errorHandle(e)}`)
       }
     }
-    const queuedResult = await waitForQueuedGreeting(ctx, pending.id, uid, total ?? 1, label)
+    const queuedResult = await waitForQueuedGreeting(pending.id, uid, total ?? 1)
     assertCurrentGreetingUid(uid)
     if (queuedResult.cancelled) {
       await removePendingGreeting(pending.id, uid)
@@ -741,11 +822,7 @@ export function handles(runtimeFormData?: FormData) {
         detail: { pendingId: pending.id, queued: true },
       }
       addLogTrace(ctx, '招呼语发送', 'success', `${label}招呼语已通过 ChatWebsocket 发送`, {
-        pendingId: pending.id,
-        index,
-        total,
-        contentLength: content.length,
-        content,
+        waitedMs: queuedResult.waitedMs,
       })
       return 'ChatWebsocket'
     }
@@ -864,13 +941,7 @@ export function handles(runtimeFormData?: FormData) {
       contentLength: content.length,
       detail: domResult.detail,
     }
-    addLogTrace(ctx, '招呼语发送', 'success', `${label}招呼语已通过 DOM 发送`, {
-      index,
-      total,
-      contentLength: content.length,
-      content,
-      detail: domResult.detail,
-    })
+    addLogTrace(ctx, '招呼语发送', 'success', `${label}招呼语已通过 DOM 发送`, domResult.detail)
     return domResult.channel
   }
 
@@ -881,6 +952,20 @@ export function handles(runtimeFormData?: FormData) {
     type: 'ai' | 'custom'
   }) {
     const { ctx, uid, messages, type } = args
+    beginGreetingSendAttempt(ctx)
+    const feedback = greetingFeedbackContext(ctx)
+    if (feedback) {
+      void appendGreetingGenerated(uid, feedback, {
+        type,
+        messages,
+        usedFactIds: ctx.aiGreetingMeta?.usedFactIds,
+        segmentFactIds: ctx.aiGreetingMeta?.segmentFactIds,
+        anchor: ctx.aiGreetingMeta?.anchor,
+        review: ctx.aiGreetingMeta?.review,
+        audit: ctx.aiGreetingMeta?.audit,
+        fingerprint: ctx.aiGreetingMeta?.fingerprint,
+      })
+    }
     const sendRecords: GreetingSendRecord[] = []
     const totalLength = messages.reduce((acc, item) => acc + item.length, 0)
 
@@ -907,12 +992,7 @@ export function handles(runtimeFormData?: FormData) {
         // 而不是直接抛出循环——用户需要看得到第几段没发出去。
         if (index > 0) {
           const waitMs = getGreetingSegmentDelayMs(content)
-          addLogTrace(ctx, '招呼语发送', 'info', `分段间隔等待 ${Math.round(waitMs / 1000)} 秒`, {
-            index: index + 1,
-            total: messages.length,
-            waitMs,
-            contentLength: content.length,
-          })
+          addLogTrace(ctx, '招呼语发送', 'info', `分段间隔等待 ${Math.round(waitMs / 1000)} 秒`)
           await delayWithDeliveryStop(waitMs)
         }
         assertDeliveryNotStopped()
@@ -945,6 +1025,16 @@ export function handles(runtimeFormData?: FormData) {
           content,
           contentLength: content.length,
         })
+        if (feedback) {
+          void appendGreetingSent(uid, feedback, {
+            type,
+            index: index + 1,
+            total: messages.length,
+            text: content,
+            channel,
+            factIds: ctx.aiGreetingMeta?.segmentFactIds?.[index],
+          })
+        }
       } catch (e) {
         if (e instanceof AiGreetingDisabledError) {
           markAiGreetingDisabled(ctx, sendRecords)
@@ -965,6 +1055,16 @@ export function handles(runtimeFormData?: FormData) {
           contentLength: totalLength,
           messageCount: messages.length,
           messages: sendRecords,
+        }
+        if (feedback) {
+          void appendGreetingFailed(uid, feedback, {
+            type,
+            index: index + 1,
+            total: messages.length,
+            text: content,
+            stage: 'send',
+            error: errorHandle(e),
+          })
         }
         throw e
       }
@@ -1037,7 +1137,9 @@ export function handles(runtimeFormData?: FormData) {
   }
 
   async function generateAiGreetingMessages(ctx: logData) {
+    ensureGreetingId(ctx)
     ctx.deliveryStage = '打招呼语生成中'
+    reportDeliveryStage('打招呼语生成中')
     addLogTrace(ctx, 'AI招呼语', 'info', `开始生成AI招呼语，超时 ${conf.aiTaskTimeoutSeconds} 秒`)
     try {
       const logStore = useLog()
@@ -1061,9 +1163,23 @@ export function handles(runtimeFormData?: FormData) {
       ctx.aiGreetingA = content
       ctx.aiGreetingMessages = greetingMessages
       ctx.aiGreetingMeta = {
+        ...(draft.promptFingerprint ? { promptFingerprint: draft.promptFingerprint } : {}),
         usedFactIds: [...draft.usedFactIds],
-        claimMode: draft.claimMode,
-        openingPattern: draft.openingPattern,
+        segmentFactIds: draft.segmentFactIds.map((ids) => [...ids]),
+        ...(draft.resumeEvidenceVersion == null
+          ? {}
+          : { resumeEvidenceVersion: draft.resumeEvidenceVersion }),
+        ...(draft.resumeSourceHash ? { resumeSourceHash: draft.resumeSourceHash } : {}),
+        anchor: { ...draft.anchor },
+        ...(draft.review ? { review: { ...draft.review } } : {}),
+        ...(draft.audit
+          ? {
+              audit: {
+                ...draft.audit,
+                matchThreshold: draft.audit.matchThreshold ?? ctx.aiFilteringThreshold ?? undefined,
+              },
+            }
+          : {}),
         fingerprint: fingerprintGreeting(greetingMessages),
       }
       ctx.aiGreetingR = reasoning_content
@@ -1072,25 +1188,19 @@ export function handles(runtimeFormData?: FormData) {
         ctx,
         'AI招呼语',
         'success',
-        `AI招呼语已生成 ${greetingMessages.length} 条，合计 ${totalLength} 字`,
-        {
-          messages: greetingMessages,
-          totalLength,
-          rawLength: content.length,
-        },
+        `AI招呼语已生成 ${greetingMessages.length} 条，合计 ${totalLength} 字${greetingReviewNote(draft.review)}`,
       )
-      addLogTrace(ctx, '话术样本', 'info', 'AI招呼语样本已记录，可用于后续复盘', {
-        jobName: ctx.listData.jobName,
-        brandName: ctx.listData.brandName,
-        bossName: ctx.bossData?.data.name ?? ctx.listData.card?.bossName ?? ctx.listData.bossName,
-        matchPercent: ctx.matchPercent,
-        aiFilteringSummary: ctx.aiFilteringAtext,
-        messages: greetingMessages,
-        totalLength,
-      })
       return greetingMessages
     } catch (e) {
       const message = errorHandle(e)
+      const feedback = greetingFeedbackContext(ctx)
+      if (feedback) {
+        void appendGreetingFailed(useUser().getUserId(), feedback, {
+          type: 'ai',
+          stage: 'generation',
+          error: message,
+        })
+      }
       addAiTaskDiagnosticsLog(ctx, 'AI招呼语', 'danger', getAiTaskDiagnostics(e))
       addLogTrace(ctx, 'AI招呼语', 'danger', `AI招呼语生成失败：${message}`)
       if (e instanceof GreetError) {
@@ -1102,57 +1212,53 @@ export function handles(runtimeFormData?: FormData) {
     }
   }
 
+  /**
+   * 等聊天页把队列里的这一段发出去。
+   *
+   * 中间状态不再逐条记进岗位记录：成功时记一句用了多久，没等到时由调用方把最后的队列状态
+   * 连同失败原因一起记下，那才是排查需要的信息。
+   */
   async function waitForQueuedGreeting(
-    ctx: logData,
     pendingId: string,
     expectedUid: string | number,
     total = 1,
-    label = '单条',
   ): Promise<{
     ok: boolean
     cancelled?: boolean
     stopped?: boolean
+    waitedMs: number
     pending?: Awaited<ReturnType<typeof getPendingGreeting>>
   }> {
-    const configuredMs = conf.formData.delay.messageSending * 1000
-    const minimumMs = Math.max(90000, total * 35000)
     const timeoutMs = getPendingGreetingWaitTimeoutMs(conf.formData.delay.messageSending, total)
     const startedAt = Date.now()
-    const deadline = Date.now() + timeoutMs
+    const deadline = startedAt + timeoutMs
+    const waited = () => Date.now() - startedAt
     let pending: Awaited<ReturnType<typeof getPendingGreeting>>
-    let lastStatusKey: string | null = ''
-    addLogTrace(ctx, '招呼语发送', 'info', `${label}招呼语等待聊天页确认发送`, {
-      pendingId,
-      timeoutMs,
-      configuredMs,
-      minimumMs,
-    })
     while (Date.now() < deadline) {
-      if (common.deliverStop) return { ok: false, stopped: true, pending }
+      if (common.deliverStop) return { ok: false, stopped: true, pending, waitedMs: waited() }
       assertCurrentGreetingUid(expectedUid)
       pending = await getPendingGreeting(pendingId, expectedUid)
       assertCurrentGreetingUid(expectedUid)
-      if (pending == null) return { ok: true }
-      if (pending.status?.stage === 'cancelled') {
-        return { ok: false, cancelled: true, pending }
+      if (pending == null) return { ok: true, waitedMs: waited() }
+      if (pending.status?.stage === 'failed') return { ok: false, pending, waitedMs: waited() }
+      // Only cut short waits that have never reached a usable connection.
+      if (
+        waited() >= 15_000 &&
+        (pending.status?.stage === 'queued' ||
+          (pending.status?.stage === 'waiting' && pending.status.waitingFor === 'connection'))
+      ) {
+        return { ok: false, pending, waitedMs: waited() }
       }
-      if (isPendingGreetingResultUnknown(pending)) return { ok: false, pending }
-      // 只按阶段去重：reason 里带毫秒倒计时（「剩余 3502ms」），整段比较会让
-      // 每一次轮询都被判为新状态，于是每秒写一条 trace——单个岗位能刷出 40 多条，
-      // 既淹没日志也白白吃掉存储配额。阶段变化才是诊断需要的信息。
-      const statusKey = pending.status?.stage ?? null
-      if (statusKey !== lastStatusKey) {
-        lastStatusKey = statusKey
-        addLogTrace(ctx, '招呼语发送', 'info', `${label}招呼语仍在等待发送确认`, {
-          pendingId,
-          waitedMs: Date.now() - startedAt,
-          pendingStatus: pending.status,
-        })
+      if (pending.status?.stage === 'cancelled') {
+        return { ok: false, cancelled: true, pending, waitedMs: waited() }
+      }
+      if (isPendingGreetingResultUnknown(pending)) {
+        return { ok: false, pending, waitedMs: waited() }
       }
       await sleep(500)
       assertCurrentGreetingUid(expectedUid)
     }
-    return { ok: false, pending }
+    return { ok: false, pending, waitedMs: waited() }
   }
 
   function buildQueuedGreetingError(pending?: Awaited<ReturnType<typeof getPendingGreeting>>) {
@@ -1165,6 +1271,7 @@ export function handles(runtimeFormData?: FormData) {
   async function openChatPageForGreeting(
     ctx: logData,
     pendingId: string,
+    expectedUid: string | number,
     index?: number,
     total?: number,
   ) {
@@ -1182,15 +1289,16 @@ export function handles(runtimeFormData?: FormData) {
       return
     }
 
-    const tab = await counter.openChatTab(targetUrl)
-    addLogTrace(ctx, '招呼语发送', 'info', '已打开BOSS聊天页，等待聊天页WebSocket消费招呼语队列', {
-      pendingId,
-      index,
-      total,
-      targetUrl,
-      tab,
-      ...getGreetingChannelProbe(),
-    })
+    const tab = await counter.openChatTab(targetUrl, String(expectedUid))
+    const detail = { ...tab, pendingId, index, total }
+    addLogTrace(
+      ctx,
+      '招呼语发送',
+      tab.ready ? 'info' : 'warning',
+      tab.ready ? '聊天页已确认账号和发送器就绪' : `聊天页发送器未就绪：${tab.reason}`,
+      detail,
+    )
+    if (!tab.ready) throw new GreetError(`聊天页发送器未就绪（${tab.code}）：${tab.reason}`)
   }
 
   function getGreetingChannelProbe() {
@@ -1359,8 +1467,37 @@ export function handles(runtimeFormData?: FormData) {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  /**
+   * 招呼语生成失败怎么归类。
+   *
+   * 模型服务本身不可用（超时、限流、鉴权、HTTP）换个岗位结果一样，停整轮；
+   * 这一次的输出不合格只影响这一个岗位，记为可重试的岗位失败，继续后面的岗位。
+   */
+  function toGreetingGenerationError(e: unknown) {
+    const cause = e instanceof GreetError && e.cause != null ? e.cause : e
+    if (!isRecoverableAiTaskFailure(cause)) {
+      return new AIProviderError(errorHandle(cause))
+    }
+    return new GreetingGenerationError(errorHandle(e), {
+      cause: e instanceof Error ? e : undefined,
+    })
+  }
+
   const aiGreeting: StepFactory = () => {
     return {
+      // 契约 §6：先生成招呼语，再建立沟通。生成失败时沟通还没建立、额度还没花，
+      // 不会留下「已建立沟通但没有招呼语」的记录。
+      fn: async (_, ctx) => {
+        ctx.aiGreetingMessages = undefined
+        ctx.aiGreetingMeta = undefined
+        ctx.message = undefined
+        if (!isAiGreetingRuntimeEnabled()) return
+        try {
+          await generateAiGreetingMessages(ctx)
+        } catch (e) {
+          throw toGreetingGenerationError(e)
+        }
+      },
       after: async (args, ctx) => {
         try {
           if (!isAiGreetingRuntimeEnabled()) {
@@ -1376,9 +1513,11 @@ export function handles(runtimeFormData?: FormData) {
             markAiGreetingDisabled(ctx)
             return
           }
-          const greetingMessages = await generateAiGreetingMessages(ctx)
-          // chatInput.end(content)
+          const greetingMessages = ctx.aiGreetingMessages?.length
+            ? ctx.aiGreetingMessages
+            : await generateAiGreetingMessages(ctx)
           ctx.deliveryStage = '正在打招呼'
+          reportDeliveryStage('正在打招呼')
           const result = await sendGreetingMessages({
             ctx,
             uid,
@@ -1391,10 +1530,8 @@ export function handles(runtimeFormData?: FormData) {
             '招呼语发送',
             'success',
             `AI招呼语${greetingMessages.length}条已全部发送`,
-            result.records,
           )
         } catch (e) {
-          // chatInput.end('Err~')
           markGreetingWarning(ctx, e)
           throw e
         }
@@ -1474,6 +1611,20 @@ export function handles(runtimeFormData?: FormData) {
     }
 
     const type = existingType
+    beginGreetingSendAttempt(ctx)
+    const feedback = greetingFeedbackContext(ctx)
+    if (feedback) {
+      void appendGreetingGenerated(uid, feedback, {
+        type,
+        messages: existingMessages,
+        usedFactIds: ctx.aiGreetingMeta?.usedFactIds,
+        segmentFactIds: ctx.aiGreetingMeta?.segmentFactIds,
+        anchor: ctx.aiGreetingMeta?.anchor,
+        review: ctx.aiGreetingMeta?.review,
+        audit: ctx.aiGreetingMeta?.audit,
+        fingerprint: ctx.aiGreetingMeta?.fingerprint,
+      })
+    }
     const mergedRecords = [...(ctx.greetingSend?.messages ?? [])]
     const totalLength = existingMessages.reduce((acc, item) => acc + item.length, 0)
 
@@ -1504,6 +1655,16 @@ export function handles(runtimeFormData?: FormData) {
           content: item.content,
           contentLength: item.content.length,
         })
+        if (feedback) {
+          void appendGreetingSent(uid, feedback, {
+            type,
+            index: item.index,
+            total: existingMessages.length,
+            text: item.content,
+            channel,
+            factIds: ctx.aiGreetingMeta?.segmentFactIds?.[item.index - 1],
+          })
+        }
       } catch (e) {
         mergedRecords.push({
           index: item.index,
@@ -1520,6 +1681,16 @@ export function handles(runtimeFormData?: FormData) {
           contentLength: totalLength,
           messageCount: existingMessages.length,
           messages: mergedRecords,
+        }
+        if (feedback) {
+          void appendGreetingFailed(uid, feedback, {
+            type,
+            index: item.index,
+            total: existingMessages.length,
+            text: item.content,
+            stage: 'send',
+            error: errorHandle(e),
+          })
         }
         throw e
       }

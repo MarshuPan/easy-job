@@ -1,3 +1,4 @@
+import { quoteAppearsInResume } from '@/profile/resumeEvidenceRules'
 import type { ResumeEvidence } from '@/types/aiGreeting'
 import { isPlainObject } from '@/utils/deepmerge'
 
@@ -20,9 +21,7 @@ const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/
 const sourceHashPattern = /^sha256:[a-f0-9]{64}$/
 const protocols = new Set(['openai-chat-completions', 'openai-responses', 'anthropic-messages'])
 const backgroundModes = new Set(['auto', 'on', 'off'])
-const ownershipValues = new Set(['led', 'owned', 'contributed', 'used', 'learned'])
 const evidenceTypes = new Set(['direct_fact', 'self_claim', 'derived_capability', 'adjacent_only'])
-const confidenceValues = new Set(['high', 'medium', 'low'])
 
 type RecordValue = Record<string, unknown>
 
@@ -174,7 +173,7 @@ function validateResumeEvidence(
   issues: ConfigValidationIssue[],
 ) {
   const evidence = asRecord(value, path, issues)
-  exactKeys(evidence, path, ['facts', 'buckets', 'claimPolicy'], ['name', 'target'], issues)
+  exactKeys(evidence, path, ['facts', 'claimPolicy'], ['name', 'target'], issues)
   if ('name' in evidence) {
     expectString(evidence.name, childPath(path, 'name'), issues, { max: 128 })
   }
@@ -201,18 +200,7 @@ function validateResumeEvidence(
     exactKeys(
       fact,
       factPath,
-      [
-        'id',
-        'sourceQuote',
-        'action',
-        'object',
-        'ownership',
-        'domains',
-        'skills',
-        'evidenceType',
-        'allowedClaimVerbs',
-        'confidence',
-      ],
+      ['id', 'sourceQuote', 'action', 'object', 'evidenceType', 'allowedClaimVerbs'],
       ['company', 'role', 'start', 'end', 'metrics'],
       issues,
     )
@@ -229,7 +217,7 @@ function validateResumeEvidence(
       min: 1,
       max: 4096,
     })
-    if (markdown && quote && !markdown.includes(quote)) {
+    if (markdown && quote && !quoteAppearsInResume(markdown, quote)) {
       addIssue(issues, childPath(factPath, 'sourceQuote'), '必须能在当前简历原文中找到')
     }
     for (const key of ['company', 'role', 'start', 'end'] as const) {
@@ -237,10 +225,6 @@ function validateResumeEvidence(
     }
     expectString(fact.action, childPath(factPath, 'action'), issues, { min: 1, max: 1024 })
     expectString(fact.object, childPath(factPath, 'object'), issues, { min: 1, max: 1024 })
-    const ownership = expectString(fact.ownership, childPath(factPath, 'ownership'), issues)
-    if (ownership && !ownershipValues.has(ownership)) {
-      addIssue(issues, childPath(factPath, 'ownership'), '枚举值无效')
-    }
     if ('metrics' in fact) {
       expectArray(fact.metrics, childPath(factPath, 'metrics'), issues, 50).forEach(
         (metric, metricIndex) =>
@@ -251,8 +235,6 @@ function validateResumeEvidence(
           ),
       )
     }
-    validateStringArray(fact.domains, childPath(factPath, 'domains'), issues)
-    validateStringArray(fact.skills, childPath(factPath, 'skills'), issues)
     const evidenceType = expectString(
       fact.evidenceType,
       childPath(factPath, 'evidenceType'),
@@ -262,57 +244,6 @@ function validateResumeEvidence(
       addIssue(issues, childPath(factPath, 'evidenceType'), '枚举值无效')
     }
     validateStringArray(fact.allowedClaimVerbs, childPath(factPath, 'allowedClaimVerbs'), issues)
-    const confidence = expectString(fact.confidence, childPath(factPath, 'confidence'), issues)
-    if (confidence && !confidenceValues.has(confidence)) {
-      addIssue(issues, childPath(factPath, 'confidence'), '枚举值无效')
-    }
-  })
-
-  const buckets = expectArray(
-    evidence.buckets,
-    childPath(path, 'buckets'),
-    issues,
-    CONFIG_LIMITS.arrayItems,
-  )
-  const bucketIds = new Set<string>()
-  buckets.forEach((item, index) => {
-    const bucketPath = childPath(childPath(path, 'buckets'), index)
-    const bucket = asRecord(item, bucketPath, issues)
-    exactKeys(bucket, bucketPath, ['id', 'signals', 'factIds'], [], issues)
-    const id = expectString(bucket.id, childPath(bucketPath, 'id'), issues, {
-      min: 1,
-      max: 128,
-      pattern: identifierPattern,
-    })
-    if (id) {
-      if (bucketIds.has(id)) addIssue(issues, childPath(bucketPath, 'id'), 'bucket ID 不能重复')
-      bucketIds.add(id)
-    }
-    expectArray(
-      bucket.signals,
-      childPath(bucketPath, 'signals'),
-      issues,
-      CONFIG_LIMITS.arrayItems,
-    ).forEach((signalValue, signalIndex) => {
-      const signalPath = childPath(childPath(bucketPath, 'signals'), signalIndex)
-      const signal = asRecord(signalValue, signalPath, issues)
-      exactKeys(signal, signalPath, ['value', 'weight'], [], issues)
-      expectString(signal.value, childPath(signalPath, 'value'), issues, { min: 1, max: 256 })
-      expectNumber(signal.weight, childPath(signalPath, 'weight'), issues, {
-        min: -1000,
-        max: 1000,
-      })
-    })
-    const bucketFactIds = validateStringArray(
-      bucket.factIds,
-      childPath(bucketPath, 'factIds'),
-      issues,
-    )
-    for (const factId of bucketFactIds) {
-      if (typeof factId === 'string' && !factIds.has(factId)) {
-        addIssue(issues, childPath(bucketPath, 'factIds'), `引用了不存在的事实 ID: ${factId}`)
-      }
-    }
   })
 
   const claimPolicyPath = childPath(path, 'claimPolicy')
@@ -341,9 +272,12 @@ export function validateResumeEvidenceForMarkdown(
 
 function validateProfile(value: unknown, path: string, issues: ConfigValidationIssue[]) {
   const profile = asRecord(value, path, issues)
-  exactKeys(profile, path, ['displayName', 'resume'], [], issues)
+  exactKeys(profile, path, ['displayName', 'targetRole', 'resume'], [], issues)
   expectString(profile.displayName, childPath(path, 'displayName'), issues, {
     max: CONFIG_LIMITS.displayNameCharacters,
+  })
+  expectString(profile.targetRole, childPath(path, 'targetRole'), issues, {
+    max: CONFIG_LIMITS.targetRoleCharacters,
   })
   const resumePath = childPath(path, 'resume')
   const resume = asRecord(profile.resume, resumePath, issues)
@@ -887,6 +821,7 @@ function createDefaultConfigBundleForModel(value: unknown): ConfigBundleV1 {
     settingsScope: CONFIG_SETTINGS_SCOPE,
     profile: {
       displayName: '',
+      targetRole: '',
       resume: { markdown: '', sourceHash: null, evidenceVersion: 1, evidence: null },
     },
     models: [value as import('./types').AiModelConfig],

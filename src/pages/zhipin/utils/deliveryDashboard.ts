@@ -37,6 +37,8 @@ export interface DashboardRecord {
     deliveryStage?: string
     failureStage?: string
     failureReason?: string
+    /** 岗位结论：成功、过滤、失败、已停止、暂缓…… */
+    state?: string
     retryable?: boolean
     trace?: Array<{
       stage?: string
@@ -69,12 +71,43 @@ export interface DashboardSourceMetric {
   targetPercent: number
 }
 
+/**
+ * 真正要处理的异常。其余几类（岗位方向不符、条件硬筛、去重、活跃/猎头）是正常的过滤结论，
+ * 说明岗位不对口，不需要用户做什么，不算进「需要关注」。
+ */
+export const anomalyCategoryIds: ReadonlySet<DeliveryFailureCategoryId> = new Set([
+  'publish',
+  'aiGreeting',
+])
+
+/** 平均用时样本：最近这么多个岗位。 */
+const jobDurationSampleSize = 20
+/** 当场判掉的岗位（去重、同公司）几乎不花时间，算进来会把平均用时拉低。 */
+const minJobDurationMs = 3_000
+/** 中间被暂停过的岗位用时不代表真实节奏。 */
+const maxJobDurationMs = 15 * 60_000
+
+/**
+ * 今天最近处理的岗位平均每个用多少秒；样本太少时返回 null，不给一个会误导人的估计。
+ */
+function averageJobSeconds(records: DashboardRecord[]) {
+  const durations = records
+    .filter((record) => isSuccessRecord(record) || isFailureRecord(record))
+    .filter((record) => record.updatedAt != null)
+    .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))
+    .map((record) => (record.updatedAt ?? record.createdAt) - record.createdAt)
+    .filter((duration) => duration >= minJobDurationMs && duration <= maxJobDurationMs)
+    .slice(0, jobDurationSampleSize)
+  if (durations.length < 3) return null
+  return Math.round(durations.reduce((total, item) => total + item, 0) / durations.length / 1000)
+}
+
 export const failureCategoryLabels: Record<DeliveryFailureCategoryId, string> = {
   jobFit: '岗位方向不符',
   hardFilter: '条件硬筛',
   dedupe: '去重/已沟通',
   activity: '活跃/猎头',
-  publish: '接口/风控',
+  publish: '接口/限流',
   aiGreeting: 'AI/招呼语',
 }
 
@@ -234,8 +267,24 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
   const success = args.todayData.success
   const failed = Math.max(0, processed - success)
   const remaining = Math.max(0, args.dailyLimit - success)
+  const estimatedRequiredProcessed =
+    remaining === 0
+      ? 0
+      : success > 0 && processed > 0
+        ? Math.ceil((remaining * processed) / success)
+        : null
+  const jobSeconds = averageJobSeconds(targetRecords)
   return {
     summary: {
+      averageJobSeconds: jobSeconds,
+      // 按今天的投递率和每岗用时，投满今天的额度还要多久。
+      estimatedRemainingSeconds:
+        estimatedRequiredProcessed != null && jobSeconds != null
+          ? estimatedRequiredProcessed * jobSeconds
+          : null,
+      attentionCount: Object.entries(failureCounts)
+        .filter(([id]) => anomalyCategoryIds.has(id as DeliveryFailureCategoryId))
+        .reduce((total, [, count]) => total + count, 0),
       fetched,
       pending,
       deferred,
@@ -245,12 +294,7 @@ export function buildDeliveryDashboard(args: DeliveryDashboardArgs) {
       retryableFailures,
       remaining,
       successRate: percentage(success, processed),
-      estimatedRequiredProcessed:
-        remaining === 0
-          ? 0
-          : success > 0 && processed > 0
-            ? Math.ceil((remaining * processed) / success)
-            : null,
+      estimatedRequiredProcessed,
     },
     sources,
     sourceRows,
@@ -335,9 +379,22 @@ function isSuccessRecord(record: DashboardRecord) {
   )
 }
 
+/**
+ * 这两类记录不是问题，不进归因、不算「需要关注」、也不算可重试：
+ * - 手动暂停时正在处理的岗位：用户自己停的；
+ * - 列表凭据过期被暂缓的岗位：还没投，抓到新列表后会自动重投。
+ * 原来它们被分别归进「AI/招呼语」和「接口/风控」，面板上显示 8 条要关注，真正的问题只有 4 条。
+ */
+function isExpectedInterruption(record: DashboardRecord) {
+  const state = record.data?.state
+  if (state === '已停止' || state === '暂缓' || record.state_name === '手动停止') return true
+  return /岗位列表凭据已放置|等待刷新凭据/.test(record.data?.failureReason ?? '')
+}
+
 function isFailureRecord(record: DashboardRecord) {
   return (
     getRecordJob(record) != null &&
+    !isExpectedInterruption(record) &&
     (record.state === 'warning' ||
       record.state === 'danger' ||
       record.data?.deliveryStage === '已过滤' ||

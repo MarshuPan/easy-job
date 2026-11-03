@@ -250,7 +250,28 @@ describe('pending greeting account scope', () => {
     expect(storageData.has(pendingGreetingKey)).toBe(false)
   })
 
-  it('removes expired greetings only for the active account', async () => {
+  it('does not evict queued greetings by a fixed item count', async () => {
+    setCurrentUid('account-a')
+    const queued = []
+    for (let index = 0; index < 51; index += 1) {
+      queued.push(
+        await enqueuePendingGreeting({
+          brandName: '测试公司',
+          content: `您好 ${index}`,
+          fromUid: 'account-a',
+          jobName: `岗位 ${index}`,
+          toName: '老师',
+          toUid: `boss-${index}`,
+          type: 'custom',
+        }),
+      )
+    }
+
+    expect(storageData.get(pendingGreetingKey)).toHaveLength(51)
+    expect(storageData.get(pendingGreetingKey)).toEqual(queued)
+  })
+
+  it('keeps a failure receipt for expired greetings of the active account', async () => {
     const accountA = pendingGreeting('account-a', 'pending-a')
     const accountB = pendingGreeting('account-b', 'pending-b')
     accountA.createdAt -= 6 * 60 * 1000
@@ -263,7 +284,13 @@ describe('pending greeting account scope', () => {
     ])
 
     expect(sendMessage).not.toHaveBeenCalled()
-    expect(storageData.get(pendingGreetingKey)).toEqual([accountB])
+    expect(storageData.get(pendingGreetingKey)).toEqual([
+      expect.objectContaining({
+        id: accountA.id,
+        status: expect.objectContaining({ stage: 'failed', reason: '待发送招呼语已过期' }),
+      }),
+      accountB,
+    ])
   })
 
   it('cancels the active account queue without sending when AI greeting is disabled', async () => {
@@ -305,7 +332,7 @@ describe('pending greeting account scope', () => {
     ])
   })
 
-  it('never gives a cancelled greeting to DOM fallback and removes it on the next consume', async () => {
+  it('retains a cancelled receipt until its caller can observe it and never gives it to DOM fallback', async () => {
     const cancelled = {
       ...pendingGreeting('account-a', 'pending-cancelled'),
       status: {
@@ -329,7 +356,41 @@ describe('pending greeting account scope', () => {
     ])
 
     expect(sendMessage).not.toHaveBeenCalled()
-    expect(storageData.has(pendingGreetingKey)).toBe(false)
+    expect(storageData.get(pendingGreetingKey)).toEqual([cancelled])
+    await expect(getPendingGreeting(cancelled.id, 'account-a')).resolves.toEqual(cancelled)
+    await expect(removePendingGreeting(cancelled.id, 'account-a')).resolves.toBe(true)
+  })
+
+  it.each(['sending', 'sent'] as const)(
+    'does not let cancellation erase a %s receipt',
+    async (stage) => {
+      const item = {
+        ...pendingGreeting('account-a', 'uncertain-cancel'),
+        status: { stage, observedAt: Date.now() },
+      }
+      storageData.set(pendingGreetingKey, [item])
+      setCurrentUid('account-a')
+      await expect(removePendingGreeting(item.id, 'account-a')).resolves.toBe(false)
+      expect(storageData.get(pendingGreetingKey)).toEqual([item])
+    },
+  )
+
+  it('does not auto-resend a failed receipt after the connection becomes ready', async () => {
+    const failed = {
+      ...pendingGreeting('account-a', 'failed-receipt'),
+      status: {
+        stage: 'failed' as const,
+        observedAt: Date.now(),
+        reason: 'channel was unavailable',
+      },
+    }
+    storageData.set(pendingGreetingKey, [failed])
+    setCurrentUid('account-a')
+    await consumePendingGreetings('account-a')
+    await vi.advanceTimersByTimeAsync(12_000)
+    await consumePendingGreetings('account-a')
+    expect(sendMessage).not.toHaveBeenCalled()
+    expect(storageData.get(pendingGreetingKey)).toEqual([failed])
   })
 
   it('serializes enqueue and removal so neither stale queue write overwrites the other', async () => {
@@ -415,7 +476,7 @@ describe('pending greeting account scope', () => {
       {
         id: pending.id,
         ok: false,
-        error: '招呼语发送结果不确定，已停止自动重试',
+        error: '该会话有发送结果不确定的消息，已停止自动重试',
       },
     ])
     await expect(
@@ -453,5 +514,34 @@ describe('pending greeting account scope', () => {
     })
     expect(storageData.get(pendingGreetingKey)).toEqual([pending])
     expect(sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('isolates ambiguous handoffs without blocking a different recruiter', async () => {
+    vi.resetModules()
+    const fresh = await import('./pendingGreeting')
+    const first = pendingGreeting('account-b', 'uncertain-first')
+    const same = pendingGreeting('account-b', 'same-recruiter')
+    const other = { ...pendingGreeting('account-b', 'other-recruiter'), toUid: 'another-boss' }
+    storageData.set(pendingGreetingKey, [first, same, other])
+    sendMessage
+      .mockReset()
+      .mockImplementationOnce(() => {
+        throw new Error('channel threw after handoff')
+      })
+      .mockReturnValue('ChatWebsocket')
+    await fresh.consumePendingGreetings('account-b')
+    vi.setSystemTime(Date.now() + 6_000)
+    await fresh.consumePendingGreetings('account-b')
+    vi.setSystemTime(Date.now() + 6_000)
+    await fresh.consumePendingGreetings('account-b')
+    expect((await fresh.getPendingGreeting(first.id, 'account-b'))?.status?.stage).toBe('sending')
+    await fresh.consumePendingGreetings('account-b')
+    expect(sendMessage).toHaveBeenCalledTimes(2)
+    expect(sendMessage.mock.calls[1][0]).toMatchObject({ to_uid: 'another-boss' })
+    expect(await fresh.claimPendingGreetingForFallback(first.id, 'account-b')).toBeUndefined()
+    expect(await fresh.getPendingGreeting(same.id, 'account-b')).toBeDefined()
+    vi.setSystemTime(Date.now() + 6 * 60_000)
+    await fresh.consumePendingGreetings('account-b')
+    expect(await fresh.getPendingGreeting(first.id, 'account-b')).toBeDefined()
   })
 })

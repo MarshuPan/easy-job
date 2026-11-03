@@ -11,7 +11,8 @@ const storageSet = vi.fn(async (key: string, value: unknown) => {
 vi.mock('@/message', () => ({ counter: { storageGet, storageSet } }))
 vi.mock('./logger', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }))
 
-const { acquireBossAction, actionGateKey, resetActionGate } = await import('./actionGateStore')
+const { acquireBossAction, actionGateKey, countRecentBossActions, resetActionGate } =
+  await import('./actionGateStore')
 const { defaultGateRules } = await import('./actionGate')
 
 describe('acquireBossAction', () => {
@@ -26,6 +27,19 @@ describe('acquireBossAction', () => {
       storage.set(key, value)
     })
     await resetActionGate()
+  })
+
+  it('counts only the requested action kinds within the window', async () => {
+    // 面板的「列表刷新 N 次/小时」：翻页和切换来源算，详情、投递不算，一小时以前的不算。
+    const now = Date.now()
+    storage.set(actionGateKey, [
+      { kind: 'pageNext', at: now - 10 * 60_000 },
+      { kind: 'navigate', at: now - 20 * 60_000 },
+      { kind: 'detail', at: now - 5 * 60_000 },
+      { kind: 'pageNext', at: now - 2 * 60 * 60_000 },
+    ])
+
+    expect(await countRecentBossActions(['pageNext', 'navigate'], 60 * 60_000, now)).toBe(2)
   })
 
   it('records every action it lets through so the window survives a page reload', () => {

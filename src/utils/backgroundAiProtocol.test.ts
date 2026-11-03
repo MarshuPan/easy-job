@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  AiTaskRequestValidationError,
   AiTaskResponseInvalidError,
+  AI_TASK_MAX_ARRAY_LENGTH,
+  AI_TASK_MAX_DEPTH,
+  AI_TASK_MAX_STRING_LENGTH,
+  AI_TASK_MAX_TOTAL_LENGTH,
   AI_TASK_REQUEST_TYPE,
   AI_TASK_RESPONSE_TYPE,
   createAiTaskResponse,
@@ -50,6 +55,27 @@ function nestedValue(depth: number): unknown {
 }
 
 describe('MAIN-world AI task protocol limits', () => {
+  it('distinguishes request validation from provider errors without echoing arbitrary input', () => {
+    const response = createAiTaskResponse('request-rejected', {
+      ok: false,
+      error: new AiTaskRequestValidationError('AI招呼语近期记录不合法'),
+    })
+    expect(response).toMatchObject({
+      ok: false,
+      errorCode: 'AI_TASK_REQUEST_INVALID',
+      error: '后台AI请求参数校验失败：AI招呼语近期记录不合法（未调用模型）',
+    })
+    expect(isAiTaskResponseMessage(response)).toBe(true)
+
+    const unknown = createAiTaskResponse('request-unknown-field', {
+      ok: false,
+      error: new AiTaskRequestValidationError('后台AI任务包含不允许的顶层字段: secret-field'),
+    })
+    expect(unknown.error).toBe('后台AI请求参数校验失败（未调用模型，请查看本机诊断）')
+    expect(JSON.stringify(unknown)).not.toContain('secret-field')
+    expect(isAiTaskResponseMessage(unknown)).toBe(true)
+  })
+
   it('accepts a bounded request containing only public task fields', () => {
     expect(isAiTaskRequestMessage(validMessage())).toBe(true)
   })
@@ -184,7 +210,7 @@ describe('MAIN-world AI task protocol limits', () => {
     ).toBe(false)
   })
 
-  it('rejects a greeting context with more than two selected fact IDs', () => {
+  it('accepts a greeting context with more than two selected fact IDs', () => {
     const selectedFactIds = ['fact-1', 'fact-2', 'fact-3']
     expect(
       isAiTaskRequestMessage({
@@ -194,7 +220,7 @@ describe('MAIN-world AI task protocol limits', () => {
           filtering: { ...validFilteringContext(), selectedFactIds },
         },
       }),
-    ).toBe(false)
+    ).toBe(true)
   })
 
   it.each([undefined, 60.5, -1, 101])(
@@ -229,7 +255,6 @@ describe('MAIN-world AI task protocol limits', () => {
     const summary = {
       sentAt: 1,
       usedFactIds: ['fact-agent-content'],
-      openingPattern: 'jd-hook',
       messages: ['第一条', '第二条', '第三条'],
       fingerprint: 'fingerprint',
     }
@@ -270,36 +295,40 @@ describe('MAIN-world AI task protocol limits', () => {
     ).toBe(false)
   })
 
-  it('rejects data nested deeper than eight levels', () => {
+  it('rejects data nested beyond the transport guard', () => {
     expect(
       isAiTaskRequestMessage({
         ...validMessage(),
-        data: { data: nestedValue(9) },
+        data: { data: nestedValue(AI_TASK_MAX_DEPTH + 1) },
       }),
     ).toBe(false)
   })
 
-  it('rejects strings longer than 32 KiB', () => {
+  it('rejects strings beyond the transport guard', () => {
     expect(
       isAiTaskRequestMessage({
         ...validMessage(),
-        data: { data: { description: 'x'.repeat(32 * 1024 + 1) } },
+        data: { data: { description: 'x'.repeat(AI_TASK_MAX_STRING_LENGTH + 1) } },
       }),
     ).toBe(false)
   })
 
-  it('rejects arrays longer than 200 items', () => {
+  it('rejects arrays beyond the transport guard', () => {
     expect(
       isAiTaskRequestMessage({
         ...validMessage(),
-        data: { data: { items: Array.from({ length: 201 }, (_, index) => index) } },
+        data: {
+          data: {
+            items: Array.from({ length: AI_TASK_MAX_ARRAY_LENGTH + 1 }, (_, index) => index),
+          },
+        },
       }),
     ).toBe(false)
   })
 
-  it('rejects requests larger than 256 KiB in total', () => {
+  it('rejects requests larger than the transport guard in total', () => {
     const chunks = Object.fromEntries(
-      Array.from({ length: 20 }, (_, index) => [`chunk${index}`, 'x'.repeat(16 * 1024)]),
+      Array.from({ length: 1_100 }, (_, index) => [`chunk${index}`, 'x'.repeat(16 * 1024)]),
     )
 
     expect(
@@ -308,6 +337,7 @@ describe('MAIN-world AI task protocol limits', () => {
         data: { data: chunks },
       }),
     ).toBe(false)
+    expect(AI_TASK_MAX_TOTAL_LENGTH).toBe(16 * 1024 * 1024)
   })
 
   it('returns only a stable code and generic message for provider failures', () => {

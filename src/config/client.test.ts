@@ -140,11 +140,19 @@ describe('configuration client clone boundary', () => {
       }),
     )
 
-    const pending = saveProfileAndExtract('account-a', '候选人', '简历内容', model())
+    const pending = saveProfileAndExtract(
+      'account-a',
+      { displayName: '候选人', targetRole: 'AI 产品经理' },
+      '简历内容',
+      model(),
+    )
     await vi.waitFor(() => expect(extractResumeEvidence).toHaveBeenCalledTimes(1))
 
     expect(runtimeSendMessage).toHaveBeenCalledTimes(1)
-    expect(runtimeSendMessage.mock.calls[0]?.[1].action).toBe('save-profile-draft')
+    expect(runtimeSendMessage.mock.calls[0]?.[1]).toMatchObject({
+      action: 'save-profile-draft',
+      targetRole: 'AI 产品经理',
+    })
     resolveExtraction({
       facts: [
         {
@@ -152,15 +160,10 @@ describe('configuration client clone boundary', () => {
           sourceQuote: '简历内容',
           action: '负责',
           object: '产品',
-          ownership: 'owned',
-          domains: [],
-          skills: [],
           evidenceType: 'direct_fact',
           allowedClaimVerbs: ['负责'],
-          confidence: 'high',
         },
       ],
-      buckets: [],
       claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
     })
 
@@ -192,7 +195,12 @@ describe('configuration client clone boundary', () => {
     )
 
     await expect(
-      saveProfileAndExtract('account-a', '候选人', '简历内容', model()),
+      saveProfileAndExtract(
+        'account-a',
+        { displayName: '候选人', targetRole: 'AI 产品经理' },
+        '简历内容',
+        model(),
+      ),
     ).resolves.toMatchObject({ reused: true, factCount: 2 })
     expect(extractResumeEvidence).not.toHaveBeenCalled()
     expect(runtimeSendMessage).toHaveBeenCalledTimes(1)
@@ -222,7 +230,12 @@ describe('configuration client clone boundary', () => {
     )
 
     await expect(
-      saveProfileAndExtract('account-a', '候选人', '私密简历正文', model()),
+      saveProfileAndExtract(
+        'account-a',
+        { displayName: '候选人', targetRole: 'AI 产品经理' },
+        '私密简历正文',
+        model(),
+      ),
     ).rejects.toMatchObject({ code: 'MODEL_TIMEOUT', message: '模型请求超时' })
 
     expect(runtimeSendMessage).toHaveBeenCalledTimes(1)

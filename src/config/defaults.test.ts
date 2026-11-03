@@ -88,8 +88,9 @@ describe('public workflow defaults', () => {
       enabled: false,
       modelId: null,
       messageCount: 3,
-      minTotalCharacters: 125,
-      maxTotalCharacters: 175,
+      // 默认话术分五部分，150 字只放得下两部分，默认目标改为 220。
+      minTotalCharacters: 195,
+      maxTotalCharacters: 245,
       prompt: DEFAULT_AI_GREETING_PROMPT,
     })
   })
@@ -122,7 +123,7 @@ describe('public workflow defaults', () => {
     expect(defaultFormData.aiGreeting).toMatchObject({
       enable: false,
       messageCount: 3,
-      targetTotalCharacters: 150,
+      targetTotalCharacters: 220,
       prompt: DEFAULT_AI_GREETING_PROMPT,
     })
   })
@@ -192,17 +193,42 @@ describe('public workflow defaults', () => {
     expect(DEFAULT_AI_FILTERING_PROMPT).not.toContain('{{')
     expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('{{')
     expect(DEFAULT_AI_FILTERING_PROMPT).toContain('85-100 strong')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('招聘者称呼、自我介绍、工作年限、主要领域')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('随后使用“我是”加 candidateName')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('接“目前有”加 candidateExperience')
-    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('candidateExperience 加“工作经验”')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('领域表述随本次岗位调整')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('换成另一个候选人是否同样成立')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('沟通意愿只能是简短尾句')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('规定的是每部分要传达的信息，不是句式模板')
+    // 用户确认的框架：我是谁、做过什么、能力、能带来什么、收尾。
+    // 身份按求职定位写，不复述姓名——1.3.6 的样本每条都用 40-50 字自报姓名年限领域。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('身份按 targetRole')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不复述姓名')
+    // 整段围绕模型先写出的 JD 核心需求：JD 是唯一每次都不同的输入，不先对准它，
+    // 13 条里 11 条会退回同一套和岗位无关的自我介绍。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('整段围绕 anchor.need 来写')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('按岗位需求和表达需要引用')
+    // 事实分布要均匀：同样贴近时选近期用得少的。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('同样贴近时选 recentFactUses 少的')
+    // 「我希望先梳理……」是在对还没决定要不要你的人规划入职以后的事，不专业。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不表态、不许愿')
+    // 禁用词清单不再写进提示词：每次治标加一条，清单越长模型越照着清单绕，
+    // 改由代码逐条检查（greetingDiversity 的 STOCK_PHRASE_PATTERNS），命中就带着问题重写。
+    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('“我希望”')
+    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('这套/这些经验可用于')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不写流程套话')
+    // 提示词里的动词会被原样学走：写过「能直接拿出什么」，11 条里 6 条是「我能拿出……经验」。
+    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('拿出')
+    // 同理，写过「哪个环节是我做过的」，一半多照抄成「我做过的对应环节是……」。
+    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('环节')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不提求职或应聘')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('用具体的做法或结果说')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('能力：点出支撑 need 的核心能力，来自 facts')
+    // 1.3.7 的新样本以「这份岗位核心是……」开头，是在给对方讲他自己的岗位。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不复述 JD')
+    // 1.3.7 的收尾是二选一的面试题，HR 答不了。收尾只表达沟通意愿。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('不提问')
+    // 条数 1-5、总字数 45-475 由用户设置，默认提示词不能写死内容块数：篇幅随总字数伸缩。
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('篇幅按设置的总字数来')
+    expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('否则不写')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('把公司名和岗位名换掉')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('规定的是每部分传达什么，不是句式模板')
     // 默认提示词被所有岗位、所有用户共用，任何可逐字照抄的示例都会变成模板。
     expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('主要在 AI、Agent 领域从事产品工作')
-    expect(DEFAULT_AI_GREETING_PROMPT).toContain('bossName 中可识别的姓氏')
+    expect(DEFAULT_AI_GREETING_PROMPT).toContain('bossName 中可识别姓氏')
     expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('只表达已经选择的简历事实')
     expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('第一人称视角')
     expect(DEFAULT_AI_GREETING_PROMPT).not.toContain('claimMode')

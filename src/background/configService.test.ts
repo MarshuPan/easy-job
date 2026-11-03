@@ -149,6 +149,23 @@ describe('ConfigService', () => {
     expect(stored.accountSettings['account-b'].delivery.customGreeting.value).toBe('账号 B')
   })
 
+  it('rejects an oversized expectation payload instead of silently dropping the tail', async () => {
+    const storage = memoryStorage()
+    const service = new ConfigService(storage.adapter)
+    const runtime = await service.getPublicRuntimeConfig('account-a')
+    const expectations = Array.from({ length: CONFIG_LIMITS.arrayItems + 1 }, (_, index) => ({
+      id: `expectation-${index}`,
+      positionName: '产品经理',
+      locationName: '上海',
+      salaryDesc: '30-50K',
+    }))
+
+    await expect(
+      service.savePublicRuntimeConfig('account-a', runtime.formData, expectations),
+    ).rejects.toThrow(ConfigValidationError)
+    expect(storage.readValue()).toBeNull()
+  })
+
   it('applies an AI task edit from a newly discovered account on the first save', async () => {
     // savePublicRuntimeConfig 会挡住新账号带来的 AI 变更（见下一条用例），
     // 那是为了防止初始化时用默认值冲掉全局配置。用户主动编辑走独立 action，
@@ -199,7 +216,6 @@ describe('ConfigService', () => {
       evidenceVersion: 1,
       evidence: {
         facts: [],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       },
     }
@@ -277,7 +293,6 @@ describe('ConfigService', () => {
       evidenceVersion: 1,
       evidence: {
         facts: [],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       },
     }
@@ -552,7 +567,7 @@ describe('ConfigService', () => {
       service.saveAiConfiguration({ models: [configuredModel()] }),
     ).rejects.toBeInstanceOf(ConfigMutationRunningError)
     await expect(
-      service.saveProfileDraft({ displayName: '候选人', markdown: '简历内容' }),
+      service.saveProfileDraft({ displayName: '候选人', targetRole: '', markdown: '简历内容' }),
     ).rejects.toBeInstanceOf(ConfigMutationRunningError)
     await expect(
       service.commitProfileEvidence({ markdown: '简历内容', evidence: {} }),
@@ -628,7 +643,6 @@ describe('ConfigService', () => {
     bundle.profile.resume.sourceHash = `sha256:${'0'.repeat(64)}`
     bundle.profile.resume.evidence = {
       facts: [],
-      buckets: [],
       claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
     }
 
@@ -654,15 +668,10 @@ describe('ConfigService', () => {
           sourceQuote: '事实摘录',
           action: '完成',
           object: '项目',
-          ownership: 'owned',
-          domains: [],
-          skills: [],
           evidenceType: 'direct_fact',
           allowedClaimVerbs: [],
-          confidence: 'high',
         },
       ],
-      buckets: [],
       claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
     }
 
@@ -723,20 +732,16 @@ describe('ConfigService', () => {
           sourceQuote: '负责平台产品',
           action: '负责',
           object: '平台产品',
-          ownership: 'owned' as const,
-          domains: ['企业服务'],
-          skills: ['产品规划'],
           evidenceType: 'direct_fact' as const,
           allowedClaimVerbs: ['负责'],
-          confidence: 'high' as const,
         },
       ],
-      buckets: [],
       claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
     }
 
     const draft = await service.saveProfileDraft({
       displayName: '候选人',
+      targetRole: '',
       markdown: '负责平台产品',
     })
     const first = await service.commitProfileEvidence({
@@ -745,6 +750,7 @@ describe('ConfigService', () => {
     })
     const second = await service.saveProfileDraft({
       displayName: '候选人',
+      targetRole: '',
       markdown: '负责平台产品',
     })
 
@@ -763,7 +769,6 @@ describe('ConfigService', () => {
       evidenceVersion: 1,
       evidence: {
         facts: [],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       },
     }
@@ -771,7 +776,7 @@ describe('ConfigService', () => {
     const service = new ConfigService(storage.adapter, '1.0.0')
 
     await expect(
-      service.saveProfileDraft({ displayName: '候选人', markdown: '新简历' }),
+      service.saveProfileDraft({ displayName: '候选人', targetRole: '', markdown: '新简历' }),
     ).resolves.toMatchObject({ status: 'pending' })
 
     expect(storage.readValue()?.profile.resume).toEqual({
@@ -792,26 +797,25 @@ describe('ConfigService', () => {
           sourceQuote: '负责平台产品',
           action: '负责',
           object: '平台产品',
-          ownership: 'owned' as const,
-          domains: ['企业服务'],
-          skills: ['产品规划'],
           evidenceType: 'direct_fact' as const,
           allowedClaimVerbs: ['负责'],
-          confidence: 'high' as const,
         },
       ],
-      buckets: [],
       claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
     }
 
     await expect(
-      service.saveProfileDraft({ displayName: '候选人', markdown: '负责平台产品' }),
+      service.saveProfileDraft({ displayName: '候选人', targetRole: '', markdown: '负责平台产品' }),
     ).resolves.toMatchObject({ status: 'pending', factCount: 0 })
     await expect(
       service.commitProfileEvidence({ markdown: '负责平台产品', evidence }),
     ).resolves.toMatchObject({ status: 'ready', factCount: 1 })
 
-    await service.saveProfileDraft({ displayName: '候选人', markdown: '更新后的简历' })
+    await service.saveProfileDraft({
+      displayName: '候选人',
+      targetRole: '',
+      markdown: '更新后的简历',
+    })
     await expect(
       service.commitProfileEvidence({ markdown: '负责平台产品', evidence }),
     ).rejects.toThrow('简历内容已更新，本次解析结果已丢弃')
@@ -825,7 +829,11 @@ describe('ConfigService', () => {
   it('rejects page-side evidence that cannot be quoted from the saved resume', async () => {
     const storage = memoryStorage(createDefaultStoredConfigState())
     const service = new ConfigService(storage.adapter, '1.0.0')
-    await service.saveProfileDraft({ displayName: '候选人', markdown: '真实简历内容' })
+    await service.saveProfileDraft({
+      displayName: '候选人',
+      targetRole: '',
+      markdown: '真实简历内容',
+    })
 
     await expect(
       service.commitProfileEvidence({
@@ -837,15 +845,10 @@ describe('ConfigService', () => {
               sourceQuote: '不存在的摘录',
               action: '负责',
               object: '平台产品',
-              ownership: 'owned',
-              domains: [],
-              skills: [],
               evidenceType: 'direct_fact',
               allowedClaimVerbs: [],
-              confidence: 'high',
             },
           ],
-          buckets: [],
           claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
         },
       }),
@@ -860,12 +863,21 @@ describe('ConfigService', () => {
     await expect(
       service.saveProfileDraft({
         displayName: 'x'.repeat(CONFIG_LIMITS.displayNameCharacters + 1),
+        targetRole: '',
         markdown: '',
       }),
     ).rejects.toBeInstanceOf(ConfigValidationError)
     await expect(
       service.saveProfileDraft({
+        displayName: '候选人',
+        targetRole: 'x'.repeat(CONFIG_LIMITS.targetRoleCharacters + 1),
+        markdown: '简历内容',
+      }),
+    ).rejects.toBeInstanceOf(ConfigValidationError)
+    await expect(
+      service.saveProfileDraft({
         displayName: '',
+        targetRole: '',
         markdown: 'x'.repeat(CONFIG_LIMITS.resumeCharacters + 1),
       }),
     ).rejects.toBeInstanceOf(ConfigValidationError)
@@ -878,10 +890,10 @@ describe('ConfigService', () => {
     const service = new ConfigService(storage.adapter, '1.0.0')
 
     await expect(
-      service.saveProfileDraft({ displayName: '候选人', markdown: '' }),
+      service.saveProfileDraft({ displayName: '候选人', targetRole: '', markdown: '' }),
     ).rejects.toBeInstanceOf(ConfigValidationError)
     await expect(
-      service.saveProfileDraft({ displayName: '候选人', markdown: '  \n ' }),
+      service.saveProfileDraft({ displayName: '候选人', targetRole: '', markdown: '  \n ' }),
     ).rejects.toBeInstanceOf(ConfigValidationError)
 
     expect(storage.adapter.write).not.toHaveBeenCalled()

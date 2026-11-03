@@ -70,6 +70,8 @@ export interface AiTaskExecutionConfig {
   configRevision: number
   model: AiModelConfig
   profile: PersonalProfileConfig
+  /** 当前账号启用的 BOSS 求职期望。求职定位留空时，按岗位所属的期望决定身份。 */
+  expectations: JobExpectationConfig[]
   task: AiTaskConfig['aiFiltering'] | AiTaskConfig['aiGreeting']
 }
 
@@ -241,6 +243,7 @@ export class ConfigService {
       configRevision: state.configRevision,
       model: jsonClone(model),
       profile: jsonClone(state.profile),
+      expectations: jsonClone(state.accountSettings[uid].jobRules.sources.enabledExpectations),
       task: jsonClone(taskConfig),
     }
   }
@@ -384,12 +387,17 @@ export class ConfigService {
     return this.replaceBundle(uid, parseConfigJson(text))
   }
 
-  async saveProfileDraft(value: { displayName: unknown; markdown: unknown }) {
+  async saveProfileDraft(value: { displayName: unknown; targetRole: unknown; markdown: unknown }) {
     if (await this.isAnyDeliveryRunning()) throw new ConfigMutationRunningError()
     const displayName = validateProfileText(
       value.displayName,
       'displayName',
       CONFIG_LIMITS.displayNameCharacters,
+    ).trim()
+    const targetRole = validateProfileText(
+      value.targetRole,
+      'targetRole',
+      CONFIG_LIMITS.targetRoleCharacters,
     ).trim()
     const markdown = validateResumeMarkdown(value.markdown)
     const sourceHash = await hashResumeMarkdown(markdown)
@@ -402,6 +410,7 @@ export class ConfigService {
         resume.evidence,
       )
       state.profile.displayName = displayName
+      state.profile.targetRole = targetRole
       if (canReuse) {
         return {
           configRevision: state.configRevision + 1,
@@ -492,7 +501,15 @@ function validateResumeMarkdown(value: unknown) {
 
 function parsePublicExpectations(value: unknown): JobExpectationConfig[] {
   if (!Array.isArray(value)) return []
-  return value.slice(0, CONFIG_LIMITS.arrayItems).flatMap((item) => {
+  if (value.length > CONFIG_LIMITS.arrayItems) {
+    throw new ConfigValidationError([
+      {
+        path: '$.expectations',
+        message: `$.expectations: 不能超过 ${CONFIG_LIMITS.arrayItems} 项`,
+      },
+    ])
+  }
+  return value.flatMap((item) => {
     if (!isPlainObject(item)) return []
     const id = typeof item.id === 'string' ? item.id.trim() : ''
     if (!id) return []

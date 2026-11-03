@@ -5,6 +5,10 @@ const { storageGet, storageSet } = vi.hoisted(() => ({
   storageSet: vi.fn(),
 }))
 
+const { localDiagnosticAppend } = vi.hoisted(() => ({
+  localDiagnosticAppend: vi.fn(async () => true),
+}))
+
 vi.mock('#imports', () => ({
   storage: {
     getItem: storageGet,
@@ -12,9 +16,17 @@ vi.mock('#imports', () => ({
   },
 }))
 
+vi.mock('./localDiagnosticSink', () => ({
+  appendLocalDiagnosticEvent: localDiagnosticAppend,
+}))
+
 import type { AiRuntimeDiagnosticEvent } from '@/utils/backgroundAi'
 
-import { createAccountAiRuntimeLogger, createRuntimeLogStorageKey } from './runtimeLogs'
+import {
+  appendAiTaskFailure,
+  createAccountAiRuntimeLogger,
+  createRuntimeLogStorageKey,
+} from './runtimeLogs'
 
 function event(overrides: Partial<AiRuntimeDiagnosticEvent> = {}): AiRuntimeDiagnosticEvent {
   return {
@@ -45,21 +57,142 @@ describe('background runtime logs', () => {
     vi.clearAllMocks()
     storageGet.mockResolvedValue([])
     storageSet.mockResolvedValue(undefined)
+    localDiagnosticAppend.mockResolvedValue(true)
   })
 
-  it('writes account-scoped AI request stages without private request content', async () => {
+  it('keeps rejected business input and original errors locally even before a provider request', async () => {
+    const request = {
+      requestId: 'request-invalid',
+      task: 'aiGreeting',
+      bridgeToken: 'not-for-disk',
+      data: {
+        accountUid: 'account-a',
+        recentGreetings: [
+          { messages: ['历史话术正文'.repeat(1000)], usedFactIds: ['a', 'b', 'c', 'd'] },
+        ],
+      },
+    }
+    const error = new Error('原始校验原因', { cause: new TypeError('原始内部原因') })
+    await appendAiTaskFailure(request, 'request-validation', error)
+    expect(localDiagnosticAppend).toHaveBeenCalledWith({
+      stream: 'logs',
+      event: 'runtime.ai-task-failed',
+      accountUid: 'account-a',
+      data: {
+        requestId: request.requestId,
+        task: request.task,
+        stage: 'request-validation',
+        requestSnapshot: {
+          requestId: request.requestId,
+          task: request.task,
+          data: { recentGreetings: request.data.recentGreetings },
+        },
+        error: expect.objectContaining({
+          name: 'Error',
+          message: '原始校验原因',
+          stack: expect.any(String),
+          cause: expect.objectContaining({ name: 'TypeError', message: '原始内部原因' }),
+        }),
+      },
+    })
+    expect(request.data.accountUid).toBe('account-a')
+    expect(request.bridgeToken).toBe('not-for-disk')
+  })
+
+  it('keeps invalid array data intact and tolerates diagnostic storage failures', async () => {
+    localDiagnosticAppend.mockRejectedValueOnce(new Error('disk unavailable'))
+    await expect(
+      appendAiTaskFailure({ data: ['invalid-input'] }, 'request-validation', new Error('invalid')),
+    ).resolves.toBeUndefined()
+    expect(localDiagnosticAppend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountUid: undefined,
+        data: expect.objectContaining({ requestSnapshot: { data: ['invalid-input'] } }),
+      }),
+    )
+  })
+
+  it('skips routine request stages and keeps slow or retried ones', async () => {
     const logger = createAccountAiRuntimeLogger('account-a')
     await logger(event())
+    await logger(event({ phase: 'succeeded', durationMs: 20_000 }))
+    expect(storageSet).not.toHaveBeenCalled()
 
+    await logger(event({ phase: 'succeeded', durationMs: 90_000 }))
     expect(storageGet).toHaveBeenCalledWith('local:agent-delivery-runtime-logs:account-a', {
       fallback: [],
     })
     expect(storageSet).toHaveBeenCalledTimes(1)
     const written = storageSet.mock.calls[0]![1]
     expect(JSON.stringify(written)).toContain('简历解析')
-    expect(JSON.stringify(written)).toContain('模型请求已发出')
+    expect(JSON.stringify(written)).toContain('模型请求较慢（90 秒）')
     expect(JSON.stringify(written)).not.toContain('apiKey')
     expect(JSON.stringify(written)).not.toContain('简历原文')
+    // 3 个完整 AI 阶段事件 + 1 条界面运行日志摘要。
+    expect(localDiagnosticAppend).toHaveBeenCalledTimes(4)
+  })
+
+  it('mirrors full prompt, request body, and provider response for every AI phase', async () => {
+    const logger = createAccountAiRuntimeLogger('account-a')
+    await logger(
+      event({
+        phase: 'succeeded',
+        promptMessages: [
+          { role: 'system', content: '系统 Prompt' },
+          { role: 'user', content: '简历原文和完整 JD' },
+        ],
+        requestBody: { messages: [{ role: 'user', content: '完整请求' }] },
+        providerResponse: { choices: [{ message: { content: '原始模型响应' } }] },
+        resultContent: '解析后的结果',
+        reasoningContent: '推理文本',
+      }),
+    )
+    expect(localDiagnosticAppend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'runtime.ai-request',
+        data: expect.objectContaining({
+          promptMessages: expect.any(Array),
+          requestBody: expect.any(Object),
+          providerResponse: expect.any(Object),
+          resultContent: '解析后的结果',
+          reasoningContent: '推理文本',
+        }),
+      }),
+    )
+  })
+
+  it('drops routine records left by older versions when writing a new one', async () => {
+    // 1.3.6 给每次正常请求都记两条。新版本不再记，老记录就永远挤不出 200 条的名额，
+    // 真机上 200 条运行日志里有 180 条是它们。
+    storageGet.mockResolvedValue([
+      {
+        title: 'AI 匹配请求',
+        state: 'success',
+        state_name: '请求成功',
+        message: '模型请求完成',
+        createdAt: 3,
+      },
+      {
+        title: 'AI 匹配请求',
+        state: 'info',
+        state_name: '请求中',
+        message: '模型请求已发出（同步）',
+        createdAt: 2,
+      },
+      {
+        title: '简历解析',
+        state: 'success',
+        state_name: '解析成功',
+        message: '解析成功',
+        createdAt: 1,
+      },
+    ])
+    const logger = createAccountAiRuntimeLogger('account-a')
+
+    await logger(event({ phase: 'succeeded', durationMs: 90_000 }))
+
+    const written = storageSet.mock.calls[0]![1] as Array<{ message: string }>
+    expect(written.map((item) => item.message)).toEqual(['模型请求较慢（90 秒）', '解析成功'])
   })
 
   it('keeps useful failure diagnostics while redacting URLs and credentials', async () => {

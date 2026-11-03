@@ -13,6 +13,7 @@ data/private/resume-evidence.json
 data/private/resume.md
 data/private/exports/
 data/private/public-release-denylist.json
+data/runtime/
 
 # Local public-repository synchronization state
 .public-sync-target

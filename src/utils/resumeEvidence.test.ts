@@ -11,28 +11,19 @@ const evidence: ResumeEvidence = {
       sourceQuote: 'private platform quote',
       action: '搭建',
       object: 'AI 平台',
-      ownership: 'led',
       metrics: [{ name: '团队规模', value: '10 人' }],
-      domains: ['AI 平台'],
-      skills: ['平台化'],
       evidenceType: 'direct_fact',
       allowedClaimVerbs: ['主导'],
-      confidence: 'high',
     },
     {
       id: 'fact-agent-content',
       sourceQuote: 'private agent quote',
       action: '构建',
       object: 'Agent 内容系统',
-      ownership: 'owned',
-      domains: ['内容生产'],
-      skills: ['Agent'],
       evidenceType: 'direct_fact',
       allowedClaimVerbs: ['负责'],
-      confidence: 'high',
     },
   ],
-  buckets: [],
   claimPolicy: {
     adjacentOnly: ['模型评测'],
     forbiddenClaims: ['虚构项目经历'],
@@ -57,9 +48,14 @@ describe('resume evidence resolution', () => {
     )
   })
 
-  it('throws when more than two unique fact ids are requested', () => {
-    expect(() =>
-      resolveSelectedGreetingFacts(evidence, ['fact-platform', 'fact-agent-content', 'fact-third']),
-    ).toThrow('筛选事实数量必须为1到2个')
+  it('resolves three or more valid facts and still rejects unknown references', () => {
+    const expanded = {
+      ...evidence,
+      facts: [...evidence.facts, { ...evidence.facts[0], id: 'fact-third' }],
+    }
+    const ids = ['fact-platform', 'fact-agent-content', 'fact-third']
+    expect(resolveSelectedGreetingFacts(expanded, ids).map((fact) => fact.id)).toEqual(ids)
+    expect(() => resolveSelectedGreetingFacts(evidence, ids)).toThrow('筛选事实ID无效: fact-third')
+    expect(() => resolveSelectedGreetingFacts(evidence, [])).toThrow('筛选事实不能为空')
   })
 })

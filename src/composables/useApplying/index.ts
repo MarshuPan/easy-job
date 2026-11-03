@@ -1,5 +1,6 @@
 import { useCommon } from '@/composables/useCommon'
 import { PipelineCacheManager } from '@/composables/usePipelineCache'
+import { needsCredentialRefresh } from '@/pages/zhipin/utils/credentialAge'
 import type { JobStatus } from '@/stores/jobs'
 import { addLogTrace } from '@/stores/log'
 import { useUser } from '@/stores/user'
@@ -92,10 +93,9 @@ function compilePipeline(
 /**
  * 列表页凭据（securityId / lid）何时应先刷新。
  *
- * 30 分钟只触发列表刷新，不判岗位失效。这样既遵守现行产品契约，也避免拿已放置较久的
- * securityId/lid 直接撞详情接口；刷新后岗位仍按原 FIFO 顺序处理。
+ * 凭据年龄达到安全余量时触发列表刷新，不判岗位失效；动作闸门之后再次校验，
+ * 避免等待本身把 securityId/lid 等过期。
  */
-const JOB_CREDENTIAL_REFRESH_AGE_MINUTES = 30
 
 export async function createHandle(runtimeFormData?: FormData): Promise<{
   before: Handler[]
@@ -118,7 +118,7 @@ export async function createHandle(runtimeFormData?: FormData): Promise<{
         try {
           const assertCredentialsFreshEnough = (alwaysLog = false) => {
             const ageMinutes = ageMinutesAt(Date.now())
-            const refreshRequired = ageMinutes >= JOB_CREDENTIAL_REFRESH_AGE_MINUTES
+            const refreshRequired = needsCredentialRefresh(args.data, Date.now())
             if (alwaysLog || refreshRequired) {
               addLogTrace(ctx, '岗位时效', 'info', '投递前重新校验岗位详情与投递凭据', {
                 ageMinutes: Math.round(ageMinutes),

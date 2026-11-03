@@ -26,8 +26,14 @@
   padding: 0;
   overflow: hidden;
   background: #fff;
-  cursor: pointer;
+  cursor: grab;
   pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+}
+
+.agent-delivery-launcher.is-dragging {
+  cursor: grabbing;
 }
 
 .agent-delivery-logo {
@@ -172,14 +178,11 @@
   border: 1px solid var(--instrument-charcoal);
   border-radius: 7px;
   box-shadow: 4px 4px 0 rgb(34 38 44 / 20%);
-  transition:
-    transform 140ms ease,
-    box-shadow 140ms ease;
+  transition: box-shadow 140ms ease;
 }
 
 .agent-delivery-launcher:hover {
   box-shadow: 5px 6px 0 rgb(34 38 44 / 22%);
-  transform: translateY(-2px);
 }
 
 .agent-delivery-overlay {

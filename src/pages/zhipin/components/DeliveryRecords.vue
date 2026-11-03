@@ -6,7 +6,7 @@ import { useCommon } from '@/composables/useCommon'
 import { useConf } from '@/stores/conf'
 import { jobList, type MyJobListData } from '@/stores/jobs'
 import type { DeliverySource, DeliveryStage, log, logData, logTraceStatus } from '@/stores/log'
-import { useLog } from '@/stores/log'
+import { DELIVERY_RECORD_RETENTION_DAYS, useLog } from '@/stores/log'
 import {
   AgentButton,
   AgentDrawer,
@@ -15,6 +15,7 @@ import {
   AgentPopconfirm,
   AgentTag,
 } from '@/ui/instrument'
+import { buildGreetingHealth, type GreetingHealthInput } from '@/utils/greetingHealth'
 import { exportJson } from '@/utils/jsonImportExport'
 import { safeStringify, toSafeJsonValue } from '@/utils/safeJson'
 
@@ -153,6 +154,14 @@ const pagedRows = computed(() => {
   return recordRows.value.slice(start, start + pageSize)
 })
 
+const greetingHealthSummary = computed(() => {
+  const records = recordRows.value.filter(
+    (row): row is Extract<DeliveryRow, { kind: 'record' }> => row.kind === 'record',
+  )
+  const report = greetingHealthReport(greetingHealthInputs(records))
+  return report.current ?? report.all
+})
+
 function setPage(page: number) {
   currentPage.value = page
 }
@@ -170,6 +179,7 @@ function getCurrentPoolJobs() {
     batchSize: queuePreviewBatchSize,
     getItemKey: (job) => job.encryptJobId,
     getItemOrder: (job) => job.deliveryQueueOrder,
+    getItemFreshness: (job) => job.fetchedAt,
     getItemSource: (job) => job.deliveryQueueSource,
     limit: queuePreviewLimit,
     pools: {
@@ -493,54 +503,120 @@ function formatDetailText(row: DeliveryRow) {
   ].join('\n')
 }
 
-function buildExportRow(row: DeliveryRow) {
-  const data = row.kind === 'record' ? row.item.data : undefined
+/** 最终发出去的整段招呼语。 */
+function formatGreetingText(data: logData | undefined) {
+  if (data?.aiGreetingMessages?.length) return data.aiGreetingMessages.join('\n')
+  return data?.message ?? ''
+}
+
+function formatExportTime(timestamp: number) {
+  return new Date(timestamp).toLocaleString('zh-CN', { hour12: false })
+}
+
+/**
+ * 导出一条岗位记录：岗位本身的情况、处理结论、AI 匹配结论和最终发出的招呼语。
+ * 过程明细不导出——它只用于当天排查，复盘话术和岗位时用不到。
+ */
+function buildExportRow(row: Extract<DeliveryRow, { kind: 'record' }>) {
+  const data = row.item.data
   const status = buildRowStatus(row)
+  const decision = data?.aiFilteringDecision
+  const job = row.job
   return {
-    exportedAt: new Date().toISOString(),
-    source: row.source,
-    sourceName: formatSource(row),
+    time: formatExportTime(row.item.createdAt),
+    source: formatSource(row),
     status: status.label,
-    deliveryStage: status.stage,
-    progress: formatProgressStep(row),
-    createdAt: row.kind === 'record' ? row.item.createdAt : undefined,
-    updatedAt: row.kind === 'record' ? row.item.updatedAt : undefined,
-    matchPercent: row.kind === 'record' ? data?.matchPercent : undefined,
-    failure:
-      row.kind === 'record' && (status.stage === '投递失败' || status.stage === '已过滤')
-        ? formatFailureReason(row)
-        : '',
+    reason: status.key === 'delivered' ? '' : data?.failureReason || row.item.message || '',
+    match:
+      typeof data?.matchPercent === 'number'
+        ? {
+            percent: data.matchPercent,
+            threshold: data.aiFilteringThreshold,
+            reason: decision?.reason ?? '',
+            risk: decision?.risk ?? '',
+          }
+        : null,
     job: {
-      encryptJobId: row.job.encryptJobId,
-      jobName: row.job.jobName,
-      cityName: row.job.cityName,
-      salaryDesc: formatSalary(row.job),
-      experienceName: row.job.card?.experienceName ?? row.job.jobExperience,
-      degreeName: row.job.card?.degreeName ?? row.job.jobDegree,
-      brandName: row.job.brandName,
-      brandScaleName: row.job.brandScaleName,
-      bossName: row.job.card?.bossName ?? row.job.bossName,
-      bossTitle: row.job.card?.bossTitle ?? row.job.bossTitle,
-      jobLabels: row.job.card?.jobLabels ?? row.job.jobLabels,
+      company: job.brandName,
+      companySize: job.brandScaleName,
+      jobName: job.jobName,
+      salary: formatSalary(job),
+      city: job.cityName,
+      experience: job.card?.experienceName ?? job.jobExperience,
+      degree: job.card?.degreeName ?? job.jobDegree,
+      boss: [job.card?.bossName ?? job.bossName, job.card?.bossTitle ?? job.bossTitle]
+        .filter(Boolean)
+        .join(' · '),
+      labels: job.card?.jobLabels ?? job.jobLabels ?? [],
+      description: job.card?.postDescription ?? '',
     },
-    jd: {
-      description: row.job.card?.postDescription ?? '',
-    },
-    trace: row.kind === 'record' ? toSafeJsonValue(data?.trace ?? []) : [],
-    greeting: {
-      rawJson: data?.aiGreetingA ?? '',
-      messages: data?.aiGreetingMessages ?? [],
-      send: toSafeJsonValue(data?.greetingSend),
-    },
+    greeting: formatGreetingText(data),
+    // 这条招呼语对准的 JD 需求，复盘时对照 JD 看选得对不对。
+    ...(data?.aiGreetingMeta?.anchor ? { greetingAnchor: data.aiGreetingMeta.anchor } : {}),
+    ...(data?.aiGreetingMeta?.usedFactIds?.length
+      ? { greetingFacts: data.aiGreetingMeta.usedFactIds }
+      : {}),
+    ...(data?.aiGreetingMeta?.segmentFactIds
+      ? { greetingSegmentFacts: data.aiGreetingMeta.segmentFactIds }
+      : {}),
+    ...(data?.aiGreetingMeta?.resumeEvidenceVersion == null
+      ? {}
+      : {
+          greetingResumeEvidenceVersion: data.aiGreetingMeta.resumeEvidenceVersion,
+          greetingResumeSourceHash: data.aiGreetingMeta.resumeSourceHash,
+        }),
+    ...(data?.aiGreetingMeta?.audit ? { greetingAudit: data.aiGreetingMeta.audit } : {}),
   }
 }
 
+/**
+ * 体检分两份：带复核结果的（当前生成链路写的）单独算一份，保留期内全部再算一份。
+ * 升级当天新旧混在一起，只算全部就看不出这一版改了什么。
+ */
+function greetingHealthReport(inputs: GreetingHealthInput[]) {
+  const current = inputs.filter((input) => input.review)
+  return {
+    current: buildGreetingHealth(current),
+    all: buildGreetingHealth(inputs),
+  }
+}
+
+/** 发出去的 AI 招呼语，供体检统计。 */
+function greetingHealthInputs(rows: Array<Extract<DeliveryRow, { kind: 'record' }>>) {
+  return rows.flatMap((row) => {
+    const data = row.item.data
+    const meta = data?.aiGreetingMeta
+    const messages = data?.aiGreetingMessages
+    if (buildRowStatus(row).key !== 'delivered' || !meta || !messages?.length) return []
+    return [
+      {
+        sentAt: row.item.updatedAt ?? row.item.createdAt,
+        messages,
+        usedFactIds: meta.usedFactIds,
+        segmentFactIds: meta.segmentFactIds,
+        anchor: meta.anchor,
+        review: meta.review,
+        audit: meta.audit,
+      },
+    ]
+  })
+}
+
 function exportRecords() {
+  const records = recordRows.value.filter(
+    (row): row is Extract<DeliveryRow, { kind: 'record' }> => row.kind === 'record',
+  )
+  if (records.length === 0) {
+    AgentMessage.info('暂无可导出的岗位记录')
+    return
+  }
   exportJson(
     {
-      exportedAt: new Date().toISOString(),
-      count: recordRows.value.length,
-      records: recordRows.value.map(buildExportRow),
+      exportedAt: formatExportTime(Date.now()),
+      retentionDays: DELIVERY_RECORD_RETENTION_DAYS,
+      count: records.length,
+      greetingHealth: greetingHealthReport(greetingHealthInputs(records)),
+      records: records.map(buildExportRow),
     },
     `投递记录-${new Date().toISOString().slice(0, 10)}`,
   )
@@ -555,11 +631,25 @@ function exportRecords() {
         <span>第 {{ clampedCurrentPage }} 页</span>
       </div>
       <div class="delivery-records__actions">
-        <AgentButton size="small" :disabled="recordRows.length === 0" @click="exportRecords">
+        <AgentButton
+          size="small"
+          :disabled="recordRows.length === 0"
+          title="导出最近 7 天的岗位记录"
+          @click="exportRecords"
+        >
           <Download :size="14" aria-hidden="true" />
           导出记录
         </AgentButton>
       </div>
+    </div>
+
+    <div v-if="greetingHealthSummary" class="delivery-records__health" data-test="greeting-health">
+      <span>话术 {{ greetingHealthSummary.count }} 条</span>
+      <span>三方核对 {{ greetingHealthSummary.triadCompleteRate }}%</span>
+      <span>JD 锚点 {{ greetingHealthSummary.jdAnchorHitRate }}%</span>
+      <span>事实映射 {{ greetingHealthSummary.factMappingCompleteRate }}%</span>
+      <span>证据版本 {{ greetingHealthSummary.evidenceVersionMatchRate }}%</span>
+      <span>主张边界 {{ greetingHealthSummary.claimBoundaryPassRate }}%</span>
     </div>
 
     <InstrumentEmptyState v-if="recordRows.length === 0" title="暂无投递记录">

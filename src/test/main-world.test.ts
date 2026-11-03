@@ -7,6 +7,9 @@ const {
   loggerWarn,
   route,
   startPendingGreetingConsumer,
+  consumePendingGreetings,
+  initUser,
+  currentUid,
   zhipinModuleLoaded,
   zhipinModuleState,
   zhipinRun,
@@ -23,6 +26,9 @@ const {
     loggerWarn: vi.fn(),
     route,
     startPendingGreetingConsumer: vi.fn(),
+    consumePendingGreetings: vi.fn(async () => []),
+    currentUid: { value: 'account-a' as string | undefined },
+    initUser: vi.fn(async () => undefined),
     zhipinModuleLoaded: vi.fn(),
     zhipinModuleState: { wait: Promise.resolve() as Promise<void> },
     zhipinRun: vi.fn(),
@@ -44,7 +50,18 @@ vi.mock('@/composables/useVue', () => ({
 
 vi.mock('@/composables/useWebSocket/pendingGreeting', () => ({
   startPendingGreetingConsumer,
+  consumePendingGreetings,
+  getSendChannelReadiness: () => ({ ready: true }),
 }))
+vi.mock('@/stores/user', () => ({
+  useUser: () => ({ getUserId: () => currentUid.value, initUser }),
+}))
+vi.mock('@/composables/useWebSocket/chatFeedback', () => ({ startChatFeedbackObserver: vi.fn() }))
+
+vi.mock('@/composables/useWebSocket/chatNetworkFeedback', () => ({
+  startChatNetworkFeedbackObserver: vi.fn(),
+}))
+vi.mock('@/utils/runtimeObservation', () => ({ startRuntimeObservation: vi.fn() }))
 
 vi.mock('@/pages/zhipin', async () => {
   await zhipinModuleState.wait
@@ -74,12 +91,15 @@ describe('main-world entrypoint', () => {
     afterHooks.length = 0
     route.path = '/web/geek/chat'
     zhipinModuleState.wait = Promise.resolve()
+    currentUid.value = 'account-a'
+    initUser.mockResolvedValue(undefined)
     document.body.innerHTML = ''
     window.history.replaceState({}, '', '/web/geek/chat')
     const mainWorldScript = document.createElement('script')
     mainWorldScript.src = 'chrome-extension://test-extension/main-world.js'
     mainWorldScript.dataset.agentDeliveryLogoUrl = logoUrl
     mainWorldScript.dataset.agentDeliveryPersonalUrl = personalUrl
+    mainWorldScript.dataset.agentDeliveryToken = 'test-bridge-token'
     Object.defineProperty(document, 'currentScript', {
       configurable: true,
       value: mainWorldScript,
@@ -98,10 +118,35 @@ describe('main-world entrypoint', () => {
 
     expect(getRootVue).not.toHaveBeenCalled()
     expect(startPendingGreetingConsumer).toHaveBeenCalledTimes(1)
+    expect(initUser).toHaveBeenCalledWith({ pollIntervalMs: 100, timeoutMs: 1500 })
     expect(document.querySelector('#agent-delivery-job')).toBeNull()
     expect(document.querySelector('#agent-delivery')).toBeNull()
     expect(loggerInfo).not.toHaveBeenCalledWith('Easy Job 加载成功')
     expect(loggerWarn).not.toHaveBeenCalledWith('当前页面无对应hook脚本', '/web/geek/chat')
+  })
+
+  it('requires the same page and bridge token before consuming a background wake', async () => {
+    await ((await import('../entrypoints/main-world')).default as unknown as () => void)()
+    await vi.waitFor(() => expect(consumePendingGreetings).toHaveBeenCalled())
+    consumePendingGreetings.mockClear()
+    const message = { type: 'agent-delivery:pending-greeting-wake', bridgeToken: 'wrong-token' }
+    window.dispatchEvent(
+      new MessageEvent('message', { source: window, origin: location.origin, data: message }),
+    )
+    expect(consumePendingGreetings).not.toHaveBeenCalled()
+    message.bridgeToken = 'test-bridge-token'
+    window.dispatchEvent(
+      new MessageEvent('message', {
+        source: window,
+        origin: 'https://other.example',
+        data: message,
+      }),
+    )
+    expect(consumePendingGreetings).not.toHaveBeenCalled()
+    window.dispatchEvent(
+      new MessageEvent('message', { source: window, origin: location.origin, data: message }),
+    )
+    await vi.waitFor(() => expect(consumePendingGreetings).toHaveBeenCalled())
   })
 
   it('ignores a stale job UI import after a newer route has already hidden the popup', async () => {

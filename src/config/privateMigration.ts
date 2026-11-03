@@ -100,6 +100,7 @@ export async function migratePrivateConfigV1(
   })
   bundle.profile = {
     displayName: typeof resumeEvidence.name === 'string' ? resumeEvidence.name.trim() : '',
+    targetRole: '',
     resume: {
       markdown: input.resumeMarkdown,
       sourceHash: await hashResumeMarkdown(input.resumeMarkdown),

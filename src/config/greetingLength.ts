@@ -3,7 +3,8 @@ import type { AiTaskConfig } from './types'
 export const GREETING_LENGTH_VARIANCE = 25
 export const GREETING_TARGET_MIN = 45
 export const GREETING_TARGET_MAX = 475
-export const DEFAULT_GREETING_TARGET = 150
+// 默认话术分五部分（身份、项目、能力、价值、收尾），150 字只放得下两部分。
+export const DEFAULT_GREETING_TARGET = 220
 
 export function greetingTargetFromTask(task: AiTaskConfig['aiGreeting']) {
   return Math.round((Number(task.minTotalCharacters) + Number(task.maxTotalCharacters)) / 2)

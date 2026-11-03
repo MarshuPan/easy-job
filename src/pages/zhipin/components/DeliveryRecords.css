@@ -34,6 +34,21 @@
   gap: 8px;
 }
 
+.delivery-records__health {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e2e5e9;
+  color: var(--agent-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.delivery-records__health span {
+  white-space: nowrap;
+}
+
 .delivery-records__table-wrap {
   max-width: 100%;
 }

@@ -90,6 +90,46 @@ describe('backfillStoredConfigState', () => {
     expect(cleaned).toHaveProperty('companySizeRange')
   })
 
+  it('loads version-2 resume evidence after its removed fields are pruned', () => {
+    // 证据版本 3 删掉了归属程度、置信度、领域、技能和 buckets。老用户存储里还有这些字段，
+    // 不清掉就会被严格校验判成未知字段，整份配置读不出来、面板起不来。
+    const state = createDefaultStoredConfigState()
+    state.profile.resume = {
+      markdown: '负责平台产品',
+      sourceHash: `sha256:${'0'.repeat(64)}`,
+      evidenceVersion: 2,
+      evidence: {
+        facts: [
+          {
+            id: 'fact-1',
+            sourceQuote: '负责平台产品',
+            action: '负责',
+            object: '平台产品',
+            evidenceType: 'direct_fact',
+            allowedClaimVerbs: ['负责'],
+            ownership: 'owned',
+            confidence: 'high',
+            domains: ['企业服务'],
+            skills: ['平台规划'],
+          },
+        ],
+        buckets: [],
+        claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
+      } as never,
+    }
+
+    const repaired = backfillStoredConfigState(state)
+
+    expect(() => validateStoredConfigState(repaired)).not.toThrow()
+    const resume = (repaired as ReturnType<typeof createDefaultStoredConfigState>).profile.resume
+    expect(resume.evidence).not.toHaveProperty('buckets')
+    expect(Object.keys(resume.evidence!.facts[0]).sort()).toEqual(
+      ['action', 'allowedClaimVerbs', 'evidenceType', 'id', 'object', 'sourceQuote'].sort(),
+    )
+    // 事实本身仍然可用，只是界面会因为版本落后提示重新解析。
+    expect(resume.evidenceVersion).toBe(2)
+  })
+
   it('replaces arrays wholesale rather than merging them item by item', () => {
     // 逐项合并数组会让默认值的尾巴混进用户的列表里，产生用户没配过的条目。
     const state = createDefaultStoredConfigState()

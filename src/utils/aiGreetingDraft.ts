@@ -1,7 +1,10 @@
 import type {
   ClaimMode,
   FilteringDecision,
+  GreetingAnchor,
+  GreetingAudit,
   GreetingDraft,
+  GreetingReview,
   MatchLevel,
   ResumeFact,
 } from '@/types/aiGreeting'
@@ -32,7 +35,7 @@ function normalizeFactIds(value: unknown): string[] {
     .filter((item): item is string => typeof item === 'string')
     .map((item) => item.trim())
     .filter((item) => item.length > 0)
-  return [...new Set(trimmed)].slice(0, 2)
+  return [...new Set(trimmed)]
 }
 
 export function parseFilteringDecisionContent(content: string, minScore: number) {
@@ -70,8 +73,151 @@ export function parseFilteringDecisionContent(content: string, minScore: number)
   }
 }
 
+function parseAnchor(value: unknown): GreetingAnchor | null {
+  if (typeof value !== 'object' || value == null) return null
+  const { need, jdQuote } = value as Record<string, unknown>
+  if (typeof need !== 'string' || typeof jdQuote !== 'string') return null
+  if (need.trim().length === 0 || jdQuote.trim().length === 0) return null
+  // The anchor is evidence used to compare the JD with the sent greeting.
+  // Keep the model's complete text; display layers can shorten it when needed.
+  return { need: need.trim(), jdQuote: jdQuote.trim() }
+}
+
+function parseSegmentFactIds(value: unknown, messageCount: number) {
+  if (!Array.isArray(value) || value.length !== messageCount) return null
+  const segments = value.map((segment) => {
+    if (!Array.isArray(segment)) return null
+    const ids = normalizeFactIds(segment)
+    return ids.length === segment.length ? ids : null
+  })
+  if (segments.some((segment) => segment == null)) return null
+  return segments as string[][]
+}
+
+function parseReview(value: unknown): GreetingReview | undefined {
+  if (typeof value !== 'object' || value == null) return undefined
+  const { jdQuoteFound, styleIssues, attempts, rewriteReasons } = value as Record<string, unknown>
+  if (
+    typeof jdQuoteFound !== 'boolean' ||
+    !Array.isArray(styleIssues) ||
+    !styleIssues.every((item) => typeof item === 'string') ||
+    !Number.isInteger(attempts)
+  ) {
+    return undefined
+  }
+  const reasons =
+    Array.isArray(rewriteReasons) && rewriteReasons.every((item) => typeof item === 'string')
+      ? rewriteReasons
+      : []
+  return {
+    jdQuoteFound,
+    styleIssues,
+    attempts: attempts as number,
+    ...(reasons.length > 0 ? { rewriteReasons: reasons } : {}),
+  }
+}
+
+function parseAudit(value: unknown): GreetingAudit | undefined {
+  if (typeof value !== 'object' || value == null || Array.isArray(value)) return undefined
+  const source = value as Record<string, unknown>
+  const stringList = (item: unknown) =>
+    Array.isArray(item) && item.every((entry) => typeof entry === 'string') ? item : null
+  const matchSelectedFactIds = stringList(source.matchSelectedFactIds)
+  const greetingUsedFactIds = stringList(source.greetingUsedFactIds)
+  const greetingFactIdsInMatch = stringList(source.greetingFactIdsInMatch)
+  const claimIssueCodes = stringList(source.claimIssueCodes)
+  const qualityIssueCodes = stringList(source.qualityIssueCodes)
+  const segmentAudits = Array.isArray(source.segmentAudits)
+    ? source.segmentAudits.flatMap((item) => {
+        if (typeof item !== 'object' || item == null || Array.isArray(item)) return []
+        const segment = item as Record<string, unknown>
+        const factIds = stringList(segment.factIds)
+        const segmentClaimIssueCodes = stringList(segment.claimIssueCodes)
+        if (
+          !Number.isInteger(segment.messageIndex) ||
+          (segment.messageIndex as number) < 1 ||
+          factIds == null ||
+          typeof segment.factIdsValid !== 'boolean' ||
+          typeof segment.claimBoundaryValid !== 'boolean' ||
+          segmentClaimIssueCodes == null
+        ) {
+          return []
+        }
+        return [
+          {
+            messageIndex: segment.messageIndex as number,
+            factIds,
+            factIdsValid: segment.factIdsValid,
+            claimBoundaryValid: segment.claimBoundaryValid,
+            claimIssueCodes: segmentClaimIssueCodes,
+          },
+        ]
+      })
+    : null
+  if (
+    typeof source.matchEnabled !== 'boolean' ||
+    typeof source.matchSelectedFactIdsValid !== 'boolean' ||
+    typeof source.greetingUsedFactIdsValid !== 'boolean' ||
+    typeof source.jdQuoteFound !== 'boolean' ||
+    (source.claimMode !== 'adjacent' && source.claimMode !== 'direct') ||
+    typeof source.claimBoundaryValid !== 'boolean' ||
+    matchSelectedFactIds == null ||
+    greetingUsedFactIds == null ||
+    greetingFactIdsInMatch == null ||
+    claimIssueCodes == null ||
+    qualityIssueCodes == null ||
+    typeof source.segmentFactMappingComplete !== 'boolean' ||
+    segmentAudits == null
+  ) {
+    return undefined
+  }
+  const matchPercent =
+    typeof source.matchPercent === 'number' && Number.isFinite(source.matchPercent)
+      ? source.matchPercent
+      : undefined
+  const matchThreshold =
+    typeof source.matchThreshold === 'number' && Number.isFinite(source.matchThreshold)
+      ? source.matchThreshold
+      : undefined
+  const resumeEvidenceVersion =
+    Number.isInteger(source.resumeEvidenceVersion) && (source.resumeEvidenceVersion as number) > 0
+      ? (source.resumeEvidenceVersion as number)
+      : undefined
+  const resumeSourceHash =
+    typeof source.resumeSourceHash === 'string' &&
+    /^sha256:[a-f0-9]{64}$/.test(source.resumeSourceHash)
+      ? source.resumeSourceHash
+      : undefined
+  return {
+    matchEnabled: source.matchEnabled,
+    ...(matchPercent == null ? {} : { matchPercent }),
+    ...(matchThreshold == null ? {} : { matchThreshold }),
+    matchSelectedFactIds,
+    matchSelectedFactIdsValid: source.matchSelectedFactIdsValid,
+    greetingUsedFactIds,
+    greetingUsedFactIdsValid: source.greetingUsedFactIdsValid,
+    greetingFactIdsInMatch,
+    ...(typeof source.maxFacts === 'number' ? { maxFacts: source.maxFacts } : {}),
+    ...(typeof source.factCountWithinLimit === 'boolean'
+      ? { factCountWithinLimit: source.factCountWithinLimit }
+      : {}),
+    segmentFactMappingComplete: source.segmentFactMappingComplete,
+    segmentAudits,
+    jdQuoteFound: source.jdQuoteFound,
+    claimMode: source.claimMode,
+    claimBoundaryValid: source.claimBoundaryValid,
+    claimIssueCodes,
+    qualityIssueCodes,
+    ...(resumeEvidenceVersion == null ? {} : { resumeEvidenceVersion }),
+    ...(resumeSourceHash == null ? {} : { resumeSourceHash }),
+    ...(typeof source.resumeEvidenceMatches === 'boolean'
+      ? { resumeEvidenceMatches: source.resumeEvidenceMatches }
+      : {}),
+  }
+}
+
 export function parseGreetingDraft(content: string, messageCount = 3): GreetingDraft {
-  const parsed = parseGptJson<Partial<GreetingDraft>>(content)
+  const parsed = parseGptJson<Record<string, unknown>>(content)
   const messages = Array.isArray(parsed?.messages)
     ? parsed.messages.map((item) => (typeof item === 'string' ? item.trim() : ''))
     : []
@@ -80,19 +226,45 @@ export function parseGreetingDraft(content: string, messageCount = 3): GreetingD
   }
 
   const usedFactIds = normalizeFactIds(parsed?.usedFactIds)
+  const anchor = parseAnchor(parsed?.anchor)
+  const segmentFactIds = parseSegmentFactIds(parsed?.segmentFactIds, messageCount)
+  const mappedFactIds = new Set(segmentFactIds?.flat() ?? [])
   if (
     usedFactIds.length === 0 ||
-    (parsed?.claimMode !== 'adjacent' && parsed?.claimMode !== 'direct') ||
-    typeof parsed?.openingPattern !== 'string' ||
-    parsed.openingPattern.trim().length === 0
+    anchor == null ||
+    segmentFactIds == null ||
+    mappedFactIds.size !== usedFactIds.length ||
+    usedFactIds.some((id) => !mappedFactIds.has(id)) ||
+    [...mappedFactIds].some((id) => !usedFactIds.includes(id))
   ) {
     throw new GreetError('AI招呼语元数据不完整')
   }
 
+  const review = parseReview(parsed?.review)
+  const audit = parseAudit(parsed?.audit)
+  const promptFingerprint =
+    typeof parsed?.promptFingerprint === 'string' &&
+    /^sha256:[a-f0-9]{64}$/.test(parsed.promptFingerprint)
+      ? parsed.promptFingerprint
+      : undefined
+  const resumeEvidenceVersion =
+    Number.isInteger(parsed?.resumeEvidenceVersion) && (parsed?.resumeEvidenceVersion as number) > 0
+      ? (parsed?.resumeEvidenceVersion as number)
+      : undefined
+  const resumeSourceHash =
+    typeof parsed?.resumeSourceHash === 'string' &&
+    /^sha256:[a-f0-9]{64}$/.test(parsed.resumeSourceHash)
+      ? parsed.resumeSourceHash
+      : undefined
   return {
+    anchor,
     messages,
     usedFactIds,
-    claimMode: parsed.claimMode,
-    openingPattern: parsed.openingPattern.trim().slice(0, 40),
+    segmentFactIds,
+    ...(resumeEvidenceVersion == null ? {} : { resumeEvidenceVersion }),
+    ...(resumeSourceHash == null ? {} : { resumeSourceHash }),
+    ...(review ? { review } : {}),
+    ...(audit ? { audit } : {}),
+    ...(promptFingerprint ? { promptFingerprint } : {}),
   }
 }

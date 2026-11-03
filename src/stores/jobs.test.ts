@@ -4,6 +4,7 @@ const {
   clickJobCardAction,
   cacheReadyMock,
   currentSource,
+  localDiagnosticAppendMock,
   logInfoMock,
   requestDetailMock,
   storageData,
@@ -15,6 +16,7 @@ const {
   clickJobCardAction: vi.fn(async () => undefined),
   cacheReadyMock: vi.fn(async (): Promise<void> => undefined),
   currentSource: { value: 'search' as 'search' | 'group' },
+  localDiagnosticAppendMock: vi.fn(async (_event: { event?: string; data?: any }) => true),
   logInfoMock: vi.fn(),
   requestDetailMock: vi.fn(),
   storageData: new Map<string, unknown>(),
@@ -59,6 +61,7 @@ vi.mock('@/message', () => ({
     storageGet: storageGetMock,
     storageRm: storageRmMock,
     storageSet: storageSetMock,
+    localDiagnosticAppend: localDiagnosticAppendMock,
   },
 }))
 
@@ -73,6 +76,7 @@ vi.mock('@/utils/logger', () => ({
 vi.mock('@/stores/log', () => ({
   useLog: () => ({
     info: logInfoMock,
+    debug: logInfoMock,
   }),
 }))
 
@@ -231,6 +235,7 @@ describe('JobList', () => {
     })
     logInfoMock.mockClear()
     cacheReadyMock.mockResolvedValue(undefined)
+    localDiagnosticAppendMock.mockClear()
   })
 
   it('restores filtered jobs as a distinct terminal state', async () => {
@@ -249,6 +254,7 @@ describe('JobList', () => {
     })
 
     const list = new JobList()
+    await list.setAccountScope('account-a')
     await list.initJobList({ useCache: { value: false } } as any)
 
     expect(list.listBySource('search')[0]?.status).toMatchObject({
@@ -343,6 +349,26 @@ describe('JobList', () => {
     list.setDeliveryPoolCaptureEnabled(true)
     expect(list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')).toBe(1)
     expect(list.listBySource('search').map((item) => item.encryptJobId)).toEqual(['page-job-1'])
+  })
+
+  it('mirrors the complete raw platform job in acquisition diagnostics', async () => {
+    const raw = job({ encryptJobId: 'raw-audit-job' }) as any
+    raw.unmodeledPlatformField = { recruiterExperiment: 'variant-b', rank: 17 }
+    vueJobList.push(raw)
+
+    const list = new JobList()
+    await list.setAccountScope('account-a')
+    await list.initJobList({ useCache: { value: false } } as any)
+    list.setDeliveryPoolCaptureEnabled(true)
+    expect(list.captureCurrentPageToDeliveryPool('search', undefined, 'AI 产品经理')).toBe(1)
+    await Promise.resolve()
+
+    const audit = localDiagnosticAppendMock.mock.calls.find(
+      ([input]) => input.event === 'acquisition.page-captured',
+    )?.[0]
+    expect(audit?.data.rawJobs[0].rawJobSnapshot).toMatchObject({
+      unmodeledPlatformField: { recruiterExperiment: 'variant-b', rank: 17 },
+    })
   })
 
   it('does not make old credentials look fresh when recapturing an unchanged page', async () => {
@@ -1214,6 +1240,7 @@ describe('config scope still evicts jobs from a disabled source', () => {
     vi.clearAllMocks()
     storageData.clear()
     vueJobList.length = 0
+    localDiagnosticAppendMock.mockClear()
   })
 
   it('drops queued jobs when the whole source is turned off', async () => {

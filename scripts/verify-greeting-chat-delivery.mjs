@@ -18,7 +18,7 @@ const pendingGreetingSource = await readFile(
   'utf8',
 )
 
-const openChatStart = backgroundSource.indexOf('async openChatTab(url: string)')
+const openChatStart = backgroundSource.indexOf('async openChatTab(')
 assert.notEqual(openChatStart, -1, 'openChatTab should exist')
 // 以「下一个方法」而不是某个具名方法收尾：原来锚在 request() 上，那个桥被删掉之后
 // 这里就再也切不出方法体了，检查本身变成了噪声。
@@ -28,18 +28,18 @@ const openChatTab = backgroundSource.slice(openChatStart, openChatEnd)
 
 assert.match(
   openChatTab,
-  /active:\s*true/,
-  'chat tab should be activated so the page can consume queued greetings',
+  /active:\s*false/,
+  'chat tab should stay in the background so the delivery page remains active',
 )
 assert.match(
   openChatTab,
-  /waitForTabLoaded/,
-  'openChatTab should wait for the chat page to finish loading',
+  /prepareChatRuntime/,
+  'openChatTab should verify the page runtime, account and consumer instead of relying on the load event',
 )
-assert.match(
+assert.doesNotMatch(
   openChatTab,
-  /browser\.tabs\.reload/,
-  'reused target chat tab should be refreshed to reinject main-world',
+  /browser\.tabs\.(?:reload|update)/,
+  'reused chat tabs must retain their connection instead of navigating on each greeting',
 )
 
 assert.doesNotMatch(

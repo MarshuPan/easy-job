@@ -99,7 +99,16 @@ function assertTimestamp(value: number) {
   if (!Number.isFinite(value) || value < 0) throw new Error('投递任务时间无效')
 }
 
-function assertPayloadSize(value: unknown, label: string, maxCharacters = 500_000) {
+// A checkpoint is mirrored to the local diagnostic sink in full. Keep the
+// guard as an extreme resource boundary instead of rejecting ordinary full JD,
+// resume and prompt snapshots at an arbitrary half-megabyte.
+export const DELIVERY_TASK_MAX_PAYLOAD_CHARACTERS = 16 * 1024 * 1024
+
+function assertPayloadSize(
+  value: unknown,
+  label: string,
+  maxCharacters = DELIVERY_TASK_MAX_PAYLOAD_CHARACTERS,
+) {
   let serialized: string
   try {
     serialized = JSON.stringify(value)
@@ -517,6 +526,16 @@ export class DeliveryTaskCoordinator {
         phase: 'acquiring',
         terminalReason: undefined,
         terminalMessage: undefined,
+        // Explicit user intent starts a fresh recovery episode. Change the
+        // authoritative checkpoint here, before any page can restore it.
+        checkpoint: (() => {
+          const resumed = structuredClone(current.checkpoint) as Record<string, unknown>
+          delete resumed.retryAt
+          delete resumed.aiUnavailableAttempts
+          delete resumed.detailRecoveryAttempts
+          delete resumed.interruption
+          return resumed
+        })(),
         workerId: request.workerId,
         leaseExpiresAt: now + DELIVERY_WORKER_LEASE_MS,
         lastWorkerAt: now,
@@ -708,7 +727,7 @@ export class DeliveryTaskCoordinator {
         status: terminalStatus(request.reason),
         terminalReason: request.reason,
         ...(request.message?.trim()
-          ? { terminalMessage: request.message.trim().slice(0, 512) }
+          ? { terminalMessage: request.message }
           : { terminalMessage: undefined }),
         updatedAt: now,
         revision: current.revision + 1,

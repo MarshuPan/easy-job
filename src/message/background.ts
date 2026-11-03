@@ -3,11 +3,18 @@ import { checkMessage, defineProxy } from 'comctx'
 
 import type { Browser } from '#imports'
 import { browser, storage } from '#imports'
+import { prepareChatRuntime } from '@/background/chatRuntime'
 import { ConfigService, type AiTaskExecutionConfig } from '@/background/configService'
 import { createBrowserConfigStorage } from '@/background/configStorage'
 import { DeliveryTaskCoordinator } from '@/background/deliveryTaskCoordinator'
+import type { DeliveryTaskMutationResult } from '@/background/deliveryTaskCoordinator'
 import { createBrowserDeliveryTaskStorage } from '@/background/deliveryTaskStorage'
-import { appendAccountRuntimeLog, createAccountAiRuntimeLogger } from '@/background/runtimeLogs'
+import { appendLocalDiagnosticEvent } from '@/background/localDiagnosticSink'
+import {
+  appendAccountRuntimeLog,
+  appendAiTaskFailure,
+  createAccountAiRuntimeLogger,
+} from '@/background/runtimeLogs'
 import { validateAiModelConfig } from '@/config/validate'
 import {
   CONFIG_REVISION_CHANGED_TYPE,
@@ -28,7 +35,15 @@ import {
   DELIVERY_WORKER_IDENTITY_RESPONSE_TYPE,
   isDeliveryWorkerIdentityRequest,
 } from '@/message/types'
-import type { GreetingDraft, GreetingRegenerationContext } from '@/types/aiGreeting'
+import { getJobGroupTargetIds } from '@/pages/zhipin/utils/jobExpectations'
+import { resolveTargetRole } from '@/profile/targetRole'
+import type {
+  GreetingAudit,
+  GreetingDraft,
+  GreetingRegenerationContext,
+  GreetingFilteringContext,
+  SelectedGreetingFact,
+} from '@/types/aiGreeting'
 import {
   deriveClaimModeFromFacts,
   parseFilteringDecisionContent,
@@ -43,8 +58,11 @@ import {
 } from '@/utils/aiTaskPrompts'
 import { runConfiguredAiTask, testConfiguredAiModel } from '@/utils/backgroundAi'
 import {
+  AiTaskRequestValidationError,
   AiTaskResponseInvalidError,
+  AI_TASK_REQUEST_TYPE,
   createAiTaskResponse,
+  getAiTaskRequestValidationError,
   isAiTaskRequestMessage,
   type AiTaskData,
   type AiTaskType,
@@ -55,7 +73,16 @@ import {
   getCurrentAppVersion,
   isExtensionBackgroundProbeRequest,
 } from '@/utils/extensionRuntimeHealth'
-import { validateGreetingDraft } from '@/utils/greetingQuality'
+import {
+  buildGreetingDiversityContext,
+  jdQuoteAppears,
+  OVERUSED_PRIMARY_FACT_COUNT,
+} from '@/utils/greetingDiversity'
+import {
+  type GreetingQualityIssue,
+  STYLE_ISSUE_CODES,
+  validateGreetingDraft,
+} from '@/utils/greetingQuality'
 import { assertHttpUrl } from '@/utils/httpGuards'
 import { listGreetingCandidateFacts, resolveSelectedGreetingFacts } from '@/utils/resumeEvidence'
 import { toStructuredCloneSafeValue } from '@/utils/safeJson'
@@ -186,6 +213,71 @@ function sanitizeMetadataString(value: unknown, maxLength = 2_048) {
   return typeof value === 'string' ? value.slice(0, maxLength) : ''
 }
 
+/**
+ * Task checkpoints are business evidence for local diagnosis. Keep their full
+ * shape, but remove the raw account UID because the event envelope already
+ * carries a stable anonymous account identity.
+ */
+function localTaskSnapshot(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(localTaskSnapshot)
+  if (value == null || typeof value !== 'object') return value
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== 'accountUid')
+      .map(([key, item]) => [key, localTaskSnapshot(item)]),
+  )
+}
+
+function mirrorTaskMutation(
+  action: string,
+  request: { uid: string; runId: string },
+  result: DeliveryTaskMutationResult,
+) {
+  const task = result.task
+  const { uid: _uid, ...requestSnapshot } = request as typeof request & Record<string, unknown>
+  void appendLocalDiagnosticEvent({
+    stream: 'tasks',
+    event: `task.${action}`,
+    accountUid: request.uid,
+    at: task?.updatedAt ?? Date.now(),
+    data: {
+      runId: request.runId,
+      accepted: result.accepted,
+      conflict: result.conflict,
+      status: task?.status,
+      phase: task?.phase,
+      revision: task?.revision,
+      terminalReason: task?.terminalReason,
+      terminalMessage: task?.terminalMessage,
+      requestSnapshot: localTaskSnapshot(requestSnapshot),
+      taskSnapshot: localTaskSnapshot(task),
+      checkpointSnapshot: localTaskSnapshot(task?.checkpoint),
+      configSnapshot: localTaskSnapshot(task?.configSnapshot),
+    },
+  }).catch(() => undefined)
+}
+
+function mirrorTaskMutationFailure(
+  action: string,
+  request: { uid: string; runId: string },
+  error: unknown,
+) {
+  const { uid: _uid, ...requestSnapshot } = request as typeof request & Record<string, unknown>
+  void appendLocalDiagnosticEvent({
+    stream: 'tasks',
+    event: `task.${action}.failed`,
+    accountUid: request.uid,
+    data: {
+      accepted: false,
+      requestSnapshot: localTaskSnapshot(requestSnapshot),
+      error:
+        error instanceof Error
+          ? { name: error.name, message: error.message, cause: localTaskSnapshot(error.cause) }
+          : localTaskSnapshot(error),
+    },
+  }).catch(() => undefined)
+}
+
 export class BackgroundCounter implements BackgroundCounterApi {
   async accountState(uid: string): Promise<AccountStateSnapshot | null> {
     if (typeof uid !== 'string' || uid.length === 0) {
@@ -276,31 +368,50 @@ export class BackgroundCounter implements BackgroundCounterApi {
     return true
   }
 
-  async openChatTab(url: string) {
+  async openChatTab(url: string, expectedUid: string) {
     assertZhipinChatUrl(url)
+    if (!expectedUid?.trim()) throw new Error('聊天页就绪检查缺少投递账号')
     const tabs = await browser.tabs.query({
       url: ['*://zhipin.com/web/geek/chat*', '*://*.zhipin.com/web/geek/chat*'],
     })
     const existing =
       tabs.find((tab) => tab.id != null && isSameGeekChatUrl(tab.url, url)) ??
       tabs.find((tab) => tab.id != null)
+    // 聊天页在后台打开，不切走当前标签页。岗位页一旦被切到后台，Chrome 会在它隐藏
+    // 5 分钟后把定时器压到每分钟唤醒一次：写的是等 13 秒，实际等了 67 秒，心跳也跟着
+    // 断续，而投递流程的等待、轮询和心跳全都跑在岗位页上。
     if (existing?.id != null) {
       const sameTarget = isSameGeekChatUrl(existing.url, url)
-      await browser.tabs.update(existing.id, sameTarget ? { active: true } : { url, active: true })
-      if (sameTarget) {
-        await browser.tabs.reload(existing.id)
+      // 队列按 toUid 发消息，不依赖当前打开的会话。复用连接，避免每岗重置 WebSocket。
+      const runtime = await prepareChatRuntime(existing.id, expectedUid, true)
+      return {
+        reused: true,
+        url: existing.url ?? url,
+        active: false,
+        sameTarget,
+        ...runtime,
       }
-      const loaded = await waitForTabLoaded(existing.id)
-      return { tabId: existing.id, reused: true, url, active: true, reloaded: sameTarget, loaded }
     }
 
-    const tab = await browser.tabs.create({ url, active: true })
-    const loaded = tab.id != null ? await waitForTabLoaded(tab.id) : false
-    return { tabId: tab.id, reused: false, url, active: true, reloaded: false, loaded }
+    const tab = await browser.tabs.create({ url, active: false })
+    if (tab.id == null) throw new Error('未能创建聊天页标签')
+    const runtime = await prepareChatRuntime(tab.id, expectedUid, false)
+    return { reused: false, url, active: false, ...runtime }
   }
 
-  async runAiTask(args: { task: AiTaskType; data: AiTaskData; json?: boolean }) {
+  async runAiTask(args: {
+    task: AiTaskType
+    data: AiTaskData
+    json?: boolean
+    requestId?: string
+  }) {
     return runAiTask(args)
+  }
+
+  async localDiagnosticAppend(
+    event: import('@/background/localDiagnosticSink').LocalDiagnosticEventInput,
+  ) {
+    return appendLocalDiagnosticEvent(event)
   }
 
   async configRuntime(uid: string) {
@@ -336,43 +447,92 @@ export class BackgroundCounter implements BackgroundCounterApi {
   async deliveryTaskStart(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskStartRequest,
   ) {
-    return deliveryTaskCoordinator.start(request)
+    try {
+      const result = await deliveryTaskCoordinator.start(request)
+      mirrorTaskMutation('started', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('started', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskClaim(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskWorkerRequest,
   ) {
-    return deliveryTaskCoordinator.claim(request)
+    try {
+      const result = await deliveryTaskCoordinator.claim(request)
+      mirrorTaskMutation('claimed', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('claimed', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskCheckpoint(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskCheckpointRequest,
   ) {
-    return deliveryTaskCoordinator.checkpoint(request)
+    try {
+      const result = await deliveryTaskCoordinator.checkpoint(request)
+      mirrorTaskMutation('checkpoint', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('checkpoint', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskRelease(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskWorkerRequest,
   ) {
-    return deliveryTaskCoordinator.release(request)
+    try {
+      const result = await deliveryTaskCoordinator.release(request)
+      mirrorTaskMutation('released', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('released', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskResume(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskWorkerRequest,
   ) {
-    return deliveryTaskCoordinator.resume(request)
+    try {
+      const result = await deliveryTaskCoordinator.resume(request)
+      mirrorTaskMutation('resumed', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('resumed', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskPause(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskWorkerRequest,
   ) {
-    return deliveryTaskCoordinator.pause(request)
+    try {
+      const result = await deliveryTaskCoordinator.pause(request)
+      mirrorTaskMutation('paused', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('paused', request, error)
+      throw error
+    }
   }
 
   async deliveryTaskTerminate(
     request: import('@/background/deliveryTaskCoordinator').DeliveryTaskTerminateRequest,
   ) {
-    return deliveryTaskCoordinator.terminate(request)
+    try {
+      const result = await deliveryTaskCoordinator.terminate(request)
+      mirrorTaskMutation('terminated', request, result)
+      return result
+    } catch (error) {
+      mirrorTaskMutationFailure('terminated', request, error)
+      throw error
+    }
   }
 
   async backgroundTest(type: 'success' | 'error') {
@@ -395,17 +555,17 @@ function assertZhipinChatUrl(url: string) {
   }
 }
 
-async function waitForTabLoaded(tabId: number, timeoutMs = 30000) {
-  const start = Date.now()
-  while (Date.now() - start < timeoutMs) {
-    const tab = await browser.tabs.get(tabId)
-    if (tab.status === 'complete') return true
-    await new Promise((resolve) => setTimeout(resolve, 250))
-  }
-  return false
-}
-
 browser.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type !== AI_TASK_REQUEST_TYPE || typeof message.requestId !== 'string') {
+    return
+  }
+  const validationError = getAiTaskRequestValidationError(message)
+  if (validationError) {
+    if (sender.tab?.id == null) return
+    const error = new AiTaskRequestValidationError(validationError)
+    void appendAiTaskFailure(message, 'request-validation', error)
+    return createAiTaskResponse(message.requestId, { ok: false, error })
+  }
   if (!isAiTaskRequestMessage(message)) return
 
   const tabId = sender.tab?.id
@@ -420,7 +580,12 @@ browser.runtime.onMessage.addListener((message, sender) => {
     return createAiTaskResponse(message.requestId, { ok: false, error: admission.error })
   }
 
-  return runAiTask({ task: message.task, data: message.data, json: message.json })
+  return runAiTask({
+    task: message.task,
+    data: message.data,
+    json: message.json,
+    requestId: message.requestId,
+  })
     .then((data) => createAiTaskResponse(message.requestId, { ok: true, data }))
     .catch((error) => createAiTaskResponse(message.requestId, { ok: false, error }))
     .finally(admission.release)
@@ -486,6 +651,7 @@ async function handleConfigRequest(message: ConfigRequest) {
         message.requestId,
         await configService.saveProfileDraft({
           displayName: message.displayName,
+          targetRole: message.targetRole,
           markdown: message.markdown,
         }),
       )
@@ -610,8 +776,151 @@ function configuredJobData(data: AiTaskData) {
   }
 }
 
+/**
+ * 招呼语只需要知道这份工作做什么、是谁在招。通勤距离、福利、薪资、招聘者在线状态这些
+ * 对匹配有用，对写开场白没用，给了模型反而可能被写进去。
+ */
+function greetingJobData(data: AiTaskData) {
+  return {
+    data: pickAiFields(data.data, ['jobName', 'jobLabels', 'skills', 'brandName', 'brandIndustry']),
+    card: pickAiFields(data.card, ['jobName', 'postDescription', 'jobLabels', 'bossTitle']),
+  }
+}
+
+interface GreetingCandidate {
+  draft: GreetingDraft
+  issues: GreetingQualityIssue[]
+  result: object
+  attempts: number
+  /** 触发这次重写的问题。 */
+  rewriteReasons: string[]
+}
+
+function createGreetingAudit(args: {
+  draft: GreetingDraft
+  issues: GreetingQualityIssue[]
+  jobText: string
+  filtering?: GreetingFilteringContext
+  filteringThreshold?: number
+  facts: SelectedGreetingFact[]
+  resumeEvidenceVersion?: number
+  resumeSourceHash?: string | null
+}): GreetingAudit {
+  const matchSelectedFactIds = [...(args.filtering?.selectedFactIds ?? [])]
+  const factIds = new Set(args.facts.map((fact) => fact.id))
+  const greetingUsedFactIds = [...args.draft.usedFactIds]
+  const greetingUsedFactIdsValid =
+    greetingUsedFactIds.length > 0 && greetingUsedFactIds.every((id) => factIds.has(id))
+  const matchSelectedFactIdsValid =
+    !args.filtering ||
+    (matchSelectedFactIds.length > 0 && matchSelectedFactIds.every((id) => factIds.has(id)))
+  const greetingFactIdsInMatch = greetingUsedFactIds.filter((id) =>
+    matchSelectedFactIds.includes(id),
+  )
+  const claimIssueCodes = args.issues
+    .filter((issue) => issue.code === 'FACT_NOT_ALLOWED' || issue.code === 'FORBIDDEN_CLAIM')
+    .map((issue) => issue.code)
+  const usedFacts = args.facts.filter((fact) => greetingUsedFactIds.includes(fact.id))
+  const factIdsValidSet = new Set(args.facts.map((fact) => fact.id))
+  const segmentAudits = args.draft.messages.map((_, index) => {
+    const factIds = args.draft.segmentFactIds[index] ?? []
+    const factIdsValid =
+      new Set(factIds).size === factIds.length && factIds.every((id) => factIdsValidSet.has(id))
+    const claimIssueCodes = args.issues
+      .filter((issue) => issue.messageIndex === index + 1 && issue.code === 'FORBIDDEN_CLAIM')
+      .map((issue) => issue.code)
+    return {
+      messageIndex: index + 1,
+      factIds: [...factIds],
+      factIdsValid,
+      claimBoundaryValid: factIdsValid && claimIssueCodes.length === 0,
+      claimIssueCodes: [...new Set(claimIssueCodes)],
+    }
+  })
+  const mappedFactIds = new Set(segmentAudits.flatMap((segment) => segment.factIds))
+  const segmentFactMappingComplete =
+    segmentAudits.every((segment) => segment.factIdsValid) &&
+    mappedFactIds.size === greetingUsedFactIds.length &&
+    greetingUsedFactIds.every((id) => mappedFactIds.has(id))
+  const jdQuoteFound =
+    !args.jobText.trim() || jdQuoteAppears(args.jobText, args.draft.anchor.jdQuote)
+  return {
+    matchEnabled: args.filtering != null,
+    ...(args.filtering?.matchPercent == null ? {} : { matchPercent: args.filtering.matchPercent }),
+    ...(args.filtering == null || args.filteringThreshold == null
+      ? {}
+      : { matchThreshold: args.filteringThreshold }),
+    matchSelectedFactIds,
+    matchSelectedFactIdsValid,
+    greetingUsedFactIds,
+    greetingUsedFactIdsValid,
+    greetingFactIdsInMatch,
+    segmentFactMappingComplete,
+    segmentAudits,
+    jdQuoteFound,
+    claimMode: deriveClaimModeFromFacts(usedFacts),
+    claimBoundaryValid: greetingUsedFactIdsValid && claimIssueCodes.length === 0,
+    claimIssueCodes: [...new Set(claimIssueCodes)],
+    qualityIssueCodes: [...new Set(args.issues.map((issue) => issue.code))],
+    ...(args.resumeEvidenceVersion == null
+      ? {}
+      : { resumeEvidenceVersion: args.resumeEvidenceVersion }),
+    ...(args.resumeSourceHash ? { resumeSourceHash: args.resumeSourceHash } : {}),
+    ...(args.resumeEvidenceVersion == null && !args.resumeSourceHash
+      ? {}
+      : { resumeEvidenceMatches: true }),
+  }
+}
+
+/** 放行一稿，并附上复核结果：体检统计 JD 摘录命中率、剩下的风格问题、重写次数和原因。 */
+function acceptedGreeting(
+  candidate: GreetingCandidate,
+  jobText: string,
+  auditContext: Omit<Parameters<typeof createGreetingAudit>[0], 'draft' | 'issues' | 'jobText'>,
+) {
+  const { draft, issues, result, attempts, rewriteReasons } = candidate
+  const review = {
+    jdQuoteFound: !jobText.trim() || jdQuoteAppears(jobText, draft.anchor.jdQuote),
+    styleIssues: issues.map((item) => item.code),
+    attempts,
+    ...(rewriteReasons.length > 0 ? { rewriteReasons } : {}),
+  }
+  const audit = createGreetingAudit({ ...auditContext, draft, issues, jobText })
+  const auditedDraft: GreetingDraft = {
+    ...draft,
+    resumeEvidenceVersion: audit.resumeEvidenceVersion,
+    ...(audit.resumeSourceHash ? { resumeSourceHash: audit.resumeSourceHash } : {}),
+    review,
+    audit,
+  }
+  return { ...result, content: JSON.stringify(auditedDraft satisfies GreetingDraft) }
+}
+
+/** 核对 anchor.jdQuote 用的岗位原文：岗位名、JD 正文、标签和技能。 */
+function greetingJobText(data: AiTaskData) {
+  const fields = ['jobName', 'postDescription', 'jobLabels', 'skills']
+  return [data.data, data.card]
+    .flatMap((source) =>
+      fields.map((field) => (source as unknown as Record<string, unknown> | undefined)?.[field]),
+    )
+    .flatMap((value) => (Array.isArray(value) ? value : [value]))
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n')
+}
+
+/** 这个岗位生效的求职定位：用户填的优先，其次是岗位所属的 BOSS 求职期望。 */
+function targetRoleForJob(data: AiTaskData, execution: AiTaskExecutionConfig) {
+  const job = data.data as { expectId?: number | string; deliveryGroupTargetIds?: string[] }
+  return resolveTargetRole({
+    targetRole: execution.profile.targetRole,
+    jobExpectationIds: job ? getJobGroupTargetIds(job) : [],
+    expectations: execution.expectations,
+    resumeMarkdown: execution.profile.resume.markdown ?? undefined,
+  })
+}
+
 async function runConfiguredFilteringAiTask(
-  args: { data: AiTaskData },
+  args: { data: AiTaskData; requestId?: string },
   execution: AiTaskExecutionConfig,
 ) {
   const task = execution.task as import('@/config/types').AiTaskConfig['aiFiltering']
@@ -622,6 +931,8 @@ async function runConfiguredFilteringAiTask(
     template: buildFilteringTaskPrompt({
       task,
       evidence,
+      resumeMarkdown: execution.profile.resume.markdown ?? undefined,
+      targetRole: targetRoleForJob(args.data, execution),
       data: configuredJobData(args.data),
     }),
     data: {},
@@ -629,6 +940,9 @@ async function runConfiguredFilteringAiTask(
     jsonSchema: filteringDecisionSchema,
     onDiagnostic: createAccountAiRuntimeLogger(args.data.accountUid!),
     task: 'aiFiltering',
+    requestId: args.requestId,
+    diagnosticContext: args.data.diagnosticContext,
+    resumeMarkdown: execution.profile.resume.markdown ?? undefined,
   })
   const parsedDecision = parseFilteringDecisionContent(result.content ?? '', task.score)
   if (!parsedDecision) throw new Error('AI匹配度响应不是新格式')
@@ -649,27 +963,32 @@ async function runConfiguredFilteringAiTask(
 }
 
 async function runConfiguredGreetingAiTask(
-  args: { data: AiTaskData },
+  args: { data: AiTaskData; requestId?: string },
   execution: AiTaskExecutionConfig,
 ) {
   const task = execution.task as import('@/config/types').AiTaskConfig['aiGreeting']
   const evidence = execution.profile.resume.evidence
   if (!evidence) throw new Error('后台结构化简历证据不可用')
   const filtering = args.data.filtering
-  const candidateFacts = listGreetingCandidateFacts(evidence)
-  const selectedFacts = filtering
+  // 招呼语可以用全部事实：项目优先用匹配选出的，能力部分要从其他事实里取。
+  // 匹配选出的 ID 仍要校验——无效就说明匹配结果和当前简历对不上，不能悄悄当成没选。
+  const facts = listGreetingCandidateFacts(evidence)
+  const recentGreetings = args.data.recentGreetings ?? []
+  const diversity = buildGreetingDiversityContext(recentGreetings)
+  // 近期用得太多的事实不再作为优先项：它仍在 facts 里，确实最贴合时模型照样能用。
+  const primaryFactIds = filtering
     ? resolveSelectedGreetingFacts(evidence, filtering.selectedFactIds)
-    : candidateFacts
-  if (selectedFacts.length === 0) throw new Error('AI招呼语没有可用的简历事实')
-  if (filtering && filtering.claimMode !== deriveClaimModeFromFacts(selectedFacts)) {
-    throw new Error('AI匹配事实的声明边界无效')
-  }
-  const effectiveFiltering = filtering
+        .map((fact) => fact.id)
+        .filter((id) => (diversity.recentFactUses[id] ?? 0) < OVERUSED_PRIMARY_FACT_COUNT)
+    : []
+  if (facts.length === 0) throw new Error('AI招呼语没有可用的简历事实')
   const claimPolicy = evidence.claimPolicy
   const bossName = args.data.boss?.data?.name ?? args.data.card?.bossName
   const candidateExperience = extractCandidateExperience(execution.profile.resume.markdown)
-  const recentGreetings = args.data.recentGreetings ?? []
+  const jobText = greetingJobText(args.data)
   let regeneration: GreetingRegenerationContext | null = null
+  // 只剩风格问题的最近一稿：重写后仍有风格问题就发它；重写反而出了事实问题，就退回上一稿。
+  let styleOnly: GreetingCandidate | null = null
 
   for (let qualityAttempt = 0; qualityAttempt < 2; qualityAttempt += 1) {
     const result = await runConfiguredAiTask({
@@ -679,23 +998,33 @@ async function runConfiguredGreetingAiTask(
         bossName,
         candidateName: execution.profile.displayName,
         candidateExperience,
+        targetRole: targetRoleForJob(args.data, execution),
         claimPolicy,
-        filtering: effectiveFiltering,
-        job: configuredJobData(args.data),
-        recentGreetings,
+        matchReason: filtering?.reason,
+        job: greetingJobData(args.data),
+        diversity,
         regeneration,
-        selectedFacts,
+        facts,
+        primaryFactIds,
       }),
       data: {},
       json: true,
       jsonSchema: greetingDraftSchema(task.messageCount),
       onDiagnostic: createAccountAiRuntimeLogger(args.data.accountUid!),
       task: 'aiGreeting',
+      requestId: args.requestId,
+      diagnosticContext: args.data.diagnosticContext,
+      resumeMarkdown: execution.profile.resume.markdown ?? undefined,
     })
 
     let draft: GreetingDraft
     try {
       draft = parseGreetingDraft(result.content ?? '', task.messageCount)
+      const promptDigest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(task.prompt),
+      )
+      draft.promptFingerprint = `sha256:${Array.from(new Uint8Array(promptDigest), (value) => value.toString(16).padStart(2, '0')).join('')}`
     } catch {
       regeneration = {
         issues: [{ code: 'SCHEMA_INVALID', message: '返回值必须符合招呼语JSON结构' }],
@@ -707,37 +1036,67 @@ async function runConfiguredGreetingAiTask(
     const issues = validateGreetingDraft({
       candidateName: execution.profile.displayName,
       draft,
-      filtering: effectiveFiltering,
-      selectedFacts,
+      selectedFacts: facts,
       claimPolicy,
       length: {
         messageCount: task.messageCount,
         minTotalCharacters: task.minTotalCharacters,
         maxTotalCharacters: task.maxTotalCharacters,
       },
+      jobText,
+      avoidPhrases: diversity.avoidPhrases,
+      recentMessages: recentGreetings.map((greeting) => greeting.messages),
     })
-    const blockingIssues = issues.filter(
-      (issue) => issue.code !== 'TOTAL_TOO_SHORT' && issue.code !== 'TOTAL_TOO_LONG',
-    )
-    if (blockingIssues.length === 0) {
-      const { prompt: _prompt, ...publicResult } = result
-      return { ...publicResult, content: JSON.stringify(draft) }
+    const { prompt: _prompt, ...publicResult } = result
+    const candidate = {
+      draft,
+      issues,
+      result: publicResult,
+      attempts: qualityAttempt + 1,
+      rewriteReasons: regeneration?.issues.map((item) => item.code) ?? [],
     }
+    const auditContext = {
+      filtering,
+      filteringThreshold: args.data.filteringThreshold,
+      facts,
+      resumeEvidenceVersion: execution.profile.resume.evidenceVersion,
+      resumeSourceHash: execution.profile.resume.sourceHash,
+    }
+    if (issues.length === 0) return acceptedGreeting(candidate, jobText, auditContext)
+    if (issues.every((item) => STYLE_ISSUE_CODES.has(item.code))) styleOnly = candidate
     regeneration = { draft, issues }
   }
+  if (styleOnly)
+    return acceptedGreeting(styleOnly, jobText, {
+      filtering,
+      filteringThreshold: args.data.filteringThreshold,
+      facts,
+      resumeEvidenceVersion: execution.profile.resume.evidenceVersion,
+      resumeSourceHash: execution.profile.resume.sourceHash,
+    })
   throw new AiTaskResponseInvalidError(
     2,
     regeneration?.issues.map((issue) => issue.code) ?? ['SCHEMA_INVALID'],
   )
 }
 
-async function runAiTask(args: { task: AiTaskType; data: AiTaskData; json?: boolean }) {
-  if (!args.data.accountUid) throw new Error('AI任务缺少当前 BOSS 账号')
-  const execution = await configService.getAiTaskExecutionConfig(args.data.accountUid, args.task)
-  if (!execution) throw new Error('当前账号尚未初始化统一配置')
-  return args.task === 'aiGreeting'
-    ? runConfiguredGreetingAiTask(args, execution)
-    : runConfiguredFilteringAiTask(args, execution)
+async function runAiTask(args: {
+  task: AiTaskType
+  data: AiTaskData
+  json?: boolean
+  requestId?: string
+}) {
+  try {
+    if (!args.data.accountUid) throw new Error('AI任务缺少当前 BOSS 账号')
+    const execution = await configService.getAiTaskExecutionConfig(args.data.accountUid, args.task)
+    if (!execution) throw new Error('当前账号尚未初始化统一配置')
+    return await (args.task === 'aiGreeting'
+      ? runConfiguredGreetingAiTask(args, execution)
+      : runConfiguredFilteringAiTask(args, execution))
+  } catch (error) {
+    void appendAiTaskFailure(args, 'execution', error)
+    throw error
+  }
 }
 
 interface MessageMeta {

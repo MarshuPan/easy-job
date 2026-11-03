@@ -163,6 +163,7 @@ export function runBackgroundAiTask(args: {
   data: AiTaskData
   json?: boolean
   timeout?: number
+  diagnosticContext?: import('@/utils/backgroundAiProtocol').AiDiagnosticContext
 }) {
   const requestId = createBackgroundRequestId()
   const timeout = args.timeout ?? 180
@@ -194,12 +195,19 @@ export function runBackgroundAiTask(args: {
     }
 
     window.addEventListener('message', onMessage)
+    const requestData: AiTaskData = {
+      ...args.data,
+      diagnosticContext: {
+        ...(args.data.diagnosticContext ?? {}),
+        ...(args.diagnosticContext ?? {}),
+      },
+    }
     window.postMessage(
       {
         type: AI_TASK_REQUEST_TYPE,
         requestId,
         task: args.task,
-        data: toSafeJsonValue(args.data),
+        data: toSafeJsonValue(requestData),
         json: args.json,
         bridgeToken,
       },

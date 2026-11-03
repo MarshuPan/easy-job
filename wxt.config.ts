@@ -49,14 +49,16 @@ export default defineConfig({
     default_locale: 'zh_CN',
     name: 'Easy Job',
     description: 'AI 求职投递助手，支持岗位筛选、AI 匹配度评估、分段打招呼和投递记录管理。',
-    permissions: ['storage', 'cookies', 'tabs'],
+    // The local diagnostic outbox must survive a receiver outage without evicting
+    // business evidence just because the normal 10 MiB storage quota was reached.
+    permissions: ['storage', 'unlimitedStorage', 'cookies', 'tabs', 'alarms'],
     web_accessible_resources: [
       {
         resources: ['main-world.js', 'options.html', 'icons/logo.png'],
         matches,
       },
     ],
-    host_permissions: ['*://zhipin.com/*', '*://*.zhipin.com/*'],
+    host_permissions: ['*://zhipin.com/*', '*://*.zhipin.com/*', 'http://127.0.0.1:3210/*'],
     optional_host_permissions: optionalOrigins,
     ...(browser === 'firefox' ? firefoxManifest : {}),
   }),

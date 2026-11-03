@@ -34,54 +34,66 @@ describe('delivery source queue scheduler', () => {
     })
   })
 
-  it('consumes the persisted queue in FIFO order without rebuilding a source ratio', () => {
-    const group = jobs('group', 20).map((id, index) => ({ id, order: index + 1 }))
-    const search = jobs('search', 20).map((id, index) => ({ id, order: index + 21 }))
+  // 2026-09-24 用户确认：每批按来源比例分名额，来源内凭据越新越先。原来按入库先后 FIFO、
+  // 不按比例——设的是求职期望 50% / 搜索 50%，一整天投的全是求职期望；刷新拿到的新一页
+  // 排在二三十个旧岗位后面，轮到时凭据已经过期，那次刷新就白费了。
+  it('splits each batch by the source ratio, freshest credentials first within a source', () => {
+    const group = jobs('group', 20).map((id, index) => ({ id, order: index + 1, fetchedAt: index }))
+    const search = jobs('search', 20).map((id, index) => ({
+      id,
+      order: index + 21,
+      fetchedAt: 100 + index,
+    }))
     const weights = { group: 40, search: 60 }
 
     const first = selectDeliveryBatch({
       batchSize: 10,
       getItemKey: (item) => item.id,
       getItemOrder: (item) => item.order,
+      getItemFreshness: (item) => item.fetchedAt,
       pools: { group, search },
       weights,
     })
-    expect(first.items.map((item) => item.source)).toEqual(
-      Array.from({ length: 10 }, () => 'group'),
-    )
-    expect(first.remaining.group).toHaveLength(10)
-    expect(first.remaining.search).toHaveLength(20)
-
-    const second = selectDeliveryBatch({
-      batchSize: 10,
-      getItemKey: (item) => item.id,
-      getItemOrder: (item) => item.order,
-      pools: first.remaining,
-      weights,
-    })
-    expect(second.items.map((item) => item.source)).toEqual(
-      Array.from({ length: 10 }, () => 'group'),
-    )
-    expect(second.remaining.search).toHaveLength(20)
+    expect(first.plan).toEqual({ group: 4, search: 6 })
+    // 来源内凭据最新的先投：group-20 是最后抓到的。
+    expect(
+      first.items.filter((item) => item.source === 'group').map(({ item }) => item.id),
+    ).toEqual(['group-20', 'group-19', 'group-18', 'group-17'])
+    expect(first.remaining.group).toHaveLength(16)
+    expect(first.remaining.search).toHaveLength(14)
   })
 
-  it('builds the queue preview from acquisition order rather than source ratio', () => {
-    const group = jobs('group', 40).map((id, index) => ({ id, order: index + 1 }))
-    const search = jobs('search', 60).map((id, index) => ({ id, order: index + 41 }))
-    const preview = previewDeliveryQueue({
+  it('fills a batch from the other source when one source runs short', () => {
+    const group = jobs('group', 20).map((id, index) => ({ id, order: index + 1 }))
+    const search = jobs('search', 2).map((id, index) => ({ id, order: index + 21 }))
+
+    const batch = selectDeliveryBatch({
       batchSize: 10,
-      limit: 60,
       getItemKey: (item) => item.id,
       getItemOrder: (item) => item.order,
       pools: { group, search },
-      weights: { group: 40, search: 60 },
+      weights: { group: 50, search: 50 },
     })
 
+    expect(batch.plan).toEqual({ group: 8, search: 2 })
+  })
+
+  it('previews the queue in the same order it will be processed', () => {
+    const group = jobs('group', 40).map((id, index) => ({ id, order: index + 1 }))
+    const search = jobs('search', 60).map((id, index) => ({ id, order: index + 41 }))
+    const args = {
+      batchSize: 10,
+      getItemKey: (item: { id: string }) => item.id,
+      getItemOrder: (item: { order: number }) => item.order,
+      pools: { group, search },
+      weights: { group: 40, search: 60 },
+    }
+    const preview = previewDeliveryQueue({ ...args, limit: 60 })
+
     expect(preview).toHaveLength(60)
-    expect(preview.filter((item) => item.source === 'group')).toHaveLength(40)
-    expect(preview.filter((item) => item.source === 'search')).toHaveLength(20)
-    expect(preview.slice(0, 10).map((item) => item.source)).toEqual(
-      Array.from({ length: 10 }, () => 'group'),
+    expect(preview.slice(0, 10).filter((item) => item.source === 'group')).toHaveLength(4)
+    expect(preview.slice(0, 10).map(({ item }) => item.id)).toEqual(
+      selectDeliveryBatch(args).items.map(({ item }) => item.id),
     )
   })
 

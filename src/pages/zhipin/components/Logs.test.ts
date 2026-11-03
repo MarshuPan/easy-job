@@ -3,35 +3,28 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import Logs from './Logs.vue'
 
-const { clear, info, logData, success, writeText } = vi.hoisted(() => ({
+const { clear, eventData, info, recordData, runtimeData, success, writeText } = vi.hoisted(() => ({
   clear: vi.fn(),
   info: vi.fn(),
-  logData: {
+  eventData: {
     value: [
       {
-        title: '获取岗位',
+        title: '投递任务',
         state: 'info' as const,
         state_name: '消息',
-        message: '本次获取到 15 个',
+        message: '补池：搜索新增 15 个（翻 1 页）',
         createdAt: new Date('2026-07-06T08:33:50Z').getTime(),
       },
+    ] as any[],
+  },
+  runtimeData: {
+    value: [
       {
-        title: 'AI产品经理-抖音电商',
+        title: 'AI匹配度',
         state: 'danger' as const,
         state_name: 'AI请求异常',
         message: 'AI请求失败，状态码：400',
         data: {
-          listData: {
-            encryptJobId: 'job-id-must-remain-visible',
-            jobName: 'AI产品经理-抖音电商',
-            securityId: 'security-id-secret',
-          },
-          bossData: {
-            encryptBossId: 'boss-id-secret',
-            encryptUserId: 'user-id-secret',
-          },
-          state: '失败',
-          err: 'openai_error',
           trace: [
             {
               at: new Date('2026-07-06T08:33:52Z').getTime(),
@@ -39,20 +32,27 @@ const { clear, info, logData, success, writeText } = vi.hoisted(() => ({
               stage: 'AI匹配度',
               message: 'AI匹配度评估失败',
               detail: {
+                jobId: 'job-id-must-remain-visible',
                 authorization: 'Bearer authorization-secret',
                 nested: { bridgeToken: 'bridge-token-secret', lid: 'lid-secret' },
+                headers: { Cookie: 'cookie-secret', api_key: 'api-key-secret' },
               },
             },
           ],
-          greetingSend: {
-            ok: false,
-            type: 'ai' as const,
-            detail: { Cookie: 'cookie-secret', api_key: 'api-key-secret' },
-          },
         },
         createdAt: new Date('2026-07-06T08:33:52Z').getTime(),
       },
-    ],
+    ] as any[],
+  },
+  recordData: {
+    value: [
+      {
+        title: '岗位记录不该出现在运行日志里',
+        state: 'success' as const,
+        state_name: '投递成功',
+        createdAt: new Date('2026-07-06T08:34:00Z').getTime(),
+      },
+    ] as any[],
   },
   success: vi.fn(),
   writeText: vi.fn(),
@@ -63,11 +63,13 @@ vi.mock('@/stores/log', async () => {
   return {
     ...actual,
     useLog: () => {
-      for (const record of logData.value as any[]) {
+      for (const record of runtimeData.value) {
         record.publicData ??= actual.toPublicLogData(record.data)
       }
       return {
-        data: logData,
+        data: recordData,
+        events: eventData,
+        runtimeData,
         clear,
       }
     },
@@ -81,13 +83,16 @@ vi.mock('@/ui/instrument', () => ({
     emits: ['click'],
     template: '<button :disabled="disabled" @click="$emit(\'click\', $event)"><slot /></button>',
   },
-  AgentEmpty: {
-    name: 'AgentEmpty',
-    template: '<div data-test="empty"><slot /></div>',
-  },
   AgentMessage: {
     success,
     info,
+  },
+  AgentSwitch: {
+    name: 'AgentSwitch',
+    props: ['modelValue'],
+    emits: ['update:modelValue'],
+    template:
+      '<input data-test="diagnostics" type="checkbox" :checked="modelValue" @change="$emit(\'update:modelValue\', $event.target.checked)" />',
   },
   AgentTag: {
     name: 'AgentTag',
@@ -97,11 +102,12 @@ vi.mock('@/ui/instrument', () => ({
 }))
 
 describe('Logs', () => {
-  const initialLogs = logData.value
+  const initialEvents = eventData.value
 
   beforeEach(() => {
     vi.clearAllMocks()
-    logData.value = initialLogs
+    eventData.value = initialEvents
+    window.localStorage.clear()
     Object.assign(navigator, {
       clipboard: {
         writeText,
@@ -109,7 +115,16 @@ describe('Logs', () => {
     })
   })
 
-  it('copies all logs from one toolbar action', async () => {
+  it('shows run events and AI request diagnostics, never job records', () => {
+    const wrapper = mount(Logs)
+
+    expect(wrapper.findAll('.console-log__entry')).toHaveLength(2)
+    expect(wrapper.text()).toContain('补池：搜索新增 15 个')
+    expect(wrapper.text()).toContain('AI请求失败，状态码：400')
+    expect(wrapper.text()).not.toContain('岗位记录不该出现在运行日志里')
+  })
+
+  it('copies all logs from one toolbar action with secrets redacted', async () => {
     const wrapper = mount(Logs)
 
     await wrapper
@@ -121,19 +136,14 @@ describe('Logs', () => {
     const copied = writeText.mock.calls[0]![0] as string
     expect(copied).toContain('运行日志（共 2 条）')
     expect(copied).toContain('# 1 / 2')
-    expect(copied).toContain('获取岗位')
+    expect(copied).toContain('AI匹配度评估失败')
     expect(copied).toContain('# 2 / 2')
-    expect(copied).toContain('AI产品经理-抖音电商')
-    expect(copied).toContain('--- 流程追踪 ---')
+    expect(copied).toContain('补池：搜索新增 15 个')
     expect(copied).toContain('job-id-must-remain-visible')
     expect(copied).toContain('[已脱敏]')
     for (const secret of [
-      'security-id-secret',
-      'boss-id-secret',
-      'user-id-secret',
       'Bearer authorization-secret',
       'bridge-token-secret',
-      'lid-secret',
       'cookie-secret',
       'api-key-secret',
     ]) {
@@ -149,47 +159,46 @@ describe('Logs', () => {
     expect(wrapper.findAll('button').filter((button) => button.text() === '复制')).toHaveLength(0)
   })
 
-  it('shows compact summaries by default and expands raw details on demand', async () => {
+  it('shows compact summaries by default and expands the request trace on demand', async () => {
     const wrapper = mount(Logs)
 
     expect(wrapper.findAll('.console-log__detail')).toHaveLength(0)
-    expect(wrapper.findAll('.console-log__summary')).toHaveLength(2)
-    expect(wrapper.text()).toContain('本次获取到 15 个')
-    expect(wrapper.text()).not.toContain('--- 原始数据 ---')
-    expect(wrapper.findAll('.console-log__title')[0]!.text()).toBe('AI产品经理-抖音电商')
+    expect(wrapper.findAll('.console-log__title')[0]!.text()).toBe('AI匹配度')
     expect(wrapper.findAll('[data-test="log-state"]')[0]!.attributes('title')).toBe('AI请求异常')
 
     await wrapper.findAll('.console-log__summary')[0]!.trigger('click')
 
     expect(wrapper.findAll('.console-log__detail')).toHaveLength(1)
-    expect(wrapper.find('.console-log__detail').text()).toContain('--- 原始数据 ---')
+    expect(wrapper.find('.console-log__detail').text()).toContain(
+      'danger / AI匹配度: AI匹配度评估失败',
+    )
     expect(wrapper.findAll('.console-log__summary')[0]!.attributes('aria-expanded')).toBe('true')
   })
 
-  it('renders a large live log set from cached public data without traversing runtime objects', () => {
-    logData.value = Array.from({ length: 200 }, (_, index) => ({
-      title: `运行中岗位 ${index + 1}`,
+  it('shows only the newest 200 entries', () => {
+    eventData.value = Array.from({ length: 250 }, (_, index) => ({
+      title: '投递任务',
       state: 'info' as const,
-      state_name: '处理中',
-      data: Object.defineProperty({}, 'unsafeRuntimeValue', {
-        enumerable: true,
-        get() {
-          throw new Error('runtime data must not be traversed while rendering')
-        },
-      }),
-      publicData: {
-        listData: {
-          encryptJobId: `job-${index + 1}`,
-          jobName: `运行中岗位 ${index + 1}`,
-        },
-        deliveryStage: 'JD筛选中' as const,
-      },
+      state_name: '消息',
+      message: `事件 ${index + 1}`,
       createdAt: Date.now() + index,
-    })) as any
+    }))
 
     const wrapper = mount(Logs)
 
     expect(wrapper.findAll('.console-log__entry')).toHaveLength(200)
-    expect(wrapper.text()).toContain('运行中岗位 200')
+    expect(wrapper.text()).toContain('事件 250')
+    expect(wrapper.text()).not.toContain('事件 50')
+  })
+
+  it('turns diagnostics mode on and off from the toolbar', async () => {
+    const wrapper = mount(Logs)
+    const toggle = wrapper.find('[data-test="diagnostics"]')
+
+    await toggle.setValue(true)
+    expect(window.localStorage.getItem('agent-delivery:diagnostics')).toBe('1')
+
+    await toggle.setValue(false)
+    expect(window.localStorage.getItem('agent-delivery:diagnostics')).toBeNull()
   })
 })

@@ -133,7 +133,7 @@ export function testAiModel(uid: string, model: AiModelConfig) {
 
 export async function saveProfileAndExtract(
   uid: string,
-  displayName: string,
+  profile: { displayName: string; targetRole: string },
   markdown: string,
   model: AiModelConfig,
 ) {
@@ -141,7 +141,8 @@ export async function saveProfileAndExtract(
   const draft = await sendConfigRequest<ResumeDraftResult>({
     action: 'save-profile-draft',
     uid,
-    displayName,
+    displayName: profile.displayName,
+    targetRole: profile.targetRole,
     markdown,
   })
   if (draft.status === 'ready') {

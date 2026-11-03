@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 
+import type { LocalDiagnosticEventInput } from '@/background/localDiagnosticSink'
 import { counter } from '@/message'
 import type { AiGreetingMeta, GreetingFilteringContext } from '@/types/aiGreeting'
 import type {
@@ -12,7 +13,9 @@ import type {
   SalaryError,
   UnknownError,
 } from '@/types/deliverError'
+import { getCurDay } from '@/utils'
 import { createAccountStorageKey, normalizeAccountUid } from '@/utils/accountStorage'
+import { isRoutineAiRuntimeRecord } from '@/utils/aiRuntimeLogPolicy'
 import type { amapDistance, amapGeocode } from '@/utils/amap'
 import { getRecentGreetingSummaries } from '@/utils/greetingHistory'
 import { logger } from '@/utils/logger'
@@ -56,6 +59,9 @@ export interface logTrace {
 
 export interface logData {
   listData: MyJobListData
+  /** 本次招呼语生成/发送尝试的关联 ID，供本机反馈流和岗位记录互相核对。 */
+  greetingId?: string
+  greetingAttempt?: number
   communicationCounted?: boolean
   /** 这个岗位是否向 BOSS 发过详情请求。节奏按请求计，不按投递结果计。 */
   detailAttempted?: boolean
@@ -149,36 +155,61 @@ export interface log {
   updatedAt?: number
 }
 
-const deliveryLogKey = 'local:web-geek-job-DeliveryLogs'
+const legacyDeliveryLogKey = 'local:web-geek-job-DeliveryLogs'
+const deliveryRecordKeyPrefix = 'local:agent-delivery-records'
+const runEventKey = 'local:agent-delivery-run-events'
 const runtimeLogKey = 'local:agent-delivery-runtime-logs'
-export const MAX_DELIVERY_LOGS = 200
+const diagnosticsFlagKey = 'agent-delivery:diagnostics'
+/** 运行日志只保留最新这么多条（契约 §7）。 */
+export const MAX_RUN_EVENTS = 200
+/** 岗位记录按天保存，保留最近这么多天（含今天）。 */
+export const DELIVERY_RECORD_RETENTION_DAYS = 7
+/**
+ * 岗位记录总条数上限（7 天合计），超出时先丢最早的记录。配额是和投递池、缓存、统计共用的，
+ * 上限要按最坏情况算：摘要记录约 2.3 KB 一条，带全文和过程记录的约 16 KB 一条，合计约 3.4 MB
+ * （log.quota.test.ts 按这个最坏情况量）。
+ */
+export const MAX_DELIVERY_RECORDS = 1000
+/** 只有今天最新的这么多条记录保留 JD 全文和过程记录，其余只留摘要。 */
+export const MAX_DETAILED_DELIVERY_RECORDS = 50
 const maxPersistedTextLength = 8000
 const maxPersistedDetailTextLength = 3000
-// JD 只在有 AI 判断可复核时才需要留全文。
-//
-// AI 匹配是拿简历事实和这段 JD 比出来的，要回答「过滤得准不准」，就必须能同时看到判断
-// 结果和它依据的原文。原来一律只存 200 字，等于把做判断的材料丢了——真机上五条过滤记录
-// 里有两条的扣分理由核对不了，因为它引用的 JD 内容正好在被截掉的部分。
-//
-// 但也不能一律存全文：配额是和投递池、缓存、统计共用的，实测一律按 2000 字存会把日志
-// 从 1.69 MB 推到 2.85 MB，直接顶穿预算。没有 AI 判断的记录（硬规则过滤、取详情失败）
-// 本来就没有什么可复核的，摘要够用。
+// JD 只在有 AI 判断可复核时才需要留全文：要回答「过滤得准不准」，就得同时看到判断和它依据
+// 的原文。但配额是和投递池、缓存、统计共用的，只有今天最新的一批记录留全文；其余只留摘要，
+// 并去掉逐步过程记录——那只在当天排查问题时有用。
 const maxPersistedJobDescriptionLength = 200
 const maxAuditableJobDescriptionLength = 2000
+const maxArchivedJobDescriptionLength = 200
 const maxPersistedTraceEntries = 120
 const redactedLogValue = '[已脱敏]'
 const sensitiveLogKeys = new Set([
-  'securityid',
-  'lid',
-  'encryptbossid',
-  'encryptuserid',
+  'apikey',
+  'xapikey',
+  'accesskey',
+  'clientsecret',
+  'privatekey',
   'authorization',
   'cookie',
-  'set-cookie',
-  'api_key',
+  'setcookie',
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'sessiontoken',
+  'credential',
+  'credentials',
+  'csrftoken',
+  'xsrftoken',
   'bridgetoken',
 ])
+/** 岗位记录：每个处理过的岗位一条，按天保存。 */
 const data = ref<log[]>([])
+/** 运行日志：任务、补池、异常等运行事件，与岗位记录分开存，互不挤占。 */
+const events = ref<log[]>([])
+/** 后台写入的 AI 请求诊断。 */
 const runtimeData = ref<log[]>([])
 let hydrated = false
 let hydratePromise: Promise<void> | undefined
@@ -187,8 +218,11 @@ let persistTimer: number | undefined
 let persistQueue: Promise<void> = Promise.resolve()
 let clearVersion = 0
 let accountUid: string | undefined
-let activeDeliveryLogKey = deliveryLogKey
 let activeRuntimeLogKey: string | undefined
+const dirtyRecordDays = new Set<string>()
+let eventsDirty = false
+/** Records created before the page learns its account must not disappear from the mirror. */
+const pendingLocalEvents: Array<Omit<LocalDiagnosticEventInput, 'accountUid'>> = []
 const deliveryLogMutex = createStorageMutex('agent-delivery:delivery-logs')
 
 function truncateText(value: string, maxLength: number) {
@@ -200,11 +234,57 @@ function getLogSortTime(record: log) {
   return record.updatedAt ?? record.createdAt
 }
 
-export function newestDeliveryLogs(records: readonly log[]) {
-  return records
-    .slice()
-    .sort((left, right) => getLogSortTime(right) - getLogSortTime(left))
-    .slice(0, MAX_DELIVERY_LOGS)
+function sortNewest(records: readonly log[]) {
+  return records.slice().sort((left, right) => getLogSortTime(right) - getLogSortTime(left))
+}
+
+/** 运行日志按时间倒序，只留最新 MAX_RUN_EVENTS 条。 */
+export function newestRunEvents(records: readonly log[]) {
+  return sortNewest(records).slice(0, MAX_RUN_EVENTS)
+}
+
+function isDeliveryRecord(record: log) {
+  return record.job != null || record.data?.listData != null
+}
+
+function recordDay(record: log) {
+  return getCurDay(new Date(record.createdAt))
+}
+
+function retainedDays(now = Date.now()) {
+  return Array.from({ length: DELIVERY_RECORD_RETENTION_DAYS }, (_, index) =>
+    getCurDay(new Date(now - index * 24 * 60 * 60 * 1000)),
+  )
+}
+
+function isRetainedDay(day: string, now = Date.now()) {
+  return retainedDays(now).includes(day)
+}
+
+function recordDayKey(uid: string, day: string) {
+  return `${createAccountStorageKey(deliveryRecordKeyPrefix, uid)}:${day}`
+}
+
+function recordIndexKey(uid: string) {
+  return `${createAccountStorageKey(deliveryRecordKeyPrefix, uid)}:days`
+}
+
+/** 诊断模式：分页、心跳、运行时检查这类实现细节只在打开时才记录。 */
+export function isDiagnosticsEnabled() {
+  try {
+    return window.localStorage.getItem(diagnosticsFlagKey) === '1'
+  } catch {
+    return false
+  }
+}
+
+export function setDiagnosticsEnabled(enabled: boolean) {
+  try {
+    if (enabled) window.localStorage.setItem(diagnosticsFlagKey, '1')
+    else window.localStorage.removeItem(diagnosticsFlagKey)
+  } catch {
+    // 标签页存储不可用时诊断模式保持关闭，不影响投递。
+  }
 }
 
 /**
@@ -338,7 +418,9 @@ function redactLogValue(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, item]) => [
         key,
-        sensitiveLogKeys.has(key.toLowerCase()) ? redactedLogValue : redactLogValue(item),
+        sensitiveLogKeys.has(key.toLowerCase().replace(/[\s_-]/g, ''))
+          ? redactedLogValue
+          : redactLogValue(item),
       ]),
     )
   }
@@ -360,8 +442,8 @@ function trimValue(value: unknown, maxStringLength: number): unknown {
 }
 
 function toPersistedJob(
-  job?: MyJobListData,
-  keepFullDescription = false,
+  job: MyJobListData | undefined,
+  descriptionLength: number,
 ): MyJobListData | undefined {
   if (!job) return undefined
   const card = job.card
@@ -387,9 +469,7 @@ function toPersistedJob(
         ? {
             postDescription: truncateText(
               card.postDescription || card.jobInfo?.postDescription || '',
-              keepFullDescription
-                ? maxAuditableJobDescriptionLength
-                : maxPersistedJobDescriptionLength,
+              descriptionLength,
             ),
             jobName: card.jobName || card.jobInfo?.jobName,
             salaryDesc: card.salaryDesc || card.jobInfo?.salaryDesc,
@@ -410,13 +490,26 @@ function toPersistedJob(
   ) as MyJobListData
 }
 
-function toPersistedLogData(logdata?: logData): logData | undefined {
+/**
+ * 岗位记录每类信息只存一份：AI 匹配存结构化结论（原始响应与之重复），招呼语存拆分后的
+ * 消息（原始 JSON 与之重复），发送结果不再重复存正文。往天的记录不存过程记录。
+ */
+function toPersistedLogData(logdata: logData | undefined, archived: boolean): logData | undefined {
   if (!logdata) return undefined
+  const persistedGreetingSend = logdata.greetingSend
+    ? archived
+      ? (() => {
+          const { messages: _messages, ...summary } = logdata.greetingSend
+          return summary
+        })()
+      : logdata.greetingSend
+    : undefined
   return compactValue(
     {
-      // listData 与 record.job 指向同一个岗位，两处都写会让每条记录保存两份完整 JD
-      // （实测占单条记录的 56%~64%）。这里只写 record.job 一份，hydrate 时回填 listData。
+      // listData 与 record.job 指向同一个岗位，只写 record.job 一份，hydrate 时回填。
       communicationCounted: logdata.communicationCounted,
+      greetingId: logdata.greetingId,
+      greetingAttempt: logdata.greetingAttempt,
       deliverySource: logdata.deliverySource,
       deliverySourceName: logdata.deliverySourceName,
       deliveryStage: logdata.deliveryStage,
@@ -430,10 +523,12 @@ function toPersistedLogData(logdata?: logData): logData | undefined {
       message: logdata.message,
       state: logdata.state,
       err: logdata.err,
-      trace: logdata.trace?.slice(-maxPersistedTraceEntries).map((item) => ({
-        ...item,
-        detail: compactValue(item.detail),
-      })),
+      trace: archived
+        ? undefined
+        : logdata.trace?.slice(-maxPersistedTraceEntries).map((item) => ({
+            ...item,
+            detail: compactValue(item.detail),
+          })),
       publish: logdata.publish
         ? {
             ok: logdata.publish.ok,
@@ -444,11 +539,11 @@ function toPersistedLogData(logdata?: logData): logData | undefined {
             error: logdata.publish.error,
           }
         : undefined,
-      greetingSend: logdata.greetingSend,
-      aiFilteringAjson: logdata.aiFilteringAjson,
-      aiFilteringAtext: logdata.aiFilteringAtext,
-      aiGreetingA: logdata.aiGreetingA,
-      aiGreetingMessages: logdata.aiGreetingMessages,
+      // The local diagnostic mirror receives the complete sent text before this
+      // recovery copy is compacted. Archived extension records keep the outcome
+      // and counts, while the newest records keep the text for the in-app view.
+      greetingSend: persistedGreetingSend,
+      aiGreetingMessages: archived ? undefined : logdata.aiGreetingMessages,
       aiFilteringDecision: logdata.aiFilteringDecision,
       aiGreetingMeta: logdata.aiGreetingMeta,
       greetingWarning: logdata.greetingWarning,
@@ -474,20 +569,226 @@ function refreshPublicLogData(record: log, logdata?: logData) {
   return record
 }
 
-function toPersistedLog(record: log): log {
-  // 有 AI 判断才留 JD 全文：只有这种记录需要拿原文去核对扣分理由站不站得住。
-  const job = toPersistedJob(
-    record.job ?? record.data?.listData,
-    record.data?.aiFilteringAjson != null,
-  )
+function localText(value: unknown, _maxLength?: number) {
+  // The in-app recovery copy is bounded below, but the local diagnostic mirror
+  // must retain the complete business text. The receiver applies only the
+  // explicit credential and last-resort resource boundaries.
+  return typeof value === 'string' ? value : undefined
+}
+
+/** 本机测试镜像不做业务文本摘要；凭据字段由 localDiagnosticSink 统一拦截。 */
+function localAuditText(value: unknown) {
+  return typeof value === 'string' ? value : undefined
+}
+
+function localAuditValue(value: unknown) {
+  return toSafeJsonValue(value)
+}
+
+function localJobSummary(job: MyJobListData | undefined) {
+  if (!job) return undefined
+  return {
+    jobId: localText(job.encryptJobId),
+    encryptBossId: localText(job.encryptBossId),
+    securityId: localText(job.securityId),
+    lid: localText(job.lid),
+    encryptBrandId: localAuditValue(
+      (job as MyJobListData & { encryptBrandId?: unknown }).encryptBrandId,
+    ),
+    jobName: localText(job.jobName),
+    brandName: localText(job.brandName),
+    brandScaleName: localText(job.brandScaleName),
+    salaryDesc: localText(job.salaryDesc),
+    cityName: localText(job.cityName),
+    jobExperience: localText(job.jobExperience),
+    jobDegree: localText(job.jobDegree),
+    bossTitle: localText(job.bossTitle),
+  }
+}
+
+function localTraceDetail(value: unknown) {
+  const safe = localAuditValue(value)
+  if (!safe || typeof safe !== 'object' || Array.isArray(safe)) return safe
+  const detail = safe as Record<string, unknown>
+  const pending = detail.pendingStatus
+  if (!pending || typeof pending !== 'object' || Array.isArray(pending)) return detail
+  const pendingRecord = pending as Record<string, unknown>
+  return {
+    ...detail,
+    pendingStage: pendingRecord.stage,
+    pendingReason: pendingRecord.reason,
+    pendingWaitingFor: pendingRecord.waitingFor,
+    pendingObservedAt: pendingRecord.observedAt,
+  }
+}
+
+function localDeliverySummary(record: log) {
+  const context = record.data
+  return {
+    // Keep the complete top-level record as a forward-compatible escape hatch:
+    // adding a field to `log` must not silently make it unavailable to local
+    // diagnosis before this projection is updated.
+    recordSnapshot: localAuditValue(record),
+    job: localJobSummary(record.job ?? context?.listData),
+    // Keep both candidates: choosing record.job first can otherwise hide a
+    // newer detail object held in logData.listData.
+    jobSnapshot: localAuditValue(record.job),
+    listDataSnapshot: localAuditValue(context?.listData),
+    // 摘要便于检索，完整对象用于复核岗位/招聘者字段是否在采集或合并时复用。
+    jobDetail: localAuditValue(record.job ?? context?.listData),
+    // Preserve fields added to logData in later versions without having to
+    // update this mirror projection first.
+    dataSnapshot: localAuditValue(context),
+    bossData: localAuditValue(context?.bossData),
+    bossId: localAuditValue(context?.bossData?.data?.bossId),
+    title: localText(record.title),
+    state: record.state,
+    stateName: localText(record.state_name),
+    message: localAuditText(record.message),
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    deliverySource: context?.deliverySource,
+    deliverySourceName: localText(context?.deliverySourceName),
+    greetingId: context?.greetingId,
+    greetingAttempt: context?.greetingAttempt,
+    deliveryStage: context?.deliveryStage,
+    failureStage: context?.failureStage,
+    failureReason: localAuditText(context?.failureReason),
+    retryable: context?.retryable,
+    retryAttempts: context?.retryAttempts,
+    matchPercent: context?.matchPercent,
+    aiFilteringThreshold: context?.aiFilteringThreshold,
+    aiFilteringRawResponse: localAuditValue(context?.aiFilteringAjson),
+    aiFilteringResponseText: localAuditText(context?.aiFilteringAtext),
+    aiFilteringReasoningContent: localAuditText(context?.aiFilteringR),
+    aiGreetingRawResponse: localAuditText(context?.aiGreetingA),
+    aiGreetingReasoningContent: localAuditText(context?.aiGreetingR),
+    aiGreetingMessages: localAuditValue(context?.aiGreetingMessages),
+    aiFilteringDecision: context?.aiFilteringDecision
+      ? {
+          rawResponse: localAuditValue(context.aiFilteringAjson),
+          responseText: localAuditText(context.aiFilteringAtext),
+          reasoningContent: localAuditText(context.aiFilteringR),
+          matchPercent: context.aiFilteringDecision.matchPercent,
+          level: context.aiFilteringDecision.level,
+          selectedFactIds: context.aiFilteringDecision.selectedFactIds,
+          claimMode: context.aiFilteringDecision.claimMode,
+          reason: localAuditText(context.aiFilteringDecision.reason),
+          risk: localAuditText(context.aiFilteringDecision.risk),
+        }
+      : undefined,
+    aiGreetingMeta: context?.aiGreetingMeta
+      ? {
+          rawResponse: localAuditText(context.aiGreetingA),
+          reasoningContent: localAuditText(context.aiGreetingR),
+          messages: localAuditValue(context.aiGreetingMessages),
+          promptFingerprint: context.aiGreetingMeta.promptFingerprint,
+          usedFactIds: context.aiGreetingMeta.usedFactIds,
+          segmentFactIds: context.aiGreetingMeta.segmentFactIds,
+          resumeEvidenceVersion: context.aiGreetingMeta.resumeEvidenceVersion,
+          resumeSourceHash: context.aiGreetingMeta.resumeSourceHash,
+          anchor: context.aiGreetingMeta.anchor,
+          review: context.aiGreetingMeta.review,
+          audit: context.aiGreetingMeta.audit,
+        }
+      : undefined,
+    publish: context?.publish
+      ? {
+          ok: context.publish.ok,
+          attempts: context.publish.attempts,
+          phase: context.publish.phase,
+          code: context.publish.code,
+          message: localAuditText(context.publish.message),
+          error: localAuditText(context.publish.error),
+          response: localAuditValue(context.publish.data),
+        }
+      : undefined,
+    greetingSend: context?.greetingSend
+      ? {
+          ok: context.greetingSend.ok,
+          type: context.greetingSend.type,
+          channel: localAuditText(context.greetingSend.channel),
+          error: localAuditText(context.greetingSend.error),
+          contentLength: context.greetingSend.contentLength,
+          messageCount: context.greetingSend.messageCount,
+          messages: localAuditValue(context.greetingSend.messages),
+          detail: localAuditValue(context.greetingSend.detail),
+        }
+      : undefined,
+    trace: context?.trace?.map((item) => ({
+      at: item.at,
+      stage: localAuditText(item.stage),
+      status: item.status,
+      message: localAuditText(item.message),
+      detail: localTraceDetail(item.detail),
+    })),
+  }
+}
+
+function mirrorLocalEvent(input: Omit<LocalDiagnosticEventInput, 'accountUid'>) {
+  const append = (
+    counter as typeof counter & {
+      localDiagnosticAppend?: (event: LocalDiagnosticEventInput) => Promise<boolean>
+    }
+  ).localDiagnosticAppend
+  if (accountUid == null || typeof append !== 'function') {
+    pendingLocalEvents.push(input)
+    return
+  }
+  void append({ ...input, accountUid }).catch(() => undefined)
+}
+
+function flushPendingLocalEvents() {
+  if (accountUid == null || pendingLocalEvents.length === 0) return
+  const append = (
+    counter as typeof counter & {
+      localDiagnosticAppend?: (event: LocalDiagnosticEventInput) => Promise<boolean>
+    }
+  ).localDiagnosticAppend
+  if (typeof append !== 'function') return
+  const pending = pendingLocalEvents.splice(0)
+  for (const input of pending) void append({ ...input, accountUid }).catch(() => undefined)
+}
+
+function mirrorDeliveryRecord(record: log, event: string) {
+  mirrorLocalEvent({
+    stream: 'deliveries',
+    event,
+    at: record.updatedAt ?? record.createdAt,
+    data: localDeliverySummary(record),
+  })
+}
+
+function toPersistedLog(record: log, archived = false): log {
+  const hasAiDecision =
+    record.data?.aiFilteringDecision != null || record.data?.matchPercent != null
+  const descriptionLength = archived
+    ? maxArchivedJobDescriptionLength
+    : hasAiDecision
+      ? maxAuditableJobDescriptionLength
+      : maxPersistedJobDescriptionLength
   return compactValue(
     {
-      job,
+      job: toPersistedJob(record.job ?? record.data?.listData, descriptionLength),
       title: record.title,
       state: record.state,
       state_name: record.state_name,
       message: record.message,
-      data: toPersistedLogData(record.data),
+      data: toPersistedLogData(record.data, archived),
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    },
+    maxPersistedTextLength,
+  ) as log
+}
+
+function toPersistedEvent(record: log): log {
+  return compactValue(
+    {
+      title: record.title,
+      state: record.state,
+      state_name: record.state_name,
+      message: record.message,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
     },
@@ -507,6 +808,16 @@ function persist() {
   }, 120)
 }
 
+function markRecordDirty(record: log) {
+  dirtyRecordDays.add(recordDay(record))
+  persist()
+}
+
+function markEventsDirty() {
+  eventsDirty = true
+  persist()
+}
+
 function enqueuePersistence(operation: () => Promise<void>) {
   const queued = persistQueue.then(operation)
   persistQueue = queued.then(
@@ -518,16 +829,11 @@ function enqueuePersistence(operation: () => Promise<void>) {
 
 function getDeliveryLogIdentity(record: log) {
   const jobId = record.job?.encryptJobId ?? record.data?.listData?.encryptJobId ?? ''
-  // 同一岗位可以有多条记录（不同时间投递），createdAt 参与标识；
-  // 纯信息日志没有岗位，用标题兜底。
+  // 同一岗位可以有多条记录（不同时间投递），createdAt 参与标识；运行事件没有岗位，用标题兜底。
   return `${jobId}|${record.createdAt}|${jobId ? '' : record.title}`
 }
 
-/**
- * 合并两份投递记录。跨标签页写入时，任何一边都可能持有对方没有的记录，
- * 因此不能用「后写覆盖」——那正是多标签页丢投递记录的原因。
- */
-export function mergeDeliveryLogs(stored: readonly log[], local: readonly log[]) {
+function mergeByIdentity(stored: readonly log[], local: readonly log[]) {
   const merged = new Map<string, log>()
   for (const record of [...stored, ...local]) {
     if (record == null) continue
@@ -542,7 +848,40 @@ export function mergeDeliveryLogs(stored: readonly log[], local: readonly log[])
     const candidateAt = record.updatedAt ?? record.createdAt
     if (candidateAt >= existingAt) merged.set(key, record)
   }
-  return newestDeliveryLogs([...merged.values()])
+  return sortNewest([...merged.values()])
+}
+
+/**
+ * 合并两份岗位记录。跨标签页写入时，任何一边都可能持有对方没有的记录，
+ * 因此不能用「后写覆盖」——那正是多标签页丢投递记录的原因。
+ */
+export function mergeDeliveryLogs(stored: readonly log[], local: readonly log[]) {
+  return mergeByIdentity(stored, local).slice(0, MAX_DELIVERY_RECORDS)
+}
+
+/** 超出总上限时，早于这个时间的记录要丢掉；没超出时返回 undefined。 */
+function retainedRecordCutoff(records: readonly log[]) {
+  if (records.length <= MAX_DELIVERY_RECORDS) return undefined
+  const createdAt = records.map((record) => record.createdAt).sort((left, right) => right - left)
+  return createdAt[MAX_DELIVERY_RECORDS - 1]
+}
+
+async function readArray(key: string): Promise<log[]> {
+  try {
+    const saved = await counter.storageGet<log[]>(key, [])
+    return Array.isArray(saved) ? saved : []
+  } catch {
+    return []
+  }
+}
+
+async function readRecordDays(uid: string) {
+  try {
+    const saved = await counter.storageGet<string[]>(recordIndexKey(uid), [])
+    return Array.isArray(saved) ? saved.filter((day) => typeof day === 'string') : []
+  } catch {
+    return []
+  }
 }
 
 async function flush() {
@@ -551,52 +890,149 @@ async function flush() {
     persistTimer = undefined
   }
   await hydrate()
-  const storageKey = activeDeliveryLogKey
+  const uid = accountUid
+  // 账号识别前只留在内存里；识别账号后整体写入该账号的存储。
+  if (uid == null) return
   const version = clearVersion
-  await enqueuePersistence(async () => {
-    await deliveryLogMutex(async () => {
-      // 必须在锁内重新读取：另一个标签页可能在本次 flush 之前写入过新记录。
-      let stored: log[] = []
-      try {
-        const saved = await counter.storageGet<log[]>(storageKey, [])
-        if (Array.isArray(saved)) stored = saved
-      } catch {
-        // 读失败时退化为只写本地记录，与之前的行为一致。
-      }
-      if (version !== clearVersion || storageKey !== activeDeliveryLogKey) return
-      const merged = mergeDeliveryLogs(stored, data.value)
-      data.value = merged
-      await counter.storageSet(storageKey, merged.map(toPersistedLog))
+  const today = getCurDay()
+  const days = new Set([...dirtyRecordDays, today])
+  dirtyRecordDays.clear()
+  const cutoff = retainedRecordCutoff(data.value)
+  if (cutoff != null) {
+    // 超出总上限的记录分布在最早的几天里，那几天要重写一遍才能真正删掉。
+    for (const record of data.value) if (record.createdAt < cutoff) days.add(recordDay(record))
+  }
+  const writeEvents = eventsDirty
+  eventsDirty = false
+  try {
+    await enqueuePersistence(async () => {
+      await deliveryLogMutex(async () => {
+        const indexedDays = new Set(await readRecordDays(uid))
+        let indexChanged = false
+        for (const day of days) {
+          if (!isRetainedDay(day)) continue
+          // 必须在锁内重新读取：另一个标签页可能在本次 flush 之前写入过新记录。
+          const stored = (await readArray(recordDayKey(uid, day))).map(restoreLogDataListData)
+          if (version !== clearVersion || uid !== accountUid) return
+          const local = data.value.filter((record) => recordDay(record) === day)
+          if (stored.length === 0 && local.length === 0) continue
+          const merged = mergeDeliveryLogs(stored, local).filter(
+            (record) => cutoff == null || record.createdAt >= cutoff,
+          )
+          data.value = sortNewest([
+            ...data.value.filter((record) => recordDay(record) !== day),
+            ...merged,
+          ])
+          if (merged.length === 0) {
+            await counter.storageRm(recordDayKey(uid, day))
+            indexChanged = indexedDays.delete(day) || indexChanged
+            continue
+          }
+          await counter.storageSet(
+            recordDayKey(uid, day),
+            merged.map((record, index) =>
+              toPersistedLog(record, day !== today || index >= MAX_DETAILED_DELIVERY_RECORDS),
+            ),
+          )
+          if (!indexedDays.has(day)) {
+            indexedDays.add(day)
+            indexChanged = true
+          }
+        }
+        if (indexChanged) {
+          await counter.storageSet(recordIndexKey(uid), [...indexedDays].sort())
+        }
+        if (writeEvents) {
+          const eventKey = createAccountStorageKey(runEventKey, uid)
+          const storedEvents = await readArray(eventKey)
+          if (version !== clearVersion || uid !== accountUid) return
+          const merged = newestRunEvents(mergeByIdentity(storedEvents, events.value))
+          events.value = merged
+          await counter.storageSet(eventKey, merged.map(toPersistedEvent))
+        }
+      })
     })
+  } catch (error) {
+    for (const day of days) dirtyRecordDays.add(day)
+    if (writeEvents) eventsDirty = true
+    throw error
+  }
+}
+
+/**
+ * 旧版把岗位记录和运行消息存在同一个键里、共用 200 条上限。迁移时岗位记录按天归档，
+ * 运行消息并入运行日志，然后删掉旧键。
+ */
+async function migrateLegacyLogs(uid: string) {
+  const keys = [legacyDeliveryLogKey, createAccountStorageKey(legacyDeliveryLogKey, uid)]
+  const legacy: log[] = []
+  for (const key of keys) legacy.push(...(await readArray(key)))
+  if (legacy.length === 0) return
+  const migratedRecords: log[] = []
+  const migratedEvents: log[] = []
+  for (const record of legacy) {
+    if (isDeliveryRecord(record)) {
+      if (!isRetainedDay(recordDay(record))) continue
+      const restored = finalizeInterruptedDelivery(restoreLogDataListData(record))
+      migratedRecords.push(restored)
+      dirtyRecordDays.add(recordDay(restored))
+    } else {
+      migratedEvents.push(record)
+    }
+  }
+  data.value = mergeByIdentity(migratedRecords, data.value)
+  if (migratedEvents.length > 0) {
+    events.value = newestRunEvents(mergeByIdentity(migratedEvents, events.value))
+    eventsDirty = true
+  }
+  await flush()
+  await enqueuePersistence(async () => {
+    for (const key of keys) await counter.storageRm(key)
   })
 }
 
 async function hydrate() {
   if (hydrated) return
   if (hydratePromise) return hydratePromise
+  const uid = accountUid
+  if (uid == null) {
+    hydrated = true
+    return
+  }
 
   const version = clearVersion
   hydratePromise = (async () => {
     try {
-      const saved = await counter.storageGet<log[]>(activeDeliveryLogKey, [])
-      if (version === clearVersion && Array.isArray(saved) && saved.length > 0) {
-        const pending = data.value
-        const restored = newestDeliveryLogs(saved).map((record) => {
-          const hydratedRecord = finalizeInterruptedDelivery(
-            restoreLogDataListData({
-              ...record,
-              publicData: undefined,
-            }),
-          )
-          return refreshPublicLogData(hydratedRecord, hydratedRecord.data)
+      const storedDays = await readRecordDays(uid)
+      const keepDays = storedDays.filter((day) => isRetainedDay(day))
+      const expiredDays = storedDays.filter((day) => !isRetainedDay(day))
+      const restored: log[] = []
+      for (const day of keepDays) {
+        const saved = await readArray(recordDayKey(uid, day))
+        restored.push(
+          ...saved.map((record) => finalizeInterruptedDelivery(restoreLogDataListData(record))),
+        )
+      }
+      const savedEvents = await readArray(createAccountStorageKey(runEventKey, uid))
+      if (version !== clearVersion || uid !== accountUid) return
+      data.value = mergeByIdentity(restored, data.value)
+      events.value = newestRunEvents(mergeByIdentity(savedEvents, events.value))
+      if (expiredDays.length > 0) {
+        await enqueuePersistence(async () => {
+          for (const day of expiredDays) await counter.storageRm(recordDayKey(uid, day))
+          await counter.storageSet(recordIndexKey(uid), keepDays)
         })
-        data.value = newestDeliveryLogs([...restored, ...pending])
       }
     } catch {
       // Storage failures should not erase in-memory logs from the current page session.
     } finally {
       hydrated = true
       hydratePromise = undefined
+    }
+    try {
+      await migrateLegacyLogs(uid)
+    } catch (error) {
+      logger.warn('旧版日志迁移失败，下次加载时重试', getProviderHeartbeatDiagnostic(error))
     }
     await hydrateRuntimeLogs()
   })()
@@ -617,8 +1053,8 @@ async function hydrateRuntimeLogs() {
       const saved = await counter.storageGet<log[]>(storageKey, [])
       if (version !== clearVersion || storageKey !== activeRuntimeLogKey) return
       runtimeData.value = Array.isArray(saved)
-        ? newestDeliveryLogs(saved).map((record) =>
-            refreshPublicLogData({ ...record, publicData: undefined }, record.data),
+        ? newestRunEvents(saved.filter((record) => !isRoutineAiRuntimeRecord(record))).map(
+            (record) => refreshPublicLogData({ ...record, publicData: undefined }, record.data),
           )
         : []
     } catch {
@@ -639,13 +1075,11 @@ export function useLog() {
       return
     }
 
-    if (accountUid == null) {
-      await hydrate()
-      await persistQueue
-    } else {
-      await flush()
-    }
-    const legacyRecords = accountUid == null ? newestDeliveryLogs(data.value) : []
+    if (accountUid != null) await flush()
+    await persistQueue
+    // 账号识别前产生的记录属于这个页面、也就是即将识别出的账号；换账号时则清空。
+    const carriedRecords = accountUid == null ? data.value : []
+    const carriedEvents = accountUid == null ? events.value : []
     if (persistTimer != null) {
       window.clearTimeout(persistTimer)
       persistTimer = undefined
@@ -653,24 +1087,19 @@ export function useLog() {
 
     clearVersion += 1
     accountUid = nextAccountUid
-    activeDeliveryLogKey = createAccountStorageKey(deliveryLogKey, nextAccountUid)
     activeRuntimeLogKey = createAccountStorageKey(runtimeLogKey, nextAccountUid)
-    data.value = []
+    data.value = [...carriedRecords]
+    events.value = [...carriedEvents]
     runtimeData.value = []
+    dirtyRecordDays.clear()
+    for (const record of carriedRecords) dirtyRecordDays.add(recordDay(record))
+    eventsDirty = carriedEvents.length > 0
     hydrated = false
     hydratePromise = undefined
     runtimeHydratePromise = undefined
     await hydrate()
-
-    if (data.value.length === 0 && legacyRecords.length > 0) {
-      data.value = legacyRecords
-      const scopedStorageKey = activeDeliveryLogKey
-      const snapshot = data.value.map(toPersistedLog)
-      await enqueuePersistence(async () => {
-        await counter.storageSet(scopedStorageKey, snapshot)
-        await counter.storageRm(deliveryLogKey)
-      })
-    }
+    flushPendingLocalEvents()
+    if (carriedRecords.length > 0 || carriedEvents.length > 0) await flush()
   }
   const add = (job: MyJobListData, err: logErr, logdata?: logData, msg?: string) => {
     const state = !err ? 'success' : err.state
@@ -685,9 +1114,9 @@ export function useLog() {
       data: logdata,
       createdAt: Date.now(),
     }
-    refreshPublicLogData(record, logdata)
-    data.value = newestDeliveryLogs([record, ...data.value])
-    persist()
+    data.value = sortNewest([record, ...data.value])
+    markRecordDirty(record)
+    mirrorDeliveryRecord(record, 'delivery.finished')
     return record
   }
   const startDelivery = (job: MyJobListData, logdata: logData) => {
@@ -700,9 +1129,9 @@ export function useLog() {
       data: logdata,
       createdAt: Date.now(),
     }
-    refreshPublicLogData(record, logdata)
-    data.value = newestDeliveryLogs([record, ...data.value])
-    persist()
+    data.value = sortNewest([record, ...data.value])
+    markRecordDirty(record)
+    mirrorDeliveryRecord(record, 'delivery.started')
     return record
   }
   const finishDelivery = (record: log, err: logErr, logdata?: logData, msg?: string) => {
@@ -713,58 +1142,121 @@ export function useLog() {
     record.message = msg ?? (err ? err.message : undefined)
     record.data = logdata
     record.updatedAt = Date.now()
-    refreshPublicLogData(record, logdata)
-    data.value = newestDeliveryLogs(data.value)
-    persist()
+    data.value = sortNewest(data.value)
+    markRecordDirty(record)
+    mirrorDeliveryRecord(record, 'delivery.finished')
     return record
   }
   const touchDelivery = (record: log, logdata?: logData) => {
     record.data = logdata ?? record.data
     record.updatedAt = Date.now()
-    refreshPublicLogData(record, record.data)
-    data.value = newestDeliveryLogs(data.value)
-    persist()
+    data.value = sortNewest(data.value)
+    markRecordDirty(record)
+    mirrorDeliveryRecord(record, 'delivery.updated')
     return record
   }
-  const info = (title: string, message: string) => {
-    data.value = newestDeliveryLogs([
-      {
-        title,
-        state: 'info',
-        state_name: '消息',
-        message,
-        data: undefined,
-        createdAt: Date.now(),
+  const pushEvent = (
+    title: string,
+    message: string,
+    state: logState,
+    detail?: Record<string, unknown>,
+  ) => {
+    const record: log = {
+      title,
+      state,
+      state_name: runEventStateNames[state],
+      message,
+      data: undefined,
+      createdAt: Date.now(),
+    }
+    events.value = newestRunEvents([record, ...events.value])
+    markEventsDirty()
+    mirrorLocalEvent({
+      stream: 'logs',
+      event: 'runtime.event',
+      at: record.createdAt,
+      data: {
+        title: localText(record.title, 160),
+        state: record.state,
+        stateName: localText(record.state_name, 80),
+        // The UI keeps its compact message, but the local diagnostic mirror is
+        // the source used to reconstruct a run and must retain the full text.
+        message: localAuditText(record.message),
+        detail: localAuditValue(detail),
       },
-      ...data.value,
-    ])
-    persist()
+    })
   }
+  /** 运行日志：用户需要知道的运行事件。 */
+  const info = (
+    title: string,
+    message: string,
+    state: logState = 'info',
+    detail?: Record<string, unknown>,
+  ) => pushEvent(title, message, state, detail)
+  /** 实现细节：只在诊断模式打开时记录。 */
+  const debug = (title: string, message: string, detail?: Record<string, unknown>) => {
+    if (isDiagnosticsEnabled()) pushEvent(`诊断 · ${title}`, message, 'info', detail)
+  }
+  /** 本机结构化诊断不依赖界面文案或诊断模式，也不占运行日志条数。 */
+  const recordDiagnostic = (message: string, detail: Record<string, unknown>) => {
+    mirrorLocalEvent({
+      stream: 'logs',
+      event: 'runtime.diagnostic',
+      at: Date.now(),
+      data: {
+        message: localAuditText(message),
+        detail: localAuditValue(detail) as Record<string, unknown>,
+      },
+    })
+  }
+  /** 清空运行日志。岗位记录是投递历史，不随运行日志一起清空。 */
   const clear = () => {
     clearVersion += 1
-    data.value = []
+    events.value = []
     runtimeData.value = []
+    eventsDirty = false
     if (persistTimer != null) {
       window.clearTimeout(persistTimer)
       persistTimer = undefined
     }
-    const storageKey = activeDeliveryLogKey
+    const uid = accountUid
     const runtimeStorageKey = activeRuntimeLogKey
     void enqueuePersistence(async () => {
-      await counter.storageRm(storageKey)
+      if (uid != null) await counter.storageRm(createAccountStorageKey(runEventKey, uid))
       if (runtimeStorageKey) await counter.storageRm(runtimeStorageKey)
-    }).catch((error) => {
-      logger.warn('日志清空失败，请稍后重试', getProviderHeartbeatDiagnostic(error))
     })
+      .then(() => {
+        // 清空打断了本轮自动保存；岗位记录的变更仍要写下去。
+        if (dirtyRecordDays.size > 0) persist()
+      })
+      .catch((error) => {
+        logger.warn('日志清空失败，请稍后重试', getProviderHeartbeatDiagnostic(error))
+      })
   }
   const remove = (record: log) => {
     data.value = data.value.filter((item) => item !== record)
-    persist()
+    const uid = accountUid
+    if (uid == null) return
+    const day = recordDay(record)
+    const identity = getDeliveryLogIdentity(record)
+    // 合并写入不会删掉存储里已有的记录，删除要按天直接重写。
+    void enqueuePersistence(async () => {
+      await deliveryLogMutex(async () => {
+        const stored = await readArray(recordDayKey(uid, day))
+        await counter.storageSet(
+          recordDayKey(uid, day),
+          stored.filter((item) => getDeliveryLogIdentity(item) !== identity),
+        )
+      })
+    }).catch((error) => {
+      logger.warn('删除岗位记录失败', getProviderHeartbeatDiagnostic(error))
+    })
   }
   const recentAiGreetings = (limit = 10) => getRecentGreetingSummaries(data.value, limit)
 
   return {
     data,
+    events,
     runtimeData,
     setAccountScope,
     hydrate,
@@ -777,6 +1269,15 @@ export function useLog() {
     touchDelivery,
     remove,
     info,
+    debug,
+    recordDiagnostic,
     recentAiGreetings,
   }
+}
+
+const runEventStateNames: Record<logState, string> = {
+  info: '消息',
+  success: '完成',
+  warning: '注意',
+  danger: '异常',
 }

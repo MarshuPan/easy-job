@@ -5,6 +5,7 @@ import type { StorageItemKey } from '#imports'
 import { browser, storage } from '#imports'
 import { AiTaskAdmissionController, defaultAiTaskAdmissionOptions } from '@/utils/aiTaskAdmission'
 import {
+  AiTaskRequestValidationError,
   AI_TASK_REQUEST_TYPE,
   createAiTaskResponse,
   getAiTaskRequestValidationError,
@@ -31,8 +32,12 @@ import {
   STORAGE_QUOTA_ERROR_MESSAGE,
 } from '@/utils/storageQuota'
 
+import { requestMainWorldChatRuntime } from './chatRuntimeBridge'
+import { isChatRuntimeRequest } from './chatRuntimeProtocol'
 import { isConfigRevisionChangedMessage } from './configProtocol'
+import { isPendingGreetingWake } from './pendingGreetingProtocol'
 import { projectPageFormData } from './publicStateProjection'
+import { assertAllowedStorageKey } from './storageKeys'
 import {
   DELIVERY_WORKER_IDENTITY_REQUEST_TYPE,
   DELIVERY_WORKER_IDENTITY_RESPONSE_TYPE,
@@ -62,6 +67,7 @@ const pageCallableMethods = new Set([
   'deliveryTaskPause',
   'deliveryTaskResume',
   'deliveryTaskTerminate',
+  'localDiagnosticAppend',
   'deliveryWorkerIdentity',
   'contentScriptTest',
   'openChatTab',
@@ -71,35 +77,6 @@ const pageCallableMethods = new Set([
   'storageUsage',
 ])
 
-const allowedStorageKeySet = new Set([
-  'boss-protocol',
-  'local:pipeline-cache',
-  'local:pending-greetings',
-  'local:sameCompany',
-  'local:sameHr',
-  'local:web-geek-job-DeliveryLogs',
-  'local:web-geek-job-FormData',
-  'local:web-geek-job-SourcePools',
-  'local:web-geek-job-Statistics',
-  'local:web-geek-job-StatisticsEpoch',
-  'local:web-geek-job-Today',
-  'local:boss-action-gate',
-  'local:risk-backoff',
-  'appearance-conf',
-  'theme-dark',
-])
-
-const legacyTaskStoragePrefix = `local:${['boss', 'helper'].join('-')}-task-v1:`
-const allowedStorageKeyPrefixes = [
-  'local:alert:',
-  'local:agent-delivery-task-v1:',
-  legacyTaskStoragePrefix,
-]
-const allowedAccountStorageKeyPattern =
-  /^local:web-geek-job-(?:DeliveryLogs|SearchRotation|SourcePools|Statistics|StatisticsEpoch|Today):[A-Za-z0-9_-]{1,128}$/
-const allowedRuntimeLogStorageKeyPattern =
-  /^local:agent-delivery-runtime-logs:[A-Za-z0-9_-]{1,128}$/
-
 let bridgeToken: string | undefined
 export { AiTaskAdmissionController } from '@/utils/aiTaskAdmission'
 
@@ -107,17 +84,6 @@ const aiTaskAdmission = new AiTaskAdmissionController(defaultAiTaskAdmissionOpti
 
 export function setBridgeToken(token: string) {
   bridgeToken = token
-}
-
-function assertAllowedStorageKey(key: string) {
-  if (
-    allowedStorageKeySet.has(key) ||
-    allowedAccountStorageKeyPattern.test(key) ||
-    allowedRuntimeLogStorageKeyPattern.test(key) ||
-    allowedStorageKeyPrefixes.some((prefix) => key.startsWith(prefix))
-  )
-    return
-  throw new Error(`storage key is not allowed: ${key}`)
 }
 
 function getBridgeToken() {
@@ -162,6 +128,10 @@ export class ContentCounter implements ContentCounterApi {
 
   async configRuntimeSave(...args: Parameters<BackgroundCounterApi['configRuntimeSave']>) {
     return this.background.configRuntimeSave(...args)
+  }
+
+  async localDiagnosticAppend(...args: Parameters<BackgroundCounterApi['localDiagnosticAppend']>) {
+    return this.background.localDiagnosticAppend(...args)
   }
 
   async configAiTasksSave(...args: Parameters<BackgroundCounterApi['configAiTasksSave']>) {
@@ -326,8 +296,26 @@ export class InjectBackgroundAdapter implements Adapter<MessageMeta> {
   }
 }
 
-browser.runtime.onMessage.addListener((message) => {
+browser.runtime.onMessage.addListener((message, sender) => {
   const activeBridgeToken = getBridgeToken()
+  if (
+    activeBridgeToken != null &&
+    sender?.id === browser.runtime.id &&
+    isChatRuntimeRequest(message)
+  ) {
+    return requestMainWorldChatRuntime(message, activeBridgeToken)
+  }
+  if (
+    activeBridgeToken != null &&
+    sender?.id === browser.runtime.id &&
+    isPendingGreetingWake(message)
+  ) {
+    window.postMessage(
+      { type: message.type, bridgeToken: activeBridgeToken },
+      window.location.origin,
+    )
+    return
+  }
   if (activeBridgeToken == null || !isConfigRevisionChangedMessage(message)) return
   window.postMessage(
     {
@@ -358,8 +346,14 @@ window.addEventListener('message', (event) => {
   }
   const validationError = getAiTaskRequestValidationError(candidate)
   if (validationError) {
+    // Background independently rejects this request and persists the exact
+    // failure and input. It must never reach a provider or use a second outbox.
+    void browser.runtime.sendMessage(browser.runtime.id, candidate).catch(() => undefined)
     window.postMessage(
-      createAiTaskResponse(candidate.requestId, { ok: false, error: validationError }),
+      createAiTaskResponse(candidate.requestId, {
+        ok: false,
+        error: new AiTaskRequestValidationError(validationError),
+      }),
       window.location.origin,
     )
     return

@@ -149,10 +149,10 @@ describe('createHandle pipeline assembly', () => {
   it('measures credential age after the action gate, not before', async () => {
     const start = Date.now()
     const fetchedAt = start - 24 * 60_000
-    // 进闸门时 24 分钟，还没过线；闸门里等掉 7 分钟，出来已经 31 分钟。判断写在闸门
+    // 进闸门时 24 分钟，还没过线；闸门里等掉 4 分钟，出来进入安全余量。判断写在闸门
     // 前面就永远看不到这段等待。
     acquireBossActionMock.mockImplementationOnce(async () => {
-      vi.spyOn(Date, 'now').mockReturnValue(start + 7 * 60_000)
+      vi.spyOn(Date, 'now').mockReturnValue(start + 4 * 60_000)
       return true
     })
 

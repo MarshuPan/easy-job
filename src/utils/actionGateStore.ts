@@ -1,4 +1,5 @@
 import { counter } from '@/message'
+import { withDeliveryWait } from '@/stores/deliveryActivity'
 
 import {
   type ActionEvent,
@@ -144,20 +145,37 @@ export interface AcquireActionOptions {
  */
 export async function acquireBossAction(kind: BossActionKind, options: AcquireActionOptions = {}) {
   const startedAt = Date.now()
-  let notified = false
-  for (;;) {
-    if (options.shouldAbort?.() === true) return false
-    const waitMs = await tryClaim(kind, Date.now())
-    if (waitMs === 0) return true
-    const waited = Date.now() - startedAt
-    if (waited >= maxGateWaitMs) throw new ActionGateTimeoutError(kind, waited)
-    if (!notified) {
-      notified = true
-      options.onWait?.(waitMs)
-      logger.info('动作闸门限速', { kind, waitMs })
+  const firstWaitMs = await tryClaimOrAbort(kind, options)
+  if (firstWaitMs === true || firstWaitMs === false) return firstWaitMs
+  options.onWait?.(firstWaitMs)
+  logger.info('动作闸门限速', { kind, waitMs: firstWaitMs })
+  // 等待期间面板显示「BOSS 请求限速」，等完回到原来的阶段。
+  return withDeliveryWait(`BOSS 请求限速（${gateActionLabels[kind]}）`, firstWaitMs, async () => {
+    let nextWaitMs = firstWaitMs
+    for (;;) {
+      const waited = Date.now() - startedAt
+      if (waited >= maxGateWaitMs) throw new ActionGateTimeoutError(kind, waited)
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollStepMs, nextWaitMs)))
+      const claimed = await tryClaimOrAbort(kind, options)
+      if (claimed === true || claimed === false) return claimed
+      nextWaitMs = claimed
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(pollStepMs, waitMs)))
-  }
+  })
+}
+
+const gateActionLabels: Record<BossActionKind, string> = {
+  detail: '岗位详情',
+  publish: '建立沟通',
+  greeting: '发送招呼语',
+  pageNext: '翻页',
+  navigate: '切换来源',
+}
+
+/** 拿到名额返回 true，用户停止返回 false，否则返回还要等多久。 */
+async function tryClaimOrAbort(kind: BossActionKind, options: AcquireActionOptions) {
+  if (options.shouldAbort?.() === true) return false
+  const waitMs = await tryClaim(kind, Date.now())
+  return waitMs === 0 ? true : waitMs
 }
 
 /**
@@ -170,6 +188,19 @@ export async function getCurrentPaceMultiplier() {
   const now = Date.now()
   const events = pruneEvents(await withGateLock(async () => await readEvents()), now)
   return paceMultiplier(getSessionElapsedMs(events, now))
+}
+
+/**
+ * 最近一段时间里发生过多少次某类动作。面板用它显示「列表刷新 N 次/小时」：
+ * BOSS 不允许频繁刷新列表，这个数一旦明显升高要能一眼看到。
+ */
+export async function countRecentBossActions(
+  kinds: readonly BossActionKind[],
+  windowMs: number,
+  now = Date.now(),
+) {
+  const events = await withGateLock(async () => await readEvents())
+  return events.filter((event) => kinds.includes(event.kind) && event.at >= now - windowMs).length
 }
 
 /** 测试与「清空数据」用。 */

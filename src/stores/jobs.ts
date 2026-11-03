@@ -17,6 +17,7 @@ import type { FormData } from '@/types/formData'
 import { getCurDay } from '@/utils'
 import { createAccountStorageKey, normalizeAccountUid } from '@/utils/accountStorage'
 import { logger } from '@/utils/logger'
+import { toSafeJsonValue } from '@/utils/safeJson'
 import { createStorageMutex } from '@/utils/storageMutex'
 
 import { useLog } from './log'
@@ -433,6 +434,65 @@ function toPersistedSourceJob(job: MyJobListData): PersistedSourceJob {
   }
 }
 
+function captureJobAudit(item: MyJobListData) {
+  const plain = toPlainSourceJob(item) as unknown as Record<string, unknown>
+  return {
+    ...plain,
+    // Keep the platform payload alongside the normalized fields.  The
+    // normalized projection is used by delivery, but a field added by BOSS
+    // (or a field we have not modeled yet) is still evidence when diagnosing
+    // acquisition and recruiter/job distribution problems.
+    rawJobSnapshot: toSafeJsonValue(item),
+    card: toSafeJsonValue(item.card),
+    status: {
+      status: item.status.status,
+      msg: item.status.msg,
+    },
+  }
+}
+
+function summarizeCapturedJobs(items: readonly MyJobListData[]) {
+  const jobIds = new Set<string>()
+  const bossIds = new Set<string>()
+  const brandIds = new Set<string>()
+  const missingBossIds: string[] = []
+  const bossToCompanies = new Map<string, Set<string>>()
+  const duplicateJobIds: string[] = []
+  for (const item of items) {
+    const jobId = String(item.encryptJobId || '').trim()
+    if (jobId && jobIds.has(jobId)) duplicateJobIds.push(jobId)
+    if (jobId) jobIds.add(jobId)
+    const bossId = String(item.encryptBossId || '').trim()
+    if (!bossId) {
+      if (jobId) missingBossIds.push(jobId)
+      continue
+    }
+    bossIds.add(bossId)
+    const brandId = String(item.encryptBrandId || item.brandName || '').trim()
+    if (brandId) brandIds.add(brandId)
+    const companies = bossToCompanies.get(bossId) ?? new Set<string>()
+    if (brandId) companies.add(brandId)
+    bossToCompanies.set(bossId, companies)
+  }
+  const sameBossAcrossCompanies = [...bossToCompanies.entries()]
+    .filter(([, companies]) => companies.size > 1)
+    .map(([bossId, companies]) => ({
+      bossId,
+      companyCount: companies.size,
+      companies: [...companies],
+    }))
+  return {
+    jobCount: items.length,
+    uniqueJobCount: jobIds.size,
+    uniqueBossCount: bossIds.size,
+    uniqueBrandCount: brandIds.size,
+    missingBossIdCount: missingBossIds.length,
+    missingBossJobIds: missingBossIds,
+    duplicateJobIds: [...new Set(duplicateJobIds)],
+    sameBossAcrossCompanies,
+  }
+}
+
 export class JobList {
   private _vue_jobList = ref<bossZpJobItemData[]>([])
   private _vue_jobDetail = ref<bossZpDetailData>()
@@ -600,14 +660,67 @@ export class JobList {
     groupName?: string,
     pageNumber?: number,
   ) {
-    if (this._list.value.length === 0) return 0
+    const rawPageJobs = [...this._list.value]
+    const page = Number.isInteger(pageNumber) && Number(pageNumber) > 0 ? Number(pageNumber) : 1
     const searchDirectionKey = normalizeDeliverySourceKey(searchDirection ?? '')
+    const appendAcquisitionAudit = (data: Record<string, unknown>) => {
+      const append = (
+        counter as typeof counter & {
+          localDiagnosticAppend?: (
+            event: import('@/background/localDiagnosticSink').LocalDiagnosticEventInput,
+          ) => Promise<boolean>
+        }
+      ).localDiagnosticAppend
+      if (this._accountUid && typeof append === 'function') {
+        void append({
+          stream: 'deliveries',
+          event: 'acquisition.page-captured',
+          accountUid: this._accountUid,
+          data,
+        }).catch(() => undefined)
+      }
+    }
+
+    const commonAudit = {
+      source,
+      page,
+      groupTargetId,
+      groupName,
+      searchDirection,
+      searchDirectionKey,
+      rawPageSize: rawPageJobs.length,
+      rawPageSummary: summarizeCapturedJobs(rawPageJobs),
+      rawJobs: rawPageJobs.map(captureJobAudit),
+    }
+
+    if (rawPageJobs.length === 0) {
+      appendAcquisitionAudit({ ...commonAudit, status: 'empty-page', reason: 'no-page-jobs' })
+      return 0
+    }
     // 所有自动捕获最终都会经过这里。无搜索方向的普通列表页不能写入搜索池，
     // 否则异步列表刷新仍可绕过 OperationPanel 的显式入口校验。
-    if (source === 'search' && !searchDirectionKey) return 0
-    const candidates = canDeliver ? this._list.value.filter(canDeliver) : this._list.value
-    if (candidates.length === 0) return 0
-    const page = Number.isInteger(pageNumber) && Number(pageNumber) > 0 ? Number(pageNumber) : 1
+    if (source === 'search' && !searchDirectionKey) {
+      appendAcquisitionAudit({
+        ...commonAudit,
+        status: 'skipped',
+        reason: 'missing-search-direction',
+      })
+      return 0
+    }
+    const candidates = canDeliver ? rawPageJobs.filter(canDeliver) : rawPageJobs
+    const candidateIds = new Set(candidates.map((item) => item.encryptJobId))
+    const filteredOutJobs = rawPageJobs.filter((item) => !candidateIds.has(item.encryptJobId))
+    if (candidates.length === 0) {
+      appendAcquisitionAudit({
+        ...commonAudit,
+        status: 'all-pre-filtered',
+        candidateCount: 0,
+        filteredOutCount: filteredOutJobs.length,
+        filteredOutJobIds: filteredOutJobs.map((item) => item.encryptJobId),
+        candidateJobIds: [],
+      })
+      return 0
+    }
     for (const item of candidates) {
       if (source === 'group' && groupTargetId) {
         item.deliveryGroupTargetIds = Array.from(
@@ -652,6 +765,17 @@ export class JobList {
     }
     const before = this._sourceLists[source].length
     this.mergeSourceList(source, candidates)
+    appendAcquisitionAudit({
+      ...commonAudit,
+      status: 'captured',
+      beforePoolSize: before,
+      afterPoolSize: this._sourceLists[source].length,
+      candidateCount: candidates.length,
+      filteredOutCount: filteredOutJobs.length,
+      filteredOutJobIds: filteredOutJobs.map((item) => item.encryptJobId),
+      candidateJobIds: candidates.map((item) => item.encryptJobId),
+      captured: summarizeCapturedJobs(candidates),
+    })
     return this._sourceLists[source].length - before
   }
 
@@ -1115,7 +1239,7 @@ export class JobList {
         const recovered = mergedCount - localCount
         if (recovered > 0 && recovered !== this._lastMergedRecoveredCount) {
           this._lastMergedRecoveredCount = recovered
-          useLog().info(
+          useLog().debug(
             '投递池',
             `已合并其他标签页的投递池
 ${JSON.stringify({

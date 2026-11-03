@@ -18,6 +18,7 @@ import {
 } from '@/config/modelPermission'
 import type { AiModelConfig, ConfigBundleV1 } from '@/config/types'
 import { isResumeEvidenceStale } from '@/profile/resumeExtraction'
+import { resolveTargetRole } from '@/profile/targetRole'
 import { AgentMessage } from '@/ui/instrument'
 
 const uid = new URLSearchParams(location.search).get('uid')?.trim() ?? ''
@@ -31,6 +32,20 @@ const loadedResumeMarkdown = ref('')
 const resumeFeedback = ref<{ tone: 'success' | 'error'; text: string } | null>(null)
 
 const primaryModel = computed(() => bundle.value?.models[0] ?? null)
+// 留空时的兜底来自用户自己的 BOSS 求职期望，要写明来源——只显示一个岗位名，
+// 读起来像插件写死的默认值。
+const targetRolePlaceholder = computed(() => {
+  const names = [
+    ...new Set(
+      (bundle.value?.settings.jobRules.sources.enabledExpectations ?? [])
+        .map((item) => item.positionName.trim())
+        .filter(Boolean),
+    ),
+  ]
+  if (names.length > 0) return `留空时按岗位所属的 BOSS 求职期望：${names.join('、')}`
+  const fromResume = resolveTargetRole({ resumeMarkdown: bundle.value?.profile.resume.markdown })
+  return fromResume ? `留空时使用简历里的求职意向：${fromResume}` : '填写岗位方向和侧重'
+})
 const resumeStatus = computed(() => {
   if (busy.value === 'save-resume') return { tone: 'loading' as const, text: '解析中' }
   if (resumeFeedback.value) return resumeFeedback.value
@@ -191,7 +206,15 @@ async function saveResume() {
     if (!granted) {
       throw new ConfigClientError('模型地址权限未开启', 'MODEL_NETWORK_OR_PERMISSION')
     }
-    await saveProfileAndExtract(uid, bundle.value.profile.displayName, markdown, model)
+    await saveProfileAndExtract(
+      uid,
+      {
+        displayName: bundle.value.profile.displayName,
+        targetRole: bundle.value.profile.targetRole,
+      },
+      markdown,
+      model,
+    )
     resumeFeedback.value = {
       tone: 'success',
       text: '解析成功',
@@ -302,6 +325,23 @@ function getImportErrorMessage(error: unknown) {
                 class="profile-control"
                 type="text"
                 :maxlength="CONFIG_LIMITS.displayNameCharacters"
+              />
+            </label>
+
+            <label class="instrument-setting-row">
+              <span class="instrument-setting-copy">
+                <strong>求职定位</strong>
+                <span
+                  >AI 匹配和招呼语据此判断“我是谁”。可写岗位方向和侧重；留空时按每个岗位所属的 BOSS
+                  求职期望</span
+                >
+              </span>
+              <input
+                v-model.trim="bundle.profile.targetRole"
+                class="profile-control"
+                type="text"
+                :maxlength="CONFIG_LIMITS.targetRoleCharacters"
+                :placeholder="targetRolePlaceholder"
               />
             </label>
 

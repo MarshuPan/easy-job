@@ -23,6 +23,7 @@ import {
 import { logger } from '@/utils/logger'
 import { JOB_UI_VISIBILITY_EVENT } from '@/utils/zhipinRoute'
 
+import { useLauncherDrag } from '../hooks/useLauncherDrag'
 import { usePager } from '../hooks/usePager'
 import Config from './Config.vue'
 import DeliveryRecords from './DeliveryRecords.vue'
@@ -46,6 +47,16 @@ const { initPager } = usePager()
 const conf = useConf()
 
 const launcherRef = ref<HTMLButtonElement>()
+const {
+  launcherStyle,
+  dragging,
+  restorePosition,
+  startDrag,
+  moveDrag,
+  endDrag,
+  cancelDrag,
+  consumeDragClick,
+} = useLauncherDrag(launcherRef)
 const workspaceRef = ref<HTMLElement>()
 const personalFrameRef = ref<HTMLIFrameElement>()
 type WorkspaceSection = 'dashboard' | 'records' | 'filters' | 'settings' | 'personal' | 'logs'
@@ -152,6 +163,7 @@ onMounted(async () => {
     )
     return
   }
+  void restorePosition()
   let currentUser
   try {
     currentUser = await user.initUser({ pollIntervalMs: 200, timeoutMs: 2_000 })
@@ -212,6 +224,10 @@ async function openWorkspace() {
   panelOpen.value = true
   await nextTick()
   workspaceRef.value?.focus({ preventScroll: true })
+}
+
+function handleLauncherClick(event: MouseEvent) {
+  if (!consumeDragClick(event)) void openWorkspace()
 }
 
 function closeWorkspace() {
@@ -283,10 +299,17 @@ function handlePersonalFrameMessage(event: MessageEvent) {
     ref="launcherRef"
     v-show="!panelOpen"
     class="agent-delivery-launcher"
+    :class="{ 'is-dragging': dragging }"
+    :style="launcherStyle"
     type="button"
-    title="打开 Easy Job"
+    title="点击打开 Easy Job，拖动可调整位置"
     aria-label="打开 Easy Job"
-    @click="openWorkspace"
+    @pointerdown="startDrag"
+    @pointermove="moveDrag"
+    @pointerup="endDrag"
+    @pointercancel="cancelDrag"
+    @lostpointercapture="cancelDrag"
+    @click="handleLauncherClick"
   >
     <img
       class="agent-delivery-logo"

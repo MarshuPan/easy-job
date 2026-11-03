@@ -355,42 +355,6 @@ export function parseFiltering(content: string, minMatchPercent = 70) {
   }
 }
 
-export function parseGreetingMessages(content: string, messageCount = 3): string[] {
-  let parsed: Partial<{
-    messages?: unknown[]
-    message1?: unknown
-    message2?: unknown
-    message3?: unknown
-  }> | null
-  try {
-    parsed = parseGptJson<{
-      messages?: unknown[]
-      message1?: unknown
-      message2?: unknown
-      message3?: unknown
-    }>(content)
-  } catch (e) {
-    throw new GreetError(`AI招呼语 JSON 解析失败：${errorHandle(e)}`)
-  }
-  const messages = Array.isArray(parsed?.messages)
-    ? parsed.messages
-    : [parsed?.message1, parsed?.message2, parsed?.message3]
-  const result = messages
-    .map((item) => (typeof item === 'string' ? item.trim() : ''))
-    .filter((item) => item.length > 0)
-
-  if (result.length !== messageCount) {
-    throw new GreetError(`AI招呼语需要返回${messageCount}条消息，实际解析到 ${result.length} 条`)
-  }
-
-  return result
-}
-
-export {
-  formatBossTeacherSalutation,
-  normalizeGreetingSalutation,
-} from '@/utils/greetingSalutation'
-
 export function errorHandle(e: any): string {
   if (e instanceof Error) {
     return e.message

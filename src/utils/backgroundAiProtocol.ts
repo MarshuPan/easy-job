@@ -14,13 +14,18 @@ export const AI_TASK_RESPONSE_TYPE = 'agent-delivery:ai-task-response'
 export const AI_TASK_MAX_RETRIES = 2
 export const AI_TASK_MAX_RETRY_DELAY_SECONDS = 60
 export const AI_TASK_CLIENT_TIMEOUT_BUFFER_SECONDS = 5
-export const AI_TASK_MAX_DEPTH = 8
-export const AI_TASK_MAX_STRING_LENGTH = 32 * 1024
-export const AI_TASK_MAX_ARRAY_LENGTH = 200
-export const AI_TASK_MAX_TOTAL_LENGTH = 256 * 1024
+// Transport guards are deliberately aligned with the local diagnostic sink's
+// last-resort resource boundaries. They reject only an extreme message rather
+// than silently clipping a large resume/JD before the background can write its
+// full local diagnostic mirror.
+export const AI_TASK_MAX_DEPTH = 64
+export const AI_TASK_MAX_STRING_LENGTH = 16 * 1024 * 1024
+export const AI_TASK_MAX_ARRAY_LENGTH = 100_000
+export const AI_TASK_MAX_TOTAL_LENGTH = 16 * 1024 * 1024
 export const AI_TASK_ERROR_CODE = 'AI_TASK_FAILED'
 
 export type AiTaskErrorCode =
+  | 'AI_TASK_REQUEST_INVALID'
   | 'AI_TASK_TIMEOUT'
   | 'AI_TASK_RATE_LIMITED'
   | 'AI_TASK_AUTH_FAILED'
@@ -30,8 +35,22 @@ export type AiTaskErrorCode =
 
 export type AiTaskType = 'aiFiltering' | 'aiGreeting'
 
+export interface AiDiagnosticContext {
+  jobId?: string
+  encryptBossId?: string
+  securityId?: string
+  lid?: string
+  encryptBrandId?: string
+  jobName?: string
+  brandName?: string
+  greetingId?: string
+  greetingAttempt?: number
+}
+
 export interface AiTaskData {
   accountUid?: string
+  /** 只用于本机诊断关联，不参与提示词，也不会发给模型。 */
+  diagnosticContext?: AiDiagnosticContext
   /** 只在招呼语任务里出现：匹配任务看到阈值就会先定结论再补分数。 */
   filteringThreshold?: number
   data?: bossZpJobItemData
@@ -61,6 +80,7 @@ export interface AiTaskResponseMessage {
 }
 
 const aiTaskStaticErrors: Partial<Record<AiTaskErrorCode, string>> = {
+  AI_TASK_REQUEST_INVALID: '后台AI请求参数校验失败（未调用模型，请查看本机诊断）',
   AI_TASK_TIMEOUT: '后台AI任务超时',
   AI_TASK_RATE_LIMITED: '后台AI请求触发限流',
   AI_TASK_AUTH_FAILED: '后台AI鉴权失败',
@@ -68,6 +88,7 @@ const aiTaskStaticErrors: Partial<Record<AiTaskErrorCode, string>> = {
   AI_TASK_FAILED: '后台AI任务失败',
 }
 const aiTaskErrorCodes = new Set<AiTaskErrorCode>([
+  'AI_TASK_REQUEST_INVALID',
   'AI_TASK_TIMEOUT',
   'AI_TASK_RATE_LIMITED',
   'AI_TASK_AUTH_FAILED',
@@ -76,6 +97,29 @@ const aiTaskErrorCodes = new Set<AiTaskErrorCode>([
   AI_TASK_ERROR_CODE,
 ])
 const safeAiTaskIssueCodePattern = /^[A-Z][A-Z0-9_]{0,39}$/
+
+// Only fixed validation reasons can cross into MAIN world. Arbitrary field
+// names and rejected payloads belong in the local diagnostic mirror.
+const publicRequestValidationReasons = new Set([
+  'AI匹配度阈值不合法',
+  'AI招呼语筛选上下文不合法',
+  'AI招呼语近期记录不合法',
+  'AI匹配度任务不接受招呼语上下文',
+  'AI匹配度任务不接受投递阈值',
+])
+
+export class AiTaskRequestValidationError extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = 'AiTaskRequestValidationError'
+  }
+
+  get publicMessage() {
+    return publicRequestValidationReasons.has(this.message)
+      ? `后台AI请求参数校验失败：${this.message}（未调用模型）`
+      : aiTaskStaticErrors.AI_TASK_REQUEST_INVALID!
+  }
+}
 
 export class AiTaskResponseInvalidError extends Error {
   readonly attempt: number
@@ -134,6 +178,9 @@ function getFailedHttpStatus(error: unknown) {
 }
 
 function classifyAiTaskError(error: unknown): { errorCode: AiTaskErrorCode; error: string } {
+  if (error instanceof AiTaskRequestValidationError) {
+    return { errorCode: 'AI_TASK_REQUEST_INVALID', error: error.publicMessage }
+  }
   const status = getFailedHttpStatus(error)
   if (status === 401 || status === 403) {
     return { errorCode: 'AI_TASK_AUTH_FAILED', error: '后台AI鉴权失败' }
@@ -173,6 +220,14 @@ function isSafeAiTaskError(errorCode: unknown, error: unknown) {
     return false
   }
   if (typeof error !== 'string') return false
+  if (errorCode === 'AI_TASK_REQUEST_INVALID') {
+    return (
+      error === aiTaskStaticErrors.AI_TASK_REQUEST_INVALID ||
+      [...publicRequestValidationReasons].some(
+        (reason) => error === `后台AI请求参数校验失败：${reason}（未调用模型）`,
+      )
+    )
+  }
   if (errorCode === 'AI_TASK_HTTP_FAILED') {
     return /^后台AI请求失败（HTTP [45]\d{2}）$/.test(error)
   }
@@ -190,6 +245,7 @@ function isSafeAiTaskError(errorCode: unknown, error: unknown) {
 const aiTaskRequestKeys = new Set(['type', 'requestId', 'task', 'data', 'json', 'bridgeToken'])
 const aiTaskDataKeys = new Set([
   'accountUid',
+  'diagnosticContext',
   'filteringThreshold',
   'data',
   'boss',
@@ -197,6 +253,17 @@ const aiTaskDataKeys = new Set([
   'amap',
   'filtering',
   'recentGreetings',
+])
+const aiDiagnosticContextKeys = new Set([
+  'jobId',
+  'encryptBossId',
+  'securityId',
+  'lid',
+  'encryptBrandId',
+  'jobName',
+  'brandName',
+  'greetingId',
+  'greetingAttempt',
 ])
 const filteringContextKeys = new Set([
   'matchPercent',
@@ -206,21 +273,21 @@ const filteringContextKeys = new Set([
   'selectedFactIds',
   'claimMode',
 ])
-const recentGreetingKeys = new Set([
-  'sentAt',
-  'usedFactIds',
-  'openingPattern',
-  'messages',
-  'fingerprint',
-])
+const recentGreetingKeys = new Set(['sentAt', 'usedFactIds', 'messages', 'fingerprint'])
 const matchLevels = new Set(['strong', 'good', 'maybe', 'weak', 'reject'])
 
 function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: Set<string>) {
   return Object.keys(value).every((key) => allowedKeys.has(key))
 }
 
-function isBoundedFactIdList(value: unknown, minimumLength = 1): value is string[] {
-  if (!Array.isArray(value) || value.length < minimumLength || value.length > 2) return false
+function isBoundedFactIdList(
+  value: unknown,
+  minimumLength = 1,
+  maximumLength = AI_TASK_MAX_ARRAY_LENGTH,
+): value is string[] {
+  if (!Array.isArray(value) || value.length < minimumLength || value.length > maximumLength) {
+    return false
+  }
   if (
     !value.every(
       (item): item is string => typeof item === 'string' && item.length > 0 && item === item.trim(),
@@ -255,8 +322,8 @@ function isRecentGreetingSummary(value: unknown): value is RecentGreetingSummary
   return (
     typeof value.sentAt === 'number' &&
     Number.isFinite(value.sentAt) &&
+    // Preserve every historical reference, using only the transport resource boundary.
     isBoundedFactIdList(value.usedFactIds) &&
-    typeof value.openingPattern === 'string' &&
     Array.isArray(value.messages) &&
     value.messages.length >= 1 &&
     value.messages.length <= 5 &&
@@ -273,6 +340,24 @@ function getTaskSpecificDataValidationError(task: AiTaskType, data: Record<strin
       data.accountUid.length > 128)
   ) {
     return '后台AI任务账号 UID 不合法'
+  }
+  if (data.diagnosticContext !== undefined) {
+    if (!isRecord(data.diagnosticContext)) return '后台AI诊断上下文不合法'
+    const unknownContextKey = Object.keys(data.diagnosticContext).find(
+      (key) => !aiDiagnosticContextKeys.has(key),
+    )
+    if (unknownContextKey) return `后台AI诊断上下文包含不允许的字段: ${unknownContextKey}`
+    for (const key of aiDiagnosticContextKeys) {
+      const value = data.diagnosticContext[key]
+      if (value === undefined) continue
+      if (key === 'greetingAttempt') {
+        if (!Number.isSafeInteger(value) || (value as number) < 1) {
+          return '后台AI诊断上下文招呼语尝试次数不合法'
+        }
+      } else if (typeof value !== 'string' || value.length > 512) {
+        return `后台AI诊断上下文字段不合法: ${key}`
+      }
+    }
   }
   if (task === 'aiFiltering') {
     if ('filtering' in data || 'recentGreetings' in data) {

@@ -86,6 +86,7 @@ const { jobs, logData, makeJob, removeLog, removeJob, sourceLists } = vi.hoisted
 })
 
 vi.mock('@/stores/log', () => ({
+  DELIVERY_RECORD_RETENTION_DAYS: 7,
   useLog: () => ({
     data: logData,
     remove: removeLog,
@@ -140,8 +141,10 @@ vi.mock('../utils/deliveryLimit', () => ({
   inferDeliveryLimitSource: () => 'group',
 }))
 
+const { exportJson } = vi.hoisted(() => ({ exportJson: vi.fn() }))
+
 vi.mock('@/utils/jsonImportExport', () => ({
-  exportJson: vi.fn(),
+  exportJson,
 }))
 
 vi.mock('@/ui/instrument', () => ({
@@ -163,6 +166,7 @@ vi.mock('@/ui/instrument', () => ({
     template: '<div data-test="empty"><slot /></div>',
   },
   AgentMessage: {
+    info: vi.fn(),
     success: vi.fn(),
     warning: vi.fn(),
   },
@@ -480,7 +484,7 @@ describe('DeliveryRecords', () => {
     expect(drawerText).not.toContain('detail api failed')
   })
 
-  it('renders pending jobs in FIFO acquisition order without source rebalancing', () => {
+  it('lists pending jobs in the order they will be processed, split by the source ratio', () => {
     logData.value = []
     sourceLists.group = Array.from({ length: 10 }, (_, index) =>
       makeJob(`group-${index + 1}`, `分组岗位 ${index + 1}`, '分组公司'),
@@ -493,6 +497,77 @@ describe('DeliveryRecords', () => {
     const rows = wrapper.findAll('tbody > tr:not(.delivery-records__detail-row)')
     const firstTenSources = rows.slice(0, 10).map((row) => row.findAll('td')[2]?.text())
 
-    expect(firstTenSources).toEqual(Array.from({ length: 10 }, () => 'AI 产品经理'))
+    // 比例是求职期望 40 / 搜索 60：第一批 4 个求职期望、6 个搜索，和实际处理顺序一致。
+    expect(firstTenSources.filter((source) => source === 'AI 产品经理')).toHaveLength(4)
+  })
+
+  it('exports retained job records as one JSON with job details and the final greeting', async () => {
+    const job = makeJob('job-export', '导出岗位', '导出公司') as any
+    logData.value = [
+      {
+        title: '导出岗位',
+        state: 'success' as const,
+        state_name: '投递成功',
+        createdAt: 1000,
+        job,
+        data: {
+          listData: job,
+          deliverySource: 'group' as const,
+          deliveryStage: '投递成功' as const,
+          matchPercent: 82,
+          aiFilteringThreshold: 60,
+          aiFilteringDecision: { reason: '直接证据', risk: '行业不同' },
+          aiGreetingMessages: ['第一段', '第二段'],
+          aiGreetingMeta: {
+            usedFactIds: ['fact-a'],
+            anchor: { need: '会员复购', jdQuote: '负责会员复购提升' },
+            review: { jdQuoteFound: true, styleIssues: ['STOCK_PHRASE'], attempts: 2 },
+            fingerprint: 'abcd1234',
+          },
+          trace: [{ at: 1000, stage: '流程', status: 'info' as const, message: '开始处理' }],
+        },
+      },
+    ]
+    sourceLists.group = []
+
+    const wrapper = mount(DeliveryRecords)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text().includes('导出记录'))!
+      .trigger('click')
+
+    expect(exportJson).toHaveBeenCalledTimes(1)
+    const [payload] = exportJson.mock.calls[0]!
+    expect(payload).toMatchObject({ retentionDays: 7, count: 1 })
+    const [record] = payload.records
+    expect(record).toMatchObject({
+      status: '已投递',
+      reason: '',
+      match: { percent: 82, threshold: 60, reason: '直接证据', risk: '行业不同' },
+      job: {
+        company: '导出公司',
+        jobName: '导出岗位',
+        city: '上海',
+        experience: '3-5年',
+        degree: '本科',
+        boss: '刘女士 · HRBP',
+        labels: ['AI 产品'],
+        description: '导出岗位 的完整 JD 描述',
+      },
+      greeting: '第一段\n第二段',
+      greetingAnchor: { need: '会员复购', jdQuote: '负责会员复购提升' },
+    })
+    // 整批招呼语的体检放在导出顶部，改动有没有效果看数字，不靠一条条读。
+    expect(record.greetingFacts).toEqual(['fact-a'])
+    expect(payload.greetingHealth.current).toMatchObject({
+      count: 1,
+      facts: { distinct: 1, top: [{ id: 'fact-a', greetings: 1, share: 100 }] },
+      reviewed: 1,
+      jdQuoteFoundRate: 100,
+      rewrittenRate: 100,
+      sentWithStyleIssuesRate: 100,
+    })
+    // 过程明细只用于当天排查，不进导出。
+    expect(JSON.stringify(payload)).not.toContain('开始处理')
   })
 })

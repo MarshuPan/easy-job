@@ -10,6 +10,7 @@ import {
 import { useCommon } from '@/composables/useCommon'
 import { createEmptyStatistics, useStatistics } from '@/composables/useStatistics'
 import { useConf } from '@/stores/conf'
+import { reportDeliveryStage, reportDeliveryWait } from '@/stores/deliveryActivity'
 import type { MyJobListData } from '@/stores/jobs'
 import { jobList } from '@/stores/jobs'
 import type { DeliveryStage, log, logData, logErr } from '@/stores/log'
@@ -20,6 +21,7 @@ import {
   AgentDeliveryError,
   DeliveryStoppedError,
   GreetError,
+  GreetingGenerationError,
   JobDataIncompleteError,
   JobDetailAccessError,
   JobUnavailableError,
@@ -57,6 +59,7 @@ import { getJobSourceLabel } from '../utils/jobExpectations'
 
 export type JobListHandleResult =
   | 'completed'
+  | 'refill'
   | 'sourceLimit'
   | 'stopped'
   | 'terminalError'
@@ -80,6 +83,14 @@ type ProcessJobResult =
   | 'rateLimited'
 type ProcessMode = 'full' | 'greetingOnly'
 type PublishPhase = 'sent' | 'confirmed' | 'unknown'
+
+export interface DeliveryBatchHooks {
+  taskId?: string
+  /** 仅计划倒计时，不在岗位处理栈里操作列表或路由。 */
+  onIdle?: () => void
+  /** 岗位已结束且检查点已落盘后，允许让出剩余批次去补给。 */
+  shouldRefill?: () => boolean
+}
 const maxManualJobRetries = 3
 /**
  * 连续这么多个岗位取详情失败，就不再当成「这些岗位恰好都下线了」。
@@ -101,6 +112,14 @@ const unevaluableJobLimit = 3
 const browseOnlyMinRatio = 0.3
 const browseOnlyMaxRatio = 0.55
 
+/** 岗位正在处理中的阶段；结论阶段（成功、过滤、失败）之后紧接着是等待，由等待自己报告。 */
+const inProgressStages: ReadonlySet<DeliveryStage> = new Set<DeliveryStage>([
+  'JD筛选中',
+  '打招呼语生成中',
+  '正在建立沟通',
+  '正在打招呼',
+])
+
 export const useDeliver = defineStore('zhipin/deliver', () => {
   const total = ref(0)
   const current = ref(0)
@@ -110,6 +129,12 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
   const common = useCommon()
   const liveConf = useConf()
   let activeRuntimeFormData: FormData | null = null
+  let activeBatchHooks: DeliveryBatchHooks | undefined
+  let supplyTaskId: string | undefined
+  let processingDurations: number[] = []
+  function getProcessingDurations(taskId: string) {
+    return supplyTaskId === taskId ? [...processingDurations] : []
+  }
   const conf = {
     get formData() {
       return activeRuntimeFormData ?? liveConf.formData
@@ -127,6 +152,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
 
   function setDeliveryStage(ctx: logData, data: MyJobListData, stage: DeliveryStage, record?: log) {
     ctx.deliveryStage = stage
+    if (inProgressStages.has(stage)) reportDeliveryStage(stage)
     // 完整 Record 而不是 Partial + ?? 兜底：新增阶段时必须显式给出它对应的岗位状态，
     // 否则会静默落到 running，而 running 是「可投递」，岗位就又回到队列里了。
     const statusMap: Record<DeliveryStage, Parameters<typeof data.status.setStatus>[0]> = {
@@ -170,6 +196,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     return (
       e instanceof AIProviderError ||
       e instanceof RetryablePipelineError ||
+      e instanceof GreetingGenerationError ||
       e instanceof PublishError ||
       e instanceof RateLimitError ||
       e instanceof UnknownError
@@ -249,6 +276,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     // 这个岗位是不是「根本没评上」——详情取不到、数据缺字段。它决定连续计数加还是清。
     let jobWasUnevaluable = false
     let shouldCountTotal = !isRetry
+    let processedCounted = false
     const ctx: logData = options.record?.data ?? { listData: data }
     ctx.listData = data
     ctx.deliverySource = options.source ?? ctx.deliverySource ?? getDeliveryLimitSource()
@@ -261,6 +289,13 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     ctx.failureStage = undefined
     ctx.retryable = false
     const record = options.record ?? log.startDelivery(data, ctx)
+
+    function countProcessedOnce() {
+      if (isRetry || processedCounted) return
+      statistics.todayData.total++
+      countProcessedSource(ctx, data)
+      processedCounted = true
+    }
 
     try {
       await ensureTodayStatisticsSafely(ctx, record)
@@ -308,6 +343,10 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             shouldAbort: () => common.deliverStop,
           })
           shouldWaitForBatchRest = countConfirmedCommunication(ctx)
+          // Keep processed/source totals consistent with success before the next
+          // await. Automatic persistence normalizes total >= success; counting
+          // only in finally would then count this same job a second time.
+          countProcessedOnce()
           // 公司去重记录必须在 BOSS 已确认建立沟通后立即落盘，不能等 AI 招呼语完成；
           // 否则招呼语失败后重试会再次尝试同公司，导致公司额度和实际沟通不一致。
           for (const handler of chandle.afterPublish ?? []) {
@@ -332,12 +371,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
               assertDeliveryNotStopped('用户已停止投递，未继续发送招呼语')
             }
             const label = `第 ${afterIndex + 1}/${chandle.after.length} 个投递后处理`
-            setDeliveryStage(
-              ctx,
-              data,
-              isAiGreetingRuntimeEnabled() ? '打招呼语生成中' : '正在打招呼',
-              record,
-            )
+            // 招呼语已在建立沟通前生成，这里只剩发送。
+            setDeliveryStage(ctx, data, '正在打招呼', record)
             addLogTrace(ctx, '投递后处理', 'info', `${label}开始`)
             try {
               await h({ data }, ctx)
@@ -410,6 +445,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           !isProviderHeartbeatError(e)
         ) {
           shouldWaitForBatchRest = countUnknownCommunication(ctx)
+          countProcessedOnce()
           shouldWaitForHumanLikePace = true
           const failureStage = inferFailureStage(ctx)
           const failureReason = e instanceof Error ? e.message : String(e)
@@ -432,6 +468,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         if (isProviderHeartbeatError(e)) {
           if (publishPhase === 'sent' || publishPhase === 'unknown') {
             shouldWaitForBatchRest = countUnknownCommunication(ctx)
+            countProcessedOnce()
             shouldWaitForHumanLikePace = true
           }
           const failureStage = inferFailureStage(ctx)
@@ -512,11 +549,15 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         ctx.failureStage = failureStage
         ctx.failureReason = e.message ?? ''
         ctx.retryable = isDetailAccessFailure || isPageSessionFailure || canRetryError(e, ctx)
+        // 详情拿不到（凭据过期、被拒）时岗位没有被评估，也没发出投递，会在刷新凭据后重投。
+        // 记成「失败」会让人以为这个岗位投坏了。
         ctx.state = isGreetingAfterPublishFailure
           ? '招呼语失败'
-          : e.state === 'warning'
-            ? '过滤'
-            : '失败'
+          : isDetailAccessFailure
+            ? '暂缓'
+            : e.state === 'warning'
+              ? '过滤'
+              : '失败'
         ctx.err = e.message ?? ''
         addLogTrace(ctx, e.state === 'warning' ? '筛选/跳过' : '失败', e.state, e.message ?? '')
         log.finishDelivery(record, e as logErr, ctx)
@@ -586,6 +627,9 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             data.status.setStatus('warn', '已建立沟通，招呼语未完成，可从记录中继续')
           } else {
             data.status.setStatus('wait', '等待中')
+            // 岗位放回了待处理，继续后会重新处理；日志写「失败」会让人以为这个岗位投坏了。
+            ctx.state = '暂停'
+            ctx.failureReason = `${e.message}，岗位已放回待处理`
           }
           addLogTrace(ctx, '流程', 'danger', `AI 请求失败：${e.message}`)
           AgentMessage.error('AI 请求失败')
@@ -671,10 +715,23 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       }
 
       if (shouldCountTotal || (!isRetry && ctx.communicationCounted === true)) {
-        statistics.todayData.total++
-        countProcessedSource(ctx, data)
+        countProcessedOnce()
       }
       await flushJobRunState(ctx, record, delivered ? '岗位处理成功' : '岗位处理结束')
+      logJobOutcome(ctx, data, jobStartedAt)
+      const browseOnlyDuration =
+        ctx.detailAttempted === true && !shouldWaitForHumanLikePace
+          ? getBrowseOnlyDurationMs(targetJobDuration)
+          : 0
+      if (
+        !isRetry &&
+        shouldCountTotal &&
+        ['success', 'filtered', 'error'].includes(data.status.status)
+      ) {
+        const paceMs = shouldWaitForHumanLikePace ? targetJobDuration : browseOnlyDuration
+        processingDurations.push(Math.max(0, Date.now() - jobStartedAt, paceMs))
+        processingDurations = processingDurations.slice(-20)
+      }
       if (shouldWaitForHumanLikePace) {
         await waitForHumanLikeJobPace(ctx, jobStartedAt, targetJobDuration, currentPaceMultiplier)
       } else if (ctx.detailAttempted === true) {
@@ -683,17 +740,42 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         // 后来改成按详情拿到手算，失败的详情请求仍然是零等待——而详情开始失败恰恰是
         // 最该慢下来的时候。真机上 6 个失败请求在 565 毫秒内打空了令牌桶。
         // 只看不投的岗位，人停留的时间本来也比投出去的短，所以按一个折扣比例来。
-        await waitForHumanLikeJobPace(
-          ctx,
-          jobStartedAt,
-          getBrowseOnlyDurationMs(targetJobDuration),
-          currentPaceMultiplier,
-        )
+        await waitForHumanLikeJobPace(ctx, jobStartedAt, browseOnlyDuration, currentPaceMultiplier)
       }
       if (shouldWaitForBatchRest && hasDailyDeliveryRemaining(statistics.todayData)) {
         await waitForBatchRest(statistics.todayData.success)
       }
     }
+  }
+
+  /**
+   * 运行日志里每个岗位一行结论。过程明细在投递记录里，这里只回答「这个岗位怎么样了」。
+   */
+  function logJobOutcome(ctx: logData, data: MyJobListData, startedAt: number) {
+    const state = ctx.state
+    if (!state) return
+    const parts = [
+      state,
+      [data.brandName, data.jobName].filter(Boolean).join(' · '),
+      typeof ctx.matchPercent === 'number' ? `匹配 ${ctx.matchPercent}%` : '',
+      state === '成功' && ctx.greetingSend?.messageCount
+        ? `招呼语 ${ctx.greetingSend.messageCount} 条`
+        : '',
+      state !== '成功' && ctx.failureReason ? truncateReason(ctx.failureReason) : '',
+      `用时 ${Math.max(0, Math.round((Date.now() - startedAt) / 1000))} 秒`,
+    ].filter(Boolean)
+    log.info('岗位', parts.join(' · '), jobOutcomeState(state))
+  }
+
+  function truncateReason(reason: string) {
+    const firstLine = reason.split('\n')[0] ?? ''
+    return firstLine.length > 60 ? `${firstLine.slice(0, 60)}…` : firstLine
+  }
+
+  function jobOutcomeState(state: string) {
+    if (state === '成功') return 'success' as const
+    if (state === '过滤' || state === '已停止' || state === '暂缓') return 'info' as const
+    return 'warning' as const
   }
 
   async function ensureTodayStatistics() {
@@ -769,9 +851,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
   async function jobListHandle(
     batchItems?: DeliveryBatchItem<MyJobListData>[],
     runtimeFormData?: FormData,
+    hooks?: DeliveryBatchHooks,
   ): Promise<JobListHandleResult> {
     const previousRuntimeFormData = activeRuntimeFormData
+    const previousHooks = activeBatchHooks
     activeRuntimeFormData = runtimeFormData ?? null
+    activeBatchHooks = hooks
+    if (hooks?.taskId !== supplyTaskId) {
+      supplyTaskId = hooks?.taskId
+      processingDurations = []
+    }
     try {
       terminalError.value = ''
       rateLimitBackoffSeconds = 0
@@ -790,7 +879,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           item,
           source: currentSource,
         }))
-      log.info('投递池', `本次从投递池取出 ${items.length} 个岗位`)
+      log.debug('投递池', `本次从投递池取出 ${items.length} 个岗位`)
       total.value = items.length
       const chandle = await createHandle(activeRuntimeFormData ?? undefined)
       const greetingResumeResult = await resumePendingGreetingRecords(chandle)
@@ -800,7 +889,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       let succeeded = 0
       let failed = 0
       const sourceSummary = summarizeBatchSources(items)
-      log.info(
+      log.debug(
         '岗位处理',
         `开始处理投递池批次\n${JSON.stringify({
           listLength: items.length,
@@ -834,7 +923,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       for (const [index, { item: data, source }] of items.entries()) {
         current.value = index
         if (common.deliverStop) {
-          log.info(
+          log.debug(
             '暂停投递',
             `剩余 ${items.length - index} 个未处理\n${JSON.stringify({
               index,
@@ -860,7 +949,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         })
         if (result === 'success') succeeded++
         if (result === 'failed') failed++
-        log.info(
+        log.debug(
           '岗位处理',
           `岗位处理进度\n${JSON.stringify({
             index,
@@ -875,7 +964,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           })}`,
         )
         if (result === 'sourceLimit') {
-          log.info(
+          log.debug(
             '岗位处理',
             `当前页处理触发每日额度上限\n${JSON.stringify({
               index,
@@ -890,7 +979,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           return 'sourceLimit'
         }
         if (result === 'stopped') {
-          log.info(
+          log.debug(
             '岗位处理',
             `当前页处理被暂停\n${JSON.stringify({
               index,
@@ -913,7 +1002,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           result === 'aiUnavailable' ||
           result === 'rateLimited'
         ) {
-          log.info(
+          log.debug(
             '岗位处理',
             `当前页处理因运行错误终止\n${JSON.stringify({
               index,
@@ -927,9 +1016,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           )
           return result
         }
+        if (
+          !common.deliverStop &&
+          hasDailyDeliveryRemaining(statistics.todayData) &&
+          hooks?.shouldRefill?.()
+        ) {
+          return 'refill'
+        }
       }
       const finalResult = common.deliverStop ? 'stopped' : 'completed'
-      log.info(
+      log.debug(
         '岗位处理',
         `当前页岗位处理结束：${finalResult}\n${JSON.stringify({
           processed,
@@ -944,6 +1040,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       return finalResult
     } finally {
       activeRuntimeFormData = previousRuntimeFormData
+      activeBatchHooks = previousHooks
     }
   }
 
@@ -1181,7 +1278,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     const waitSeconds = Math.ceil(remainingMs / 1000)
     const targetSeconds = Math.ceil(targetDurationMs / 1000)
     const msg = `投递节奏等待 ${waitSeconds} 秒后继续下一个岗位`
-    log.info(
+    log.debug(
       '投递节奏',
       `${msg}\n${JSON.stringify({
         jobName: ctx.listData.jobName,
@@ -1195,6 +1292,9 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       })}`,
     )
     logger.info(`${msg}，目标单JD耗时 ${targetSeconds} 秒`)
+    reportDeliveryWait('等待处理下一个岗位', remainingMs)
+    if (!common.deliverStop && hasDailyDeliveryRemaining(statistics.todayData))
+      activeBatchHooks?.onIdle?.()
     await delayWithStop(remainingMs)
   }
 
@@ -1207,6 +1307,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     const msg = `已投递/打招呼 ${successCount} 个，进入批量休息 ${restMinutes} 分钟，休息结束后会自动继续`
     log.info('批量休息', msg)
     AgentMessage.info(msg)
+    reportDeliveryWait(`批次休息（已投 ${successCount} 个）`, restSeconds * 1000)
+    if (!common.deliverStop) activeBatchHooks?.onIdle?.()
     await delayWithStop(restSeconds * 1000)
     if (common.deliverStop) {
       log.info('批量休息', `批量休息被停止打断，当前成功 ${successCount} 个`)
@@ -1226,6 +1328,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     createHandle,
     deliverOne,
     jobListHandle,
+    getProcessingDurations,
     retryRecord,
     resetBatchPace,
     terminalError,

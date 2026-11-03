@@ -50,9 +50,20 @@ describe('configuration message protocol', () => {
         action: 'save-profile-draft',
         uid: 'account-a',
         displayName: '候选人',
+        targetRole: 'AI 产品经理',
         markdown: '简历内容',
       }),
     ).toBe(true)
+    expect(
+      isConfigRequest({
+        type: CONFIG_REQUEST_TYPE,
+        requestId: 'request-profile-without-role',
+        action: 'save-profile-draft',
+        uid: 'account-a',
+        displayName: '候选人',
+        markdown: '简历内容',
+      }),
+    ).toBe(false)
     expect(
       isConfigRequest({
         type: CONFIG_REQUEST_TYPE,

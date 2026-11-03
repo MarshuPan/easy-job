@@ -20,6 +20,15 @@
   gap: 8px;
 }
 
+.console-log__diagnostics {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--agent-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .console-log__body {
   min-height: 0;
 }

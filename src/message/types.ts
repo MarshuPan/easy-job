@@ -8,6 +8,7 @@ import type {
   DeliveryTaskWorkerRequest,
   DurableDeliveryTask,
 } from '@/background/deliveryTaskCoordinator'
+import type { LocalDiagnosticEventInput } from '@/background/localDiagnosticSink'
 import type { JobExpectationConfig } from '@/config/types'
 import type { messageReps } from '@/types/aiProtocol'
 import type { FormData } from '@/types/formData'
@@ -72,19 +73,28 @@ export interface BackgroundCounterApi {
   cookieSave(info: CookieInfo): Promise<boolean>
   cookieDelete(uid: string): Promise<boolean>
   cookieClear(): Promise<boolean>
-  openChatTab(url: string): Promise<{
-    tabId?: number
-    reused: boolean
-    url: string
-    active?: boolean
-    reloaded?: boolean
-    loaded?: boolean
-  }>
+  openChatTab(
+    url: string,
+    expectedUid: string,
+  ): Promise<
+    import('./chatRuntimeProtocol').ChatRuntimeState & {
+      tabId?: number
+      reused: boolean
+      url: string
+      active?: boolean
+      reloaded?: boolean
+      loaded?: boolean
+      handshakeMs?: number
+      recoveryCode?: string
+    }
+  >
   runAiTask(args: {
     task: AiTaskType
     data: AiTaskData
     json?: boolean
+    requestId?: string
   }): Promise<Omit<messageReps, 'prompt'>>
+  localDiagnosticAppend(event: LocalDiagnosticEventInput): Promise<boolean>
   configRuntime(uid: string): Promise<PublicRuntimeConfig>
   configAiTasksSave(tasks: {
     aiFiltering?: { enabled?: boolean; score?: number }
@@ -131,6 +141,7 @@ export interface ContentCounterApi extends Pick<
   | 'deliveryTaskResume'
   | 'deliveryTaskTerminate'
   | 'openChatTab'
+  | 'localDiagnosticAppend'
 > {
   deliveryWorkerIdentity(sessionToken: string): Promise<string>
   storageGet<T>(key: string, defaultValue: T): Promise<T>

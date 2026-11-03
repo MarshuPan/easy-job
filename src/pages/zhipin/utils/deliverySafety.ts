@@ -2,6 +2,7 @@ export type DeliveryStopReason =
   | 'manual-stop'
   | 'manual-pause'
   | 'ai-unavailable'
+  | 'ai-retry'
   | 'session-unavailable'
   | 'security-check'
   | 'daily-limit'
@@ -14,8 +15,9 @@ export type DeliveryStopReason =
 export const deliveryStopReasonPriority: Record<DeliveryStopReason, number> = {
   'rate-limited': 4,
   'manual-stop': 10,
-  'manual-pause': 4,
+  'manual-pause': 9,
   'ai-unavailable': 4,
+  'ai-retry': 2,
   'session-unavailable': 4,
   'security-check': 5,
   'daily-limit': 3,

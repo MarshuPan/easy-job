@@ -24,16 +24,28 @@ describe('AI greeting domain parsing', () => {
         JSON.stringify({
           messages: ['第一条', '第二条', '第三条'],
           usedFactIds: ['fact-agent-content'],
+          segmentFactIds: [['fact-agent-content'], [], []],
           claimMode: 'direct',
-          openingPattern: 'jd-hook',
+          anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
         }),
       ),
     ).toEqual({
+      anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
       messages: ['第一条', '第二条', '第三条'],
       usedFactIds: ['fact-agent-content'],
-      claimMode: 'direct',
-      openingPattern: 'jd-hook',
+      segmentFactIds: [['fact-agent-content'], [], []],
     })
+    // 草稿不再要求模型自报 claimMode，没有这一项也是完整的。
+    expect(
+      parseGreetingDraft(
+        JSON.stringify({
+          messages: ['第一条', '第二条', '第三条'],
+          usedFactIds: ['fact-agent-content'],
+          segmentFactIds: [['fact-agent-content'], [], []],
+          anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
+        }),
+      ).usedFactIds,
+    ).toEqual(['fact-agent-content'])
   })
 
   it('accepts the configured message count', () => {
@@ -42,8 +54,9 @@ describe('AI greeting domain parsing', () => {
         JSON.stringify({
           messages: ['第一条', '第二条'],
           usedFactIds: ['fact-agent-content'],
+          segmentFactIds: [['fact-agent-content'], []],
           claimMode: 'direct',
-          openingPattern: 'jd-hook',
+          anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
         }),
         2,
       ).messages,
@@ -60,7 +73,7 @@ describe('AI greeting domain parsing', () => {
           messages: ['第一条', '第二条', '第三条'],
           usedFactIds: [],
           claimMode: 'direct',
-          openingPattern: '',
+          anchor: { need: '', jdQuote: '' },
         }),
       ),
     ).toThrow('AI招呼语元数据不完整')
@@ -119,7 +132,7 @@ describe('AI greeting domain parsing', () => {
     ).toBeNull()
   })
 
-  it('trims and deduplicates filtering fact ids before applying the limit', () => {
+  it('trims and deduplicates filtering fact ids without truncating references', () => {
     const result = parseFilteringDecisionContent(
       JSON.stringify({
         matchPercent: 80,
@@ -135,7 +148,11 @@ describe('AI greeting domain parsing', () => {
       70,
     )
 
-    expect(result?.decision.selectedFactIds).toEqual(['fact-agent-content', 'fact-b2b-saas'])
+    expect(result?.decision.selectedFactIds).toEqual([
+      'fact-agent-content',
+      'fact-b2b-saas',
+      'fact-third',
+    ])
   })
 
   it('rejects whitespace-only greeting fact ids', () => {
@@ -144,14 +161,15 @@ describe('AI greeting domain parsing', () => {
         JSON.stringify({
           messages: ['第一条', '第二条', '第三条'],
           usedFactIds: [' ', '\t'],
+          segmentFactIds: [[], [], []],
           claimMode: 'direct',
-          openingPattern: 'jd-hook',
+          anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
         }),
       ),
     ).toThrow('AI招呼语元数据不完整')
   })
 
-  it('trims and deduplicates greeting fact ids before applying the limit', () => {
+  it('preserves all greeting facts and their complete segment mappings', () => {
     const result = parseGreetingDraft(
       JSON.stringify({
         messages: ['第一条', '第二条', '第三条'],
@@ -160,12 +178,26 @@ describe('AI greeting domain parsing', () => {
           'fact-agent-content',
           '\tfact-b2b-saas\t',
           'fact-third',
+          'fact-fourth',
+          'fact-fifth',
+        ],
+        segmentFactIds: [
+          ['fact-agent-content', 'fact-b2b-saas', 'fact-third'],
+          ['fact-fourth', 'fact-fifth'],
+          [],
         ],
         claimMode: 'direct',
-        openingPattern: 'jd-hook',
+        anchor: { need: 'Agent 产品落地', jdQuote: '负责 Agent 产品' },
       }),
     )
 
-    expect(result.usedFactIds).toEqual(['fact-agent-content', 'fact-b2b-saas'])
+    expect(result.usedFactIds).toEqual([
+      'fact-agent-content',
+      'fact-b2b-saas',
+      'fact-third',
+      'fact-fourth',
+      'fact-fifth',
+    ])
+    expect(result.segmentFactIds[0]).toHaveLength(3)
   })
 })

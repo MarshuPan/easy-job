@@ -130,11 +130,10 @@ vi.mock('@/stores/conf', () => ({
   }),
 }))
 
+const commonState = vi.hoisted(() => ({ deliverLock: false, deliverStop: false }))
+
 vi.mock('@/composables/useCommon', () => ({
-  useCommon: () => ({
-    deliverLock: false,
-    deliverStop: false,
-  }),
+  useCommon: () => commonState,
 }))
 
 vi.mock('@/composables/useStatistics', () => ({
@@ -155,6 +154,7 @@ vi.mock('@/stores/jobs', () => ({
 vi.mock('@/stores/log', () => ({
   useLog: () => ({
     data: logData,
+    recordDiagnostic: vi.fn(),
     flush: vi.fn(async () => undefined),
   }),
 }))
@@ -182,6 +182,7 @@ vi.mock('../hooks/useDeliver', () => ({
     currentData: { jobName: 'AI 产品经理' },
     resetBatchPace: vi.fn(),
     jobListHandle: vi.fn(async () => 'done'),
+    getProcessingDurations: () => [],
   }),
 }))
 
@@ -203,7 +204,8 @@ vi.mock('../utils/deliveryLimit', () => ({
   setDeliveryLimitSourceOverride,
 }))
 
-vi.mock('../utils/deliveryTask', () => ({
+vi.mock('../utils/deliveryTask', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/deliveryTask')>()),
   clearDeliveryTask: vi.fn(),
   createDeliveryTask,
   getCurrentTaskStep: vi.fn(() => null),
@@ -226,6 +228,7 @@ vi.mock('@/ui/instrument', () => ({
   },
   AgentMessage: {
     info: vi.fn(),
+    debug: vi.fn(),
   },
   AgentProgress: {
     name: 'AgentProgress',
@@ -295,20 +298,30 @@ describe('operation panel', () => {
     expect(text).not.toContain('批量投递')
     expect(text).toContain('TODAY / DELIVERED')
     expect(text).toContain('034 / 100')
-    expect(text).toContain('投递成功率')
+    // 分母包含被 AI 过滤掉的岗位，含义是「处理过的岗位里投出去多少」，不是请求成功率。
+    expect(text).toContain('投递率')
+    expect(text).not.toContain('投递成功率')
     expect(text).toContain('68%')
+    expect(text).toContain('投出 34 · 处理 50')
+    // 「已获取」是池里所有岗位（含已处理），看了做不了判断；「待重新发现」是内部说法。
+    expect(text).toContain('暂缓 · 凭据过期')
+    expect(text).toContain('抓到新列表后自动恢复')
+    expect(text).not.toContain('已获取 / 待重新发现')
+    expect(text).toContain('剩余 66 个')
     expect(text).toContain('求职期望 2 · 搜索 3')
     expect(text).toContain('来源效率')
     expect(wrapper.find('.operation-panel__source-table').exists()).toBe(true)
     expect(wrapper.find('.operation-panel__source-chart').exists()).toBe(false)
     expect(wrapper.find('.operation-panel__source-result-bar').exists()).toBe(false)
-    expect(text).toContain('来源')
-    expect(text).toContain('待处理')
-    expect(text).toContain('今日处理')
-    expect(text).toContain('今日成功')
-    expect(text).toContain('今日过滤')
-    expect(text).toContain('今日异常')
-    expect(text).toContain('成功率')
+    // 表头不再逐列写「今日」：时间范围在区块标题上标一次（SOURCE / TODAY），
+    // 和顶部 TODAY / DELIVERED 一致。
+    expect(
+      wrapper
+        .find('.operation-panel__source-table-head')
+        .findAll('span')
+        .map((cell) => cell.text()),
+    ).toEqual(['来源', '待处理', '处理', '成功', '过滤', '异常', '成功率'])
+    expect(text).toContain('SOURCE / TODAY')
     expect(text).not.toContain('成功/失败')
     expect(text).not.toContain('过滤/异常')
     // 来源只有两个大类：求职期望和搜索。原来叫「求职期望投递池」「搜索投递池」——
@@ -333,9 +346,47 @@ describe('operation panel', () => {
     ])
     expect(text).toContain('最近记录归因')
     expect(text).toContain('岗位方向不符')
-    expect(text).toContain('接口/风控')
+    expect(text).toContain('接口/限流')
     expect(text).toContain('运行参数')
     expect(text).toContain('求职期望 50% / 搜索 50%')
+    // 设定比例旁给出今天的实际比例（8 / 42）：真机上设 50/50、实际跑成 100/0 却看不出来。
+    expect(text).toContain('（今天 16% / 84%）')
+    // 过滤是正常结论，不算「需要关注」。
+    expect(text).not.toContain('异常 / 过滤')
+  })
+
+  it('lights only the step the current job is in, and counts down while waiting', async () => {
+    const { clearDeliveryActivity, reportDeliveryStage, reportDeliveryWait } =
+      await import('@/stores/deliveryActivity')
+    commonState.deliverLock = true
+    try {
+      reportDeliveryStage('打招呼语生成中')
+      const wrapper = mount(OperationPanel)
+      await vi.advanceTimersByTimeAsync(12_000)
+
+      const steps = wrapper.findAll('.operation-panel__sequence-step')
+      const signal = (index: number) =>
+        steps[index]!.find('.operation-panel__step-signal').classes()
+      // 原来投递中时 JD 筛选、生成招呼语、建立沟通三步同时亮，文字是写死的。
+      expect(signal(1)).toContain('is-complete')
+      expect(signal(2)).toContain('is-current')
+      expect(signal(3)).toContain('is-idle')
+      expect(steps[2]!.text()).toContain('生成招呼语 · 已用 12 秒')
+      expect(wrapper.find('.operation-panel__hero-copy').text()).toContain(
+        '生成招呼语 · 已用 12 秒',
+      )
+
+      // 等待时写明在等什么、还要多久，不再只显示「投递流程运行中」看起来像卡住。
+      reportDeliveryWait('等待处理下一个岗位', 42_000)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(wrapper.find('.operation-panel__hero-copy').text()).toContain(
+        '等待处理下一个岗位 · 还剩 41 秒',
+      )
+      expect(wrapper.findAll('.operation-panel__step-signal.is-current')).toHaveLength(0)
+    } finally {
+      commonState.deliverLock = false
+      clearDeliveryActivity()
+    }
   })
 
   it('does not let an unassigned recent record distort persistent source totals', () => {
@@ -363,7 +414,7 @@ describe('operation panel', () => {
       const text = wrapper.text()
       expect(text).not.toContain('未归因历史')
       expect(wrapper.findAll('.operation-panel__source-table-row')).toHaveLength(2)
-      expect(text).toContain('接口/风控')
+      expect(text).toContain('接口/限流')
     } finally {
       logData.value = previousLogs
     }
@@ -412,7 +463,7 @@ describe('operation panel', () => {
       window.dispatchEvent(new Event('focus'))
       await flushPromises()
       expect(statistics.updateStatistics).toHaveBeenCalledTimes(2)
-      expect(wrapper.find('.operation-panel__failure-list').text()).toContain('接口/风控')
+      expect(wrapper.find('.operation-panel__failure-list').text()).toContain('接口/限流')
       expect(wrapper.find('.operation-panel__failure-list').text()).not.toContain('岗位方向不符')
 
       document.dispatchEvent(new Event('visibilitychange'))

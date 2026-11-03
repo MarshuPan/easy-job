@@ -1,4 +1,5 @@
 import { SEARCH_DIRECTIONS_PER_CYCLE, selectRotatingCycle } from '@/delivery/acquisition/scheduler'
+import { withoutBossSecurityCheckParam } from '@/utils/bossPageState'
 
 import type { DeliveryLimitSource } from './deliveryLimit'
 import type { JobExpectation } from './jobExpectations'
@@ -48,6 +49,12 @@ export interface DeliveryTask {
   cycleStartedTotal?: number
   noProgressCycles?: number
   retryAt?: number
+  aiUnavailableAttempts?: number
+  /** 恢复原因随后台权威检查点保存，页面刷新后仍能说明为何等待或暂停。 */
+  interruption?: {
+    reason: 'ai-retry' | 'ai-unavailable' | 'source-retry'
+    message: string
+  }
   /** 下一轮求职期望从该游标之后开始，避免每轮都固定命中第一个期望。 */
   groupExpectationCursorId?: string
   runtimeHeartbeat?: {
@@ -102,7 +109,7 @@ function readDeliveryTaskAtKey(key: string): DeliveryTask | null {
   }
 }
 
-function isDeliveryTask(value: unknown): value is DeliveryTask {
+export function isDeliveryTask(value: unknown): value is DeliveryTask {
   if (typeof value !== 'object' || value == null || Array.isArray(value)) return false
   const task = value as Partial<DeliveryTask>
   return (
@@ -405,7 +412,9 @@ export function createDeliveryTask(args: {
   hasRemaining: (source: DeliveryLimitSource) => boolean
 }): DeliveryTask | null {
   const groupUrl =
-    args.currentSource === 'group' ? args.currentUrl : (args.groupUrl ?? defaultGroupUrl)
+    args.currentSource === 'group'
+      ? withoutBossSecurityCheckParam(args.currentUrl)
+      : (args.groupUrl ?? defaultGroupUrl)
   const configuredSearchSteps = normalizeSearchSteps(args.searchUrls, args.searchUrl)
   const selectedSearch = selectRotatingCycle({
     items: configuredSearchSteps,

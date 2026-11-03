@@ -343,6 +343,132 @@ describe('delivery dashboard metrics', () => {
     expect(dashboard.failureCategories.find((item) => item.id === 'publish')?.count).toBe(1)
   })
 
+  it('does not count manual stops or expired-credential deferrals as problems', () => {
+    // 真机面板：「需要关注 8 条」里有手动暂停时正在处理的岗位和凭据过期被暂缓的岗位，
+    // 真正的问题只有 4 条。
+    const targetDate = '2026-07-10'
+    const base = { createdAt: timestampFor(targetDate) }
+    const dashboard = buildDeliveryDashboard({
+      dailyLimit: 100,
+      pools: { group: [], search: [] },
+      records: [
+        {
+          ...base,
+          title: '手动暂停',
+          state: 'warning',
+          state_name: '手动停止',
+          message: '用户已停止投递，待发送招呼语已取消',
+          data: {
+            listData: job('stopped'),
+            state: '已停止',
+            deliveryStage: '投递失败',
+            failureReason: '用户已停止投递，待发送招呼语已取消',
+            retryable: true,
+          },
+        },
+        {
+          ...base,
+          title: '凭据过期',
+          state: 'danger',
+          state_name: '详情暂不可用',
+          message: '岗位列表凭据已放置 647 分钟，需要刷新列表凭据后继续',
+          data: {
+            listData: job('deferred'),
+            state: '暂缓',
+            deliveryStage: '投递失败',
+            failureReason: '岗位列表凭据已放置 647 分钟，需要刷新列表凭据后继续',
+            retryable: true,
+          },
+        },
+        {
+          ...base,
+          title: '真的失败',
+          state: 'danger',
+          state_name: '投递出错',
+          message: '投递接口异常',
+          data: { listData: job('real'), deliveryStage: '投递失败', retryable: true },
+        },
+      ],
+      todayData: {
+        date: targetDate,
+        success: 0,
+        searchSuccess: 0,
+        groupSuccess: 0,
+        total: 1,
+        jobContent: 0,
+        aiFiltering: 0,
+        amap: 0,
+        companySizeRange: 0,
+        activityFilter: 0,
+        goldHunterFilter: 0,
+        repeat: 0,
+      },
+      targetDate,
+      weights: { group: 50, search: 50 },
+    })
+
+    const counted = dashboard.failureCategories.filter((item) => item.count > 0)
+    expect(counted).toEqual([{ id: 'publish', label: '接口/限流', count: 1 }])
+    expect(dashboard.summary.retryableFailures).toBe(1)
+  })
+
+  it("estimates the time left from today's pace and counts only anomalies as needing attention", () => {
+    const targetDate = '2026-07-10'
+    const start = timestampFor(targetDate)
+    const processedRecord = (id: string, seconds: number, stage: string, state: any) => ({
+      title: id,
+      state,
+      state_name: stage === '投递成功' ? '投递成功' : '岗位方向不符',
+      message: stage === '已过滤' ? 'AI匹配度 40% 低于阈值' : undefined,
+      createdAt: start,
+      updatedAt: start + seconds * 1000,
+      data: { listData: job(id), deliveryStage: stage },
+    })
+    const dashboard = buildDeliveryDashboard({
+      dailyLimit: 150,
+      pools: { group: [], search: [] },
+      records: [
+        processedRecord('a', 60, '投递成功', 'success'),
+        processedRecord('b', 80, '投递成功', 'success'),
+        processedRecord('c', 70, '已过滤', 'warning'),
+        // 当场判掉的（同公司去重）几乎不花时间，不拉低平均用时。
+        processedRecord('d', 0, '已过滤', 'warning'),
+        {
+          title: '真的失败',
+          state: 'danger',
+          state_name: '投递出错',
+          message: '投递接口异常',
+          createdAt: start,
+          updatedAt: start + 90_000,
+          data: { listData: job('e'), deliveryStage: '投递失败' },
+        },
+      ],
+      todayData: {
+        date: targetDate,
+        success: 20,
+        searchSuccess: 0,
+        groupSuccess: 20,
+        total: 24,
+        jobContent: 0,
+        aiFiltering: 0,
+        amap: 0,
+        companySizeRange: 0,
+        activityFilter: 0,
+        goldHunterFilter: 0,
+        repeat: 0,
+      },
+      targetDate,
+      weights: { group: 50, search: 50 },
+    })
+
+    // (60 + 80 + 70 + 90) / 4 = 75 秒；还差 130 个，按投递率 20/24 要处理 156 个。
+    expect(dashboard.summary.averageJobSeconds).toBe(75)
+    expect(dashboard.summary.estimatedRequiredProcessed).toBe(156)
+    expect(dashboard.summary.estimatedRemainingSeconds).toBe(156 * 75)
+    // 岗位方向不符是正常过滤，不算需要关注；只有接口异常算。
+    expect(dashboard.summary.attentionCount).toBe(1)
+  })
+
   it('deduplicates the same job globally across sources and unknown records', () => {
     const targetDate = '2026-07-10'
     const duplicate = job('same-job')

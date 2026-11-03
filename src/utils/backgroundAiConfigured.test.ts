@@ -410,6 +410,7 @@ describe('configured AI protocols', () => {
   })
 
   it('surfaces bounded provider details from a Responses failure event', async () => {
+    const onDiagnostic = vi.fn()
     vi.mocked(fetch).mockResolvedValue(
       sseResponse([
         {
@@ -433,6 +434,7 @@ describe('configured AI protocols', () => {
       template: '返回 JSON',
       data: {},
       json: true,
+      onDiagnostic,
       // 这条用例验的是 SSE 的错误处理，不是传输选择；显式声明慢任务才会走流式。
       task: 'resumeExtraction',
     })
@@ -440,6 +442,13 @@ describe('configured AI protocols', () => {
     await expect(request).rejects.toThrow(
       /^AI流式响应返回失败事件：server_error: provider task failed x{219}$/,
     )
+    expect(onDiagnostic.mock.calls.at(-1)?.[0]).toMatchObject({
+      phase: 'failed',
+      providerResponse: expect.objectContaining({
+        format: 'text/event-stream',
+        rawEvents: expect.stringContaining('response.failed'),
+      }),
+    })
   })
 
   it('does not retain large reasoning events while reading a Responses stream', async () => {
@@ -1017,12 +1026,24 @@ describe('anthropic messages protocol shape', () => {
   })
 })
 
+/**
+ * 重试之间要等 2 秒、4 秒：用假时钟快进，不让测试真的等。
+ * 请求是 mock 的，每快进一次就把排队中的重试放出来。
+ */
+async function withRetryTimers<T>(promise: Promise<T>) {
+  promise.catch(() => undefined)
+  for (let step = 0; step < 10; step += 1) await vi.advanceTimersByTimeAsync(10_000)
+  return promise
+}
+
 describe('provider failure detail', () => {
   beforeEach(() => {
+    vi.useFakeTimers()
     vi.stubGlobal('fetch', vi.fn())
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
@@ -1041,12 +1062,14 @@ describe('provider failure detail', () => {
 
     // 三次尝试都会拿到同一个 400，最终错误里要带着供应商给的原因。
     await expect(
-      runConfiguredAiTask({
-        model: configuredModel({ protocol: 'openai-responses' }),
-        template: '返回 JSON',
-        data: {},
-        json: true,
-      }),
+      withRetryTimers(
+        runConfiguredAiTask({
+          model: configuredModel({ protocol: 'openai-responses' }),
+          template: '返回 JSON',
+          data: {},
+          json: true,
+        }),
+      ),
     ).rejects.toThrow(/input too long/)
   })
 
@@ -1055,12 +1078,14 @@ describe('provider failure detail', () => {
       new Response('x'.repeat(5000), { status: 400, statusText: 'Bad Request' }),
     )
 
-    const message = await runConfiguredAiTask({
-      model: configuredModel({ protocol: 'openai-responses' }),
-      template: '返回 JSON',
-      data: {},
-      json: true,
-    }).then(
+    const message = await withRetryTimers(
+      runConfiguredAiTask({
+        model: configuredModel({ protocol: 'openai-responses' }),
+        template: '返回 JSON',
+        data: {},
+        json: true,
+      }),
+    ).then(
       () => '',
       (error: Error) => error.message,
     )
@@ -1072,10 +1097,12 @@ describe('provider failure detail', () => {
 
 describe('transient failures before giving up', () => {
   beforeEach(() => {
+    vi.useFakeTimers()
     vi.stubGlobal('fetch', vi.fn())
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
@@ -1087,13 +1114,15 @@ describe('transient failures before giving up', () => {
       .mockResolvedValueOnce(jsonResponse({ output_text: '{"ok":true}' }))
 
     await expect(
-      runConfiguredAiTask({
-        model: configuredModel({ protocol: 'openai-responses' }),
-        template: '返回 JSON',
-        data: {},
-        json: true,
-        task: 'aiFiltering',
-      }),
+      withRetryTimers(
+        runConfiguredAiTask({
+          model: configuredModel({ protocol: 'openai-responses' }),
+          template: '返回 JSON',
+          data: {},
+          json: true,
+          task: 'aiFiltering',
+        }),
+      ),
     ).resolves.toMatchObject({ content: '{"ok":true}' })
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2)
   })
@@ -1103,13 +1132,15 @@ describe('transient failures before giving up', () => {
     vi.mocked(fetch).mockRejectedValue(new TypeError('Failed to fetch'))
 
     await expect(
-      runConfiguredAiTask({
-        model: configuredModel({ protocol: 'openai-responses' }),
-        template: '返回 JSON',
-        data: {},
-        json: true,
-        task: 'aiFiltering',
-      }),
+      withRetryTimers(
+        runConfiguredAiTask({
+          model: configuredModel({ protocol: 'openai-responses' }),
+          template: '返回 JSON',
+          data: {},
+          json: true,
+          task: 'aiFiltering',
+        }),
+      ),
     ).rejects.toThrow(/网络失败/)
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3)
   })
@@ -1121,13 +1152,15 @@ describe('transient failures before giving up', () => {
       .mockResolvedValueOnce(jsonResponse({ output_text: '{"ok":true}' }))
 
     await expect(
-      runConfiguredAiTask({
-        model: configuredModel({ protocol: 'openai-responses' }),
-        template: '返回 JSON',
-        data: {},
-        json: true,
-        task: 'aiFiltering',
-      }),
+      withRetryTimers(
+        runConfiguredAiTask({
+          model: configuredModel({ protocol: 'openai-responses' }),
+          template: '返回 JSON',
+          data: {},
+          json: true,
+          task: 'aiFiltering',
+        }),
+      ),
     ).resolves.toMatchObject({ content: '{"ok":true}' })
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(3)
   })

@@ -60,7 +60,6 @@ describe('resume extraction retry budget', () => {
     runConfiguredAiTask.mockResolvedValue({
       content: JSON.stringify({
         facts: [{ id: 'a', action: '负责', object: 'x' }],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       }),
     })
@@ -91,7 +90,6 @@ describe('what is worth retrying', () => {
     runConfiguredAiTask.mockResolvedValue({
       content: JSON.stringify({
         facts: [],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       }),
     })

@@ -102,20 +102,14 @@ describe('ConfigBundleV1 validation', () => {
             sourceQuote: '不存在的摘录',
             action: '完成',
             object: '项目',
-            ownership: 'owned',
-            domains: [],
-            skills: [],
             evidenceType: 'direct_fact',
             allowedClaimVerbs: [],
-            confidence: 'high',
           },
         ],
-        buckets: [{ id: 'bucket-1', signals: [], factIds: ['missing-fact'] }],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       },
     }
     expectIssue(bundle, '$.profile.resume.evidence.facts[0].sourceQuote')
-    expectIssue(bundle, '$.profile.resume.evidence.buckets[0].factIds')
   })
 
   it('enforces model, array, prompt, resume and import resource limits', () => {

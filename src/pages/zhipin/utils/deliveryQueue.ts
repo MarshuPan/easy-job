@@ -9,6 +9,8 @@ export interface DeliveryQueueArgs<T> {
   batchSize: number
   getItemKey?: (item: T) => unknown
   getItemOrder?: (item: T) => number | undefined
+  /** 列表凭据的抓取时间。越新越先投：刷新拿到的一页不该排在旧岗位后面等到过期。 */
+  getItemFreshness?: (item: T) => number | undefined
   getItemSource?: (item: T) => DeliveryLimitSource | undefined
   pools: DeliverySourcePools<T>
   weights: DeliveryBatchPlan
@@ -51,16 +53,66 @@ export function buildDeliveryBatchPlan(args: {
   return plan
 }
 
-export function selectDeliveryBatch<T>(args: DeliveryQueueArgs<T>) {
+/** 同一来源内的处理顺序：凭据越新越先，同样新的按入库先后。 */
+function sortWithinSource<T>(items: T[], args: DeliveryQueueArgs<T>) {
+  return items
+    .map((item, stableIndex) => ({
+      item,
+      freshness: Number(args.getItemFreshness?.(item)),
+      order: Number(args.getItemOrder?.(item)),
+      stableIndex,
+    }))
+    .sort((left, right) => {
+      const leftFresh = Number.isFinite(left.freshness) ? left.freshness : 0
+      const rightFresh = Number.isFinite(right.freshness) ? right.freshness : 0
+      const leftOrder = Number.isFinite(left.order) ? left.order : Number.MAX_SAFE_INTEGER
+      const rightOrder = Number.isFinite(right.order) ? right.order : Number.MAX_SAFE_INTEGER
+      return (
+        rightFresh - leftFresh || leftOrder - rightOrder || left.stableIndex - right.stableIndex
+      )
+    })
+    .map(({ item }) => item)
+}
+
+/**
+ * 整个待处理队列的处理顺序：一批一批往下排，每批按来源比例分配名额，来源内凭据越新越先。
+ *
+ * 原来只按入库先后取前 10 个，weights 传进来却没用上——哪个来源先入库，整批就全是它。
+ * 真机上设的是求职期望 50% / 搜索 50%，一整天投的全是求职期望。
+ * 某个来源不够它的名额时，由另一个来源补齐，不让批次空着。
+ */
+export function orderDeliveryQueue<T>(args: DeliveryQueueArgs<T>) {
   const pools = dedupeDeliverySourcePools(args.pools, args.getItemKey, args.getItemSource)
-  const items = flattenDeliveryQueue({
-    getItemKey: args.getItemKey,
-    getItemOrder: args.getItemOrder,
-    getItemSource: args.getItemSource,
-    pools,
-  }).slice(0, Math.max(0, Math.floor(args.batchSize)))
+  const queues: DeliverySourcePools<T> = {
+    group: sortWithinSource(pools.group, args),
+    search: sortWithinSource(pools.search, args),
+  }
+  const batchSize = Math.max(1, Math.floor(args.batchSize))
+  const ordered: Array<DeliveryBatchItem<T>> = []
+  while (queues.group.length + queues.search.length > 0) {
+    const plan = buildDeliveryBatchPlan({ batchSize, weights: args.weights })
+    const batch: Array<DeliveryBatchItem<T>> = []
+    for (const source of orderedSources) {
+      for (const item of queues[source].splice(0, plan[source])) batch.push({ source, item })
+    }
+    // 名额没用满（某个来源不够）时，用另一个来源按顺序补齐。
+    for (const source of orderedSources) {
+      if (batch.length >= batchSize) break
+      for (const item of queues[source].splice(0, batchSize - batch.length)) {
+        batch.push({ source, item })
+      }
+    }
+    if (batch.length === 0) break
+    ordered.push(...batch)
+  }
+  return ordered
+}
+
+export function selectDeliveryBatch<T>(args: DeliveryQueueArgs<T>) {
+  const items = orderDeliveryQueue(args).slice(0, Math.max(0, Math.floor(args.batchSize)))
   const getItemKey = args.getItemKey ?? ((item: T) => item)
   const selectedKeys = new Set(items.map(({ item }) => getItemKey(item)))
+  const pools = dedupeDeliverySourcePools(args.pools, args.getItemKey, args.getItemSource)
   const remaining: DeliverySourcePools<T> = {
     group: pools.group.filter((item) => !selectedKeys.has(getItemKey(item))),
     search: pools.search.filter((item) => !selectedKeys.has(getItemKey(item))),
@@ -80,9 +132,10 @@ export function selectDeliveryBatch<T>(args: DeliveryQueueArgs<T>) {
   }
 }
 
+/** 待处理列表的展示顺序与实际处理顺序一致。 */
 export function previewDeliveryQueue<T>(args: DeliveryQueueArgs<T> & { limit: number }) {
   const limit = Math.max(0, Math.floor(args.limit))
-  return flattenDeliveryQueue(args).slice(0, limit)
+  return orderDeliveryQueue(args).slice(0, limit)
 }
 
 export function sourcesNeedingPrefetch<T>(args: DeliveryQueueArgs<T>): DeliveryLimitSource[] {

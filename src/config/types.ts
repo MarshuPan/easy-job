@@ -46,6 +46,8 @@ export interface ResumeConfig {
 
 export interface PersonalProfileConfig {
   displayName: string
+  /** 求职定位，如「AI 产品经理，侧重 Agent 应用」。空时按 BOSS 求职期望、简历意向行兜底。 */
+  targetRole: string
   resume: ResumeConfig
 }
 

@@ -50,6 +50,7 @@ const {
   visibleSource,
   getUserResumeData,
   setAvailableJobExpectations,
+  processingDurations,
 } = vi.hoisted(() => ({
   storageGetMock: vi.fn(async (_key: string, fallback: unknown) => fallback),
   storageSetMock: vi.fn(async () => true),
@@ -136,6 +137,7 @@ const {
   visibleSource: { value: 'group' as 'group' | 'search' },
   getUserResumeData: vi.fn(),
   setAvailableJobExpectations: vi.fn(),
+  processingDurations: { value: [] as number[] },
 }))
 
 setAvailableJobExpectations.mockImplementation(
@@ -411,6 +413,14 @@ vi.mock('@/message', () => ({
         updatedAt: clock.now,
         revision: durableTaskState.value.revision + 1,
       }
+      for (const field of [
+        'retryAt',
+        'aiUnavailableAttempts',
+        'detailRecoveryAttempts',
+        'interruption',
+      ]) {
+        delete durableTaskState.value.checkpoint[field]
+      }
       return { accepted: true, task: structuredClone(durableTaskState.value) }
     }),
     deliveryTaskClaim: vi.fn(async (request: any) => {
@@ -584,6 +594,8 @@ vi.mock('@/stores/log', () => ({
     data: { value: [] },
     flush: vi.fn(async () => undefined),
     info: logInfo,
+    debug: logInfo,
+    recordDiagnostic: vi.fn(),
   }),
 }))
 
@@ -609,6 +621,7 @@ vi.mock('../hooks/useDeliver', () => ({
   useDeliver: () => ({
     resetBatchPace,
     jobListHandle: deliverJobListHandle,
+    getProcessingDurations: () => processingDurations.value,
   }),
 }))
 
@@ -665,6 +678,21 @@ import { AgentMessage } from '@/ui/instrument'
 
 import OperationPanel from './OperationPanel.vue'
 
+async function exhaustAiRecovery() {
+  for (const [index, cooldown] of [60_000, 120_000, 300_000].entries()) {
+    await vi.waitFor(() =>
+      expect(durableTaskState.value?.checkpoint?.aiUnavailableAttempts).toBe(index + 1),
+    )
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('waiting-for-page'))
+    const retryAt = durableTaskState.value.checkpoint.retryAt
+    expect(retryAt - clock.now).toBe(cooldown)
+    clock.now = retryAt
+    await vi.advanceTimersByTimeAsync(cooldown)
+    await flushPromises()
+  }
+  await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
+}
+
 describe('operation panel pagination delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -713,6 +741,7 @@ describe('operation panel pagination delivery', () => {
     })
     sourceLists.group = []
     sourceLists.search = []
+    processingDurations.value = []
     jobListRef.value = [job('page-1-first')]
 
     getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 0 : 10))
@@ -754,6 +783,7 @@ describe('operation panel pagination delivery', () => {
     sourceLists.group = []
     sourceLists.search = []
     jobListRef.value = []
+    document.querySelectorAll('[data-test-security-check]').forEach((node) => node.remove())
     document.querySelectorAll('.c-expect-select').forEach((node) => node.remove())
     window.sessionStorage.clear()
     vi.useRealTimers()
@@ -772,10 +802,15 @@ describe('operation panel pagination delivery', () => {
 
     expect(deliverJobListHandle).not.toHaveBeenCalled()
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).toBeNull()
-    expect(logInfo).not.toHaveBeenCalledWith('投递批次', expect.stringContaining('创建投递任务'))
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('创建投递任务'),
+      expect.anything(),
+    )
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递运行时检查失败：执行端等待重连'),
+      expect.anything(),
     )
   })
 
@@ -798,8 +833,9 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).toBeNull()
     expect(common.deliverLock).toBe(false)
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('创建投递任务失败：运行配置读取失败'),
+      expect.anything(),
     )
     expect(AgentMessage.error).toHaveBeenCalledWith('投递配置读取失败，请重试')
 
@@ -823,8 +859,9 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
     expect(durableTaskState.value).toBeNull()
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('后台连接暂时中断，保留本地检查点'),
+      expect.anything(),
     )
     expect(deliverJobListHandle).not.toHaveBeenCalled()
   })
@@ -848,8 +885,9 @@ describe('operation panel pagination delivery', () => {
     await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalledTimes(1))
     await vi.waitFor(() =>
       expect(logInfo).toHaveBeenCalledWith(
-        '投递批次',
+        '投递任务',
         expect.stringContaining('后台连接暂时中断，保留本地检查点'),
+        expect.anything(),
       ),
     )
 
@@ -892,15 +930,16 @@ describe('operation panel pagination delivery', () => {
     expect(durableTaskState.value?.status).not.toBe('failed')
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递任务等待：后台连接暂时中断'),
+      expect.anything(),
     )
     expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
     expect(deliverJobListHandle).not.toHaveBeenCalled()
     const buttonTexts = wrapper.findAll('button').map((button) => button.text())
-    expect(buttonTexts).toContain('等待中')
+    expect(buttonTexts).toContain('暂停')
+    expect(buttonTexts).toContain('结束')
     expect(buttonTexts).not.toContain('开始投递')
-    expect(buttonTexts).not.toContain('暂停')
     expect(wrapper.find('.operation-panel__run-state').text()).toContain('等待中')
     expect(wrapper.exists()).toBe(true)
   })
@@ -1031,12 +1070,14 @@ describe('operation panel pagination delivery', () => {
     expect(deliverJobListHandle).not.toHaveBeenCalled()
     expect(initJobList).not.toHaveBeenCalled()
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递运行时检查失败：执行端等待重连'),
+      expect.anything(),
     )
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递任务运行时通信异常：保留任务等待重连'),
+      expect.anything(),
     )
   })
 
@@ -1060,8 +1101,9 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
     expect(durableTaskState.value).toMatchObject({ status: 'waiting-for-page' })
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递任务运行时通信异常：保留任务等待重连'),
+      expect.anything(),
     )
     expect(logInfo).not.toHaveBeenCalledWith(
       '投递批次',
@@ -1360,10 +1402,43 @@ describe('operation panel pagination delivery', () => {
     expect(stored?.[1]).toMatchObject({ 'account-a': expect.objectContaining({ hits: 1 }) })
   })
 
-  it('pauses independently on a BOSS security-check page and keeps the checkpoint', async () => {
+  it('processes existing jobs after verification leaves a URL marker', async () => {
+    actualSource.value = 'search'
+    visibleSource.value = 'search'
+    window.history.replaceState({}, '', '/web/geek/jobs?query=AI&_security_check=1_123')
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 10 : 0))
+    sourceLists.search = Array.from({ length: 15 }, (_, index) => job(`returned-${index + 1}`))
+    jobListRef.value = sourceLists.search.slice()
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'completed'
+    })
+    const wrapper = mount(OperationPanel)
+
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+
+    expect(deliverJobListHandle.mock.calls[0]?.[0]).toHaveLength(10)
+    expect(sourceLists.search.filter((item) => item.status.status === 'wait')).toHaveLength(5)
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('安全校验'),
+      'warning',
+    )
+  })
+
+  it('pauses independently on a visible BOSS security challenge and keeps the checkpoint', async () => {
     actualSource.value = 'group'
     visibleSource.value = 'group'
-    window.history.replaceState({}, '', '/web/geek/jobs?_security_check=1')
+    const challenge = document.createElement('div')
+    challenge.setAttribute('data-test-security-check', '')
+    challenge.setAttribute('role', 'dialog')
+    challenge.innerHTML = '<h2>安全验证</h2><canvas></canvas>'
+    document.body.append(challenge)
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
     sourceLists.group = Array.from({ length: 20 }, (_, index) => job(`security-${index + 1}`))
     jobListRef.value = sourceLists.group.slice(0, 15)
@@ -1374,8 +1449,17 @@ describe('operation panel pagination delivery', () => {
     await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
 
     expect(deliverJobListHandle).not.toHaveBeenCalled()
-    expect(durableTaskState.value?.checkpoint).toBeTruthy()
+    expect(durableTaskState.value?.checkpoint?.activeBatch?.items).toHaveLength(10)
     expect(storageSetMock).not.toHaveBeenCalledWith('local:risk-backoff', expect.anything())
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('投递已暂停'),
+      'warning',
+    )
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递批次',
+      expect.stringContaining('投递池 FIFO 批次完成'),
+    )
   })
 
   it('keeps the run resumable after a third explicit platform rate limit', async () => {
@@ -1428,6 +1512,7 @@ describe('operation panel pagination delivery', () => {
       JSON.stringify({
         accountUid: 'account-a',
         id: 'ai-down-task',
+        aiUnavailableAttempts: 3,
         startedAt: Date.now() - 60_000,
         currentIndex: 0,
         runtimeHeartbeat: { at: Date.now() - 1_000, source: 'group' },
@@ -1505,13 +1590,249 @@ describe('operation panel pagination delivery', () => {
 
     expect(pagerReload).toHaveBeenCalled()
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('详情接口连续被拒，重抓列表后继续'),
+      expect.anything(),
     )
     expect(durableTaskState.value?.status).not.toBe('failed')
     expect(durableTaskState.value?.checkpoint?.detailRecoveryAttempts).toBe(1)
     expect(durableTaskState.value?.checkpoint?.activeBatch?.items).not.toHaveLength(0)
     expect(wrapper.exists()).toBe(true)
+  })
+
+  // 真机上暂停 11 小时后恢复：投递池四十多个岗位凭据全过期，原来要一个一个排到队首才发现，
+  // 每发现一个刷新一次列表，把「最多重抓 3 次」的额度用光后退避一分钟。
+  it('defers pool jobs whose list credentials have expired before starting a batch', async () => {
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    // 测试时钟从 1_000_000 起步，不够倒推 25 分钟；先拨到一小时之后。
+    clock.now += 60 * 60_000
+    const stale = Array.from({ length: 5 }, (_, index) => ({
+      ...job(`stale-${index + 1}`),
+      fetchedAt: Date.now() - 25 * 60_000,
+    }))
+    const fresh = Array.from({ length: 15 }, (_, index) => ({
+      ...job(`fresh-${index + 1}`),
+      fetchedAt: Date.now(),
+    }))
+    // 上一个版本就已经标成「等待刷新凭据」的旧岗位，记录的原因还丢了——凭据年龄才是证据。
+    const blockedStale = {
+      ...job('blocked-stale'),
+      fetchedAt: Date.now() - 50 * 60_000,
+      credentialRefreshRequired: true,
+      deliveryCredentialOrigin: { source: 'group', page: 3 },
+    }
+    sourceLists.group = [blockedStale, ...stale, ...fresh]
+    jobListRef.value = fresh
+    pagerNext.mockReturnValue(false)
+    const seen: string[] = []
+    const seenState: string[] = []
+    deliverJobListHandle.mockImplementation(async (items: Array<{ item: any }> = []) => {
+      seen.push(...items.map(({ item }) => item.encryptJobId))
+      seenState.push(
+        ...items.map(({ item }) => `${item.encryptJobId}:${item.credentialRefreshDeferred}`),
+      )
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+
+    expect(seen.length).toBeGreaterThan(0)
+    expect(
+      seen.some((id) => id.startsWith('stale-')),
+      seenState.join(' '),
+    ).toBe(false)
+    expect(stale.every((item: any) => item.credentialRefreshDeferred === true)).toBe(true)
+    expect(blockedStale).toMatchObject({
+      credentialRefreshRequired: false,
+      credentialRefreshDeferred: true,
+    })
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('6 个待投岗位的列表凭据余量不足'),
+    )
+    // 过期岗位不再走「详情接口被拒」的恢复，也就不占重抓额度。
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('详情接口连续被拒'),
+      'warning',
+    )
+    expect(durableTaskState.value?.checkpoint?.detailRecoveryAttempts ?? 0).toBe(0)
+  })
+
+  it('uses queue position instead of deferring every credential older than twenty minutes', async () => {
+    clock.now += 3_600_000
+    const jobs = Array.from({ length: 3 }, (_, index) => ({
+      ...job(`aged-${index + 1}`),
+      fetchedAt: Date.now() - 25 * 60_000,
+      credentialRefreshDeferred: false,
+    }))
+    sourceLists.group = jobs
+    jobListRef.value = [...jobs]
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map(({ item }: any) => item.encryptJobId)).toEqual(['aged-1', 'aged-2'])
+      expect(pagerNext).not.toHaveBeenCalled()
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const wrapper = mount(OperationPanel)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledOnce())
+    expect(jobs[0].credentialRefreshDeferred).not.toBe(true)
+    expect(jobs[1].credentialRefreshDeferred).not.toBe(true)
+    expect(jobs[2].credentialRefreshDeferred).toBe(true)
+  })
+
+  it('overlaps the refill countdown with a job wait and resumes the unfinished batch first', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    processingDurations.value = [10_000, 10_000, 10_000]
+    const jobs = [job('checkpoint-1'), job('checkpoint-2'), job('checkpoint-3')]
+    sourceLists.group = jobs
+    jobListRef.value = [...jobs]
+    let afterIdleAt = 0
+    deliverJobListHandle.mockImplementationOnce(async (items, _config, hooks) => {
+      expect(items).toHaveLength(3)
+      markBatchProcessed(items.slice(0, 1))
+      hooks.onIdle()
+      clock.now += 60_000
+      afterIdleAt = clock.now
+      expect(hooks.shouldRefill()).toBe(true)
+      return 'refill'
+    })
+    pagerNext.mockImplementationOnce(() => {
+      // 翻页前没有再串行加一段 45 秒等待。
+      expect(clock.now).toBe(afterIdleAt)
+      expect(jobs[1].status.status).toBe('wait')
+      jobListRevision.value += 1
+      jobListRef.value = [job('new-after-idle')]
+      return true
+    })
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map(({ item }: any) => item.encryptJobId)).toEqual([
+        'checkpoint-2',
+        'checkpoint-3',
+      ])
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const wrapper = mount(OperationPanel)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(2))
+    expect(pagerNext).toHaveBeenCalledOnce()
+    expect(
+      sourceLists.group.find((item) => item.encryptJobId === 'new-after-idle')?.status.status,
+    ).toBe('wait')
+  })
+
+  it('crosses a duplicate page in an empty pool and processes a small next-page gain immediately', async () => {
+    const terminal = job('already-processed')
+    terminal.status.setStatus('success')
+    jobListRef.value = [terminal]
+    pagerNext.mockImplementation(() => {
+      pagerNextAttempt.value += 1
+      jobListRevision.value += 1
+      const next = job(pagerNextAttempt.value === 1 ? 'another-processed' : 'single-fresh-job')
+      if (pagerNextAttempt.value === 1) next.status.setStatus('success')
+      jobListRef.value = [next]
+      return true
+    })
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map(({ item }: any) => item.encryptJobId)).toEqual(['single-fresh-job'])
+      expect(pagerNext).toHaveBeenCalledTimes(2)
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
+    })
+    const wrapper = mount(OperationPanel)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledOnce())
+    const checkpoint = JSON.parse(
+      window.sessionStorage.getItem('agent-delivery:combined-delivery-task')!,
+    )
+    expect(checkpoint.steps[0].prefetchRetryAt).toBeUndefined()
+  })
+
+  it('backs off after three duplicate pages instead of immediately starting another page budget', async () => {
+    const terminal = job('already-processed')
+    terminal.status.setStatus('success')
+    jobListRef.value = [terminal]
+    pagerNext.mockImplementation(() => {
+      pagerNextAttempt.value += 1
+      jobListRevision.value += 1
+      const duplicate = job(`processed-page-${pagerNextAttempt.value}`)
+      duplicate.status.setStatus('success')
+      jobListRef.value = [duplicate]
+      return true
+    })
+    const wrapper = mount(OperationPanel)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(common.deliverLock).toBe(false))
+    expect(pagerNext).toHaveBeenCalledTimes(3)
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    const checkpoint = JSON.parse(
+      window.sessionStorage.getItem('agent-delivery:combined-delivery-task')!,
+    )
+    expect(checkpoint.steps[0]).toMatchObject({ status: 'waiting', prefetchExhausted: false })
+    expect(checkpoint.steps[0].prefetchRetryAt).toBeGreaterThan(clock.now)
+    expect(counter.deliveryTaskTerminate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'terminal-error' }),
+    )
+  })
+
+  it('does not spend the refusal budget on expired list credentials', async () => {
+    // 凭据过期是本地判断、一个请求都没发；只有 BOSS 真的拒绝才算进「最多重抓 3 次」。
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
+    sourceLists.group = Array.from({ length: 20 }, (_, index) => job(`stale-origin-${index + 1}`))
+    jobListRef.value = sourceLists.group.slice(0, 15)
+    pagerNext.mockReturnValue(false)
+    deliverJobListHandle
+      .mockImplementationOnce(async (items: Array<{ item: any }> = []) => {
+        const blocked = items[0]?.item
+        blocked.credentialRefreshRequired = true
+        blocked.credentialRefreshReason = 'credentials-stale'
+        blocked.deliveryCredentialOrigin = { source: 'group', page: 1 }
+        return 'detailRefused'
+      })
+      .mockImplementationOnce(async (items) => {
+        markBatchProcessed(items)
+        common.deliverStop = true
+        return 'stopped'
+      })
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(2))
+
+    expect(pagerReload).toHaveBeenCalled()
+    expect(durableTaskState.value?.checkpoint?.detailRecoveryAttempts ?? 0).toBe(0)
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('已重新抓取列表后继续（未向 BOSS 发出请求）'),
+      'info',
+    )
   })
 
   it('reloads the original page and retries the first blocked FIFO job before later jobs', async () => {
@@ -2037,8 +2358,9 @@ describe('operation panel pagination delivery', () => {
     mount(OperationPanel)
     await vi.waitFor(() =>
       expect(logInfo).toHaveBeenCalledWith(
-        '投递批次',
+        '投递任务',
         expect.stringContaining('其他标签页正在执行'),
+        expect.anything(),
       ),
     )
 
@@ -2115,8 +2437,9 @@ describe('operation panel pagination delivery', () => {
 
     expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
     expect(logInfo).not.toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('求职期望岗位列表不可用'),
+      expect.anything(),
     )
   })
 
@@ -2287,8 +2610,8 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
     expect(durableTaskState.value?.status).toBe('running')
     const waitingButtonTexts = wrapper.findAll('button').map((button) => button.text())
-    expect(waitingButtonTexts).toContain('等待中')
-    expect(waitingButtonTexts).not.toContain('暂停')
+    expect(waitingButtonTexts).toContain('暂停')
+    expect(waitingButtonTexts).toContain('结束')
     expect(waitingButtonTexts).not.toContain('开始投递')
 
     await vi.advanceTimersByTimeAsync(5_000)
@@ -2299,16 +2622,16 @@ describe('operation panel pagination delivery', () => {
   })
 
   it('keeps a paused task resumable when the resume RPC is temporarily unavailable', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     pagerNext.mockReturnValue(false)
-    deliverJobListHandle.mockImplementation(async (items?: Array<{ item?: any }>) => {
-      markBatchProcessed(items)
+    deliverJobListHandle.mockImplementation(async () => {
       return 'aiUnavailable'
     })
     const wrapper = mount(OperationPanel)
     const findButton = (label: string) =>
       wrapper.findAll('button').find((button) => button.text() === label)
     await findButton('开始投递')!.trigger('click')
-    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('paused'))
+    await exhaustAiRecovery()
     vi.mocked(counter.deliveryTaskResume).mockRejectedValueOnce(new Error('resume rpc failed'))
 
     await findButton('继续')!.trigger('click')
@@ -2362,29 +2685,29 @@ describe('operation panel pagination delivery', () => {
   })
 
   it('pauses instead of terminating when the AI channel keeps failing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     // 模型不可用是能修好的。终止会连同检查点一起清掉，用户配好模型后只能从头再来；
     // 暂停把位置留着，点「继续」就接着原来的投递池跑。
     pagerNext.mockReturnValue(false)
-    deliverJobListHandle.mockImplementation(async (items?: Array<{ item?: any }>) => {
-      markBatchProcessed(items)
+    deliverJobListHandle.mockImplementation(async () => {
       return 'aiUnavailable'
     })
     const wrapper = mount(OperationPanel)
     const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
     await startButton!.trigger('click')
 
-    await vi.waitFor(() => expect(durableTaskState.value).toMatchObject({ status: 'paused' }))
+    await exhaustAiRecovery()
     expect(durableTaskState.value.checkpoint).toBeTruthy()
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
   })
 
-  it('survives an AI outage end to end: pause, keep everything, resume', async () => {
+  it('restores the panel lifecycle after an AI outage: pause, keep work, resume', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
     // 这条走完整条链路，而不是分别验各个环节——这次改动来回了五个版本，
     // 出问题的恰恰是「每段都对、拼起来断了」：三个出口只改了两个，
     // 运行从没改的那个走掉，任务被释放成 waiting-for-page，检查点没保住。
     pagerNext.mockReturnValue(false)
-    deliverJobListHandle.mockImplementation(async (items?: Array<{ item?: any }>) => {
-      markBatchProcessed(items)
+    deliverJobListHandle.mockImplementation(async () => {
       return 'aiUnavailable'
     })
     const wrapper = mount(OperationPanel)
@@ -2394,7 +2717,7 @@ describe('operation panel pagination delivery', () => {
     await findButton('开始投递')!.trigger('click')
 
     // 1. 暂停而不是终止，检查点和任务都留着
-    await vi.waitFor(() => expect(durableTaskState.value).toMatchObject({ status: 'paused' }))
+    await exhaustAiRecovery()
     expect(durableTaskState.value.checkpoint).toBeTruthy()
     expect(durableTaskState.value.terminalReason).toBeUndefined()
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
@@ -2415,6 +2738,106 @@ describe('operation panel pagination delivery', () => {
 
     await vi.waitFor(() => expect(durableTaskState.value.status).not.toBe('paused'))
     expect(durableTaskState.value.runId).toBe(pausedRunId)
+  })
+
+  it('shows the persisted AI cooldown after refresh and lets the user pause it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'ai-wait-task',
+      startedAt: clock.now,
+      currentIndex: 0,
+      retryAt: clock.now + 120_000,
+      aiUnavailableAttempts: 2,
+      interruption: { reason: 'ai-retry', message: '模型网关返回 HTTP 502' },
+      steps: [{ source: 'group', url: location.href, status: 'running', pagesDone: 0 }],
+    }
+    registerDurableTask(checkpoint)
+    const wrapper = mount(OperationPanel)
+    for (let i = 0; i < 8; i++) await flushPromises()
+    expect(wrapper.text()).toContain('AI 服务不可用，自动重试 2/3')
+    expect(wrapper.text()).toContain('还剩')
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '暂停')!
+      .trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
+    clock.now += 180_000
+    await vi.advanceTimersByTimeAsync(180_000)
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(wrapper.findAll('button').some((button) => button.text() === '继续')).toBe(true)
+  })
+
+  it('gives manual continuation a new AI recovery budget instead of inheriting the old limit', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    registerDurableTask(
+      {
+        accountUid: 'account-a',
+        id: 'ai-paused-task',
+        startedAt: clock.now,
+        currentIndex: 0,
+        aiUnavailableAttempts: 3,
+        interruption: { reason: 'ai-unavailable', message: 'HTTP 502' },
+        steps: [{ source: 'group', url: location.href, status: 'running', pagesDone: 0 }],
+      },
+      { status: 'paused' },
+    )
+    deliverJobListHandle.mockResolvedValue('aiUnavailable')
+    const wrapper = mount(OperationPanel)
+    for (let i = 0; i < 8; i++) await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '继续')!
+      .trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('waiting-for-page'))
+    expect(durableTaskState.value.checkpoint.aiUnavailableAttempts).toBe(1)
+    expect(durableTaskState.value.checkpoint.retryAt - clock.now).toBe(60_000)
+    await vi.waitFor(() =>
+      expect(logInfo).toHaveBeenCalledWith(
+        '投递任务',
+        '投递等待自动继续（AI 冷却后自动重试）',
+        'info',
+      ),
+    )
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '结束')!
+      .trigger('click')
+  })
+
+  it('does not turn a late heartbeat rejection after pause into a task failure', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    const batch = createDeferred<any>()
+    const heartbeat = createDeferred<any>()
+    deliverJobListHandle.mockReturnValue(batch.promise)
+    const wrapper = mount(OperationPanel)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
+    vi.mocked(counter.deliveryTaskCheckpoint).mockImplementationOnce(() => heartbeat.promise)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '暂停')!
+      .trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
+    heartbeat.resolve({
+      accepted: false,
+      conflict: 'task-paused',
+      task: structuredClone(durableTaskState.value),
+    })
+    await flushPromises()
+    batch.resolve('stopped')
+    for (let i = 0; i < 8; i++) await flushPromises()
+    expect(durableTaskState.value.status).toBe('paused')
+    expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
+    expect(
+      logInfo.mock.calls.some(([, message]) => String(message).includes('后台任务检查点写入失败')),
+    ).toBe(false)
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('已暂停')
   })
 
   it('marks a running task completed when the daily limit is reached', async () => {
@@ -2482,8 +2905,9 @@ describe('operation panel pagination delivery', () => {
 
     await vi.waitFor(() =>
       expect(logInfo).toHaveBeenCalledWith(
-        '投递批次',
+        '投递任务',
         expect.stringContaining('详情接口连续被拒，重抓列表后继续'),
+        expect.anything(),
       ),
     )
     // 关键：没有被判成运行错误收工。
@@ -2710,9 +3134,10 @@ describe('operation panel pagination delivery', () => {
       '投递批次',
       expect.stringContaining('恢复投递任务继续首次补充投递池'),
     )
+    // 一页 15 个已达到按需投递池的目标，补池就此完成。
     expect(logInfo).toHaveBeenCalledWith(
       '投递批次',
-      expect.stringContaining('"completionReason":"source-round-complete"'),
+      expect.stringContaining('"completionReason":"target-reached"'),
     )
   })
 
@@ -2837,8 +3262,9 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     await vi.waitFor(() =>
       expect(logInfo).toHaveBeenCalledWith(
-        '投递批次',
-        expect.stringContaining('"pendingActiveBatch":9'),
+        '投递任务',
+        expect.stringContaining('本批剩余 9'),
+        expect.anything(),
       ),
     )
   })
@@ -2888,11 +3314,10 @@ describe('operation panel pagination delivery', () => {
     await flushPromises()
 
     expect(common.deliverLock).toBe(true)
-    // 后台正在等待页面恢复时仍保留运行所有权，但页面不应把等待误报成「投递中」，
-    // 也不应暴露暂停或重新开始入口。
+    // 后台等待恢复时仍可暂停或结束，不暴露重新开始入口。
     const buttonTexts = wrapper.findAll('button').map((button) => button.text())
-    expect(buttonTexts).toContain('等待中')
-    expect(buttonTexts).not.toContain('暂停')
+    expect(buttonTexts).toContain('暂停')
+    expect(buttonTexts).toContain('结束')
     expect(buttonTexts).not.toContain('开始投递')
 
     jobListRef.value = [job('resume-job')]
@@ -2980,6 +3405,8 @@ describe('operation panel pagination delivery', () => {
     )
     registerStoredTask()
 
+    const navigation = createDeferred()
+    routerPush.mockReturnValueOnce(navigation.promise)
     mount(OperationPanel)
     await flushPromises()
     await flushPromises()
@@ -2993,6 +3420,8 @@ describe('operation panel pagination delivery', () => {
       targetUrl: 'https://www.zhipin.com/web/geek/job?query=AI',
     })
     expect(routerPush).toHaveBeenCalledWith('/web/geek/job?query=AI')
+    common.deliverStop = true
+    navigation.resolve(undefined)
   })
 
   it('does not navigate when stop is requested while mixed-source switch state is flushing', async () => {
@@ -3352,7 +3781,8 @@ describe('operation panel pagination delivery', () => {
     const expectationJob = { ...job('expectation-job'), expectId: 101 }
     const recommendationJob = { ...job('recommendation-job'), expectId: 0 }
     jobListRef.value = [expectationJob]
-    sourceLists.group = [expectationJob, recommendationJob]
+    // 推荐尚未入池，确实需要切换原生控件取岗；已有库存时应直接处理。
+    sourceLists.group = [expectationJob]
     getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 10 : 0))
     deliverJobListHandle.mockImplementationOnce(async (items) => {
       markBatchProcessed(items)
@@ -3551,8 +3981,9 @@ describe('operation panel pagination delivery', () => {
     expect(durableTaskState.value?.status).not.toBe('failed')
     expect(durableTaskState.value?.terminalReason).toBeUndefined()
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('本轮取岗准备失败，任务保持运行并稍后重试'),
+      expect.anything(),
     )
   })
 
@@ -3571,8 +4002,9 @@ describe('operation panel pagination delivery', () => {
     for (let index = 0; index < 6; index++) await flushPromises()
 
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('扩展本地存储接近上限'),
+      expect.anything(),
     )
   })
 
@@ -3739,7 +4171,7 @@ describe('operation panel pagination delivery', () => {
     expect(deliverJobListHandle.mock.calls.length).toBeGreaterThan(1)
     expect(logInfo).toHaveBeenCalledWith(
       '投递批次',
-      expect.stringContaining('投递池低水位触发整轮补充'),
+      expect.stringContaining('混合投递池切换来源补充'),
     )
   })
 
@@ -3761,8 +4193,9 @@ describe('operation panel pagination delivery', () => {
 
     expect(deliverJobListHandle).toHaveBeenCalledTimes(1)
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递任务运行时通信异常：保留任务等待重连'),
+      expect.anything(),
     )
   })
 
@@ -3933,12 +4366,15 @@ describe('operation panel pagination delivery', () => {
     )
   })
 
-  it('prefetches the current source pool during startup before consuming an incomplete pool', async () => {
+  it('consumes an incomplete startup pool before waiting for another page', async () => {
     actualSource.value = 'group'
     visibleSource.value = 'group'
     getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 60 : 40))
     sourceLists.group = Array.from({ length: 5 }, (_, index) => job(`group-seed-${index + 1}`))
-    sourceLists.search = Array.from({ length: 30 }, (_, index) => job(`search-seed-${index + 1}`))
+    // 搜索已达到自己的目标份额，整池仍低于目标：只有当前的求职期望需要补。
+    sourceLists.search = Array.from({ length: 9 }, (_, index) => job(`search-seed-${index + 1}`))
+    // 当前页就是已入池的那几个，不足的部分只能靠翻下一页。
+    jobListRef.value = [...sourceLists.group]
     pagerNext.mockImplementationOnce(() => {
       pagerNextAttempt.value += 1
       const pageJobs = Array.from({ length: 15 }, (_, index) => job(`group-prefetch-${index + 1}`))
@@ -3965,7 +4401,7 @@ describe('operation panel pagination delivery', () => {
       await flushPromises()
     }
 
-    expect(pagerNext).toHaveBeenCalled()
+    expect(pagerNext).not.toHaveBeenCalled()
     expect(logInfo).toHaveBeenCalledWith('投递批次', expect.stringContaining('投递池首次补充开始'))
   })
 
@@ -3974,13 +4410,23 @@ describe('operation panel pagination delivery', () => {
     visibleSource.value = 'group'
     autoMergeOnInit.value = false
     window.history.replaceState({}, '', '/web/geek/jobs?salary=406')
-    getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 60 : 40))
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 0 : 100))
     sourceLists.group = Array.from({ length: 5 }, (_, index) => job(`group-seed-${index + 1}`))
+    sourceLists.group.forEach((item) => item.status.setStatus('success'))
+    jobListRef.value = [...sourceLists.group]
     sourceLists.search = []
     pagerNext.mockImplementationOnce(() => {
       pagerNextAttempt.value += 1
       jobListRef.value = [job('page-changed-but-pool-not-merged')]
       return true
+    })
+    deliverJobListHandle.mockImplementationOnce(async (items) => {
+      expect(items.map(({ item }: any) => item.encryptJobId)).toEqual([
+        'page-changed-but-pool-not-merged',
+      ])
+      markBatchProcessed(items)
+      common.deliverStop = true
+      return 'stopped'
     })
 
     const wrapper = mount(OperationPanel)
@@ -3998,6 +4444,7 @@ describe('operation panel pagination delivery', () => {
     expect(
       sourceLists.group.some((item) => item.encryptJobId === 'page-changed-but-pool-not-merged'),
     ).toBe(true)
+    expect(pagerNext).toHaveBeenCalledOnce()
   })
 
   it('captures jobs appended by the next page while the first job stays unchanged', async () => {
@@ -4007,7 +4454,8 @@ describe('operation panel pagination delivery', () => {
     autoMergeOnInit.value = false
     window.history.replaceState({}, '', '/web/geek/jobs?salary=406')
     getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 0 : 100))
-    const firstPageJobs = Array.from({ length: 15 }, (_, index) => job(`group-page-1-${index + 1}`))
+    // 第一页不足按需目标（15），才会继续翻下一页。
+    const firstPageJobs = Array.from({ length: 10 }, (_, index) => job(`group-page-1-${index + 1}`))
     const secondPageJobs = Array.from({ length: 15 }, (_, index) =>
       job(`group-page-2-${index + 1}`),
     )
@@ -4054,11 +4502,13 @@ describe('operation panel pagination delivery', () => {
     autoMergeOnInit.value = false
     window.history.replaceState({}, '', '/web/geek/jobs?salary=406')
     getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 50 : 50))
-    const groupJobs = Array.from({ length: 5 }, (_, index) => job(`group-seed-${index + 1}`))
+    // 空池才阻塞取岗；先前记录均已处理，当前来源翻页超时后降级到搜索。
+    const groupJobs = Array.from({ length: 3 }, (_, index) => job(`group-seed-${index + 1}`))
     const searchJobs = Array.from({ length: 29 }, (_, index) => job(`search-seed-${index + 1}`))
     jobListRef.value = groupJobs
     sourceLists.group = [...groupJobs]
-    sourceLists.search = [...searchJobs]
+    sourceLists.search = searchJobs.slice(0, 3)
+    ;[...groupJobs, ...sourceLists.search].forEach((item) => item.status.setStatus('success'))
     pagerNext.mockImplementation(() => {
       pagerNextAttempt.value += 1
       return pagerNextAttempt.value === 1
@@ -4085,8 +4535,9 @@ describe('operation panel pagination delivery', () => {
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
 
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递池首次补充跳过：来源翻页加载失败'),
+      expect.anything(),
     )
     expect(counter.deliveryTaskTerminate).not.toHaveBeenCalledWith(
       expect.objectContaining({ reason: 'terminal-error' }),
@@ -4099,12 +4550,14 @@ describe('operation panel pagination delivery', () => {
     visibleSource.value = 'search'
     autoMergeOnInit.value = false
     window.history.replaceState({}, '', '/web/geek/job?query=AI')
-    getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 50 : 50))
-    const searchJobs = Array.from({ length: 5 }, (_, index) => job(`search-seed-${index + 1}`))
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'search' ? 60 : 40))
+    // 搜索缺口较大，空池先翻搜索；超时后继续尝试求职期望。
+    const searchJobs = Array.from({ length: 3 }, (_, index) => job(`search-seed-${index + 1}`))
     const groupJobs = Array.from({ length: 29 }, (_, index) => job(`group-seed-${index + 1}`))
     jobListRef.value = searchJobs
     sourceLists.search = [...searchJobs]
-    sourceLists.group = [...groupJobs]
+    sourceLists.group = groupJobs.slice(0, 4)
+    ;[...searchJobs, ...sourceLists.group].forEach((item) => item.status.setStatus('success'))
     pagerNext.mockImplementation(() => {
       pagerNextAttempt.value += 1
       return pagerNextAttempt.value === 1
@@ -4131,15 +4584,16 @@ describe('operation panel pagination delivery', () => {
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
 
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('投递池首次补充跳过：来源翻页加载失败'),
+      expect.anything(),
     )
     expect(counter.deliveryTaskTerminate).not.toHaveBeenCalledWith(
       expect.objectContaining({ reason: 'terminal-error' }),
     )
   })
 
-  it('attempts every underfilled source before consuming an incomplete startup pool', async () => {
+  it('does not visit every underfilled source when startup jobs can already be processed', async () => {
     actualSource.value = 'group'
     visibleSource.value = 'group'
     window.history.replaceState({}, '', '/web/geek/jobs?salary=406')
@@ -4178,17 +4632,14 @@ describe('operation panel pagination delivery', () => {
     await startButton!.trigger('click')
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
 
-    // search 的缺口更大，预热先尝试 search；当前 group 不再因为“正好在这页”插队。
+    // 来源比例是软目标，现有岗位先处理，不能为了填满另一来源而跳页。
     expect(pagerNext).not.toHaveBeenCalled()
-    expect(routerPush).toHaveBeenCalledWith('/web/geek/job?query=AI')
+    expect(routerPush).not.toHaveBeenCalled()
     expect(logInfo).toHaveBeenCalledWith('投递批次', expect.stringContaining('投递池首次补充完成'))
-    expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
-      expect.stringContaining('混合投递池切换来源补充'),
-    )
   })
 
-  it('does not deliver 29 search jobs until the enabled group source has been attempted', async () => {
+  it('starts delivering once the pool reaches its target instead of visiting every source first', async () => {
+    // 投递池按需补充：整池够一批就开始投，另一个来源留给下一次低水位补池（缺口最大者优先）。
     actualSource.value = 'search'
     visibleSource.value = 'search'
     window.history.replaceState({}, '', '/web/geek/job?query=AI')
@@ -4197,16 +4648,8 @@ describe('operation panel pagination delivery', () => {
     sourceLists.group = []
     jobListRef.value = sourceLists.search.slice(0, 15)
     pagerNext.mockReturnValue(false)
-    routerPush.mockImplementationOnce(async (route?: string) => {
-      expect(deliverJobListHandle).not.toHaveBeenCalled()
-      actualSource.value = 'group'
-      visibleSource.value = 'group'
-      window.history.replaceState({}, '', route)
-      jobListRef.value = Array.from({ length: 15 }, (_, index) => job(`group-${index + 1}`))
-    })
     deliverJobListHandle.mockImplementationOnce(async (items) => {
-      expect(routerPush).toHaveBeenCalledWith('/web/geek/jobs')
-      expect(items.some((item: any) => item.source === 'group')).toBe(true)
+      expect(items.every((item: any) => item.source === 'search')).toBe(true)
       markBatchProcessed(items)
       common.deliverStop = true
       return 'stopped'
@@ -4220,11 +4663,11 @@ describe('operation panel pagination delivery', () => {
       await flushPromises()
     }
 
-    expect(routerPush).toHaveBeenCalledWith('/web/geek/jobs')
+    expect(routerPush).not.toHaveBeenCalled()
     expect(deliverJobListHandle).toHaveBeenCalledTimes(1)
     expect(logInfo).toHaveBeenCalledWith(
       '投递批次',
-      expect.stringContaining('"completionReason":"source-round-complete"'),
+      expect.stringContaining('"completionReason":"target-reached"'),
     )
   })
 
@@ -4251,10 +4694,15 @@ describe('operation panel pagination delivery', () => {
     })
     getDeliveryLimit.mockImplementation(() => 50)
     const searchJobs = Array.from({ length: 29 }, (_, index) => job(`search-${index + 1}`))
-    sourceLists.search = [...searchJobs]
+    searchJobs.slice(0, 15).forEach((item) => item.status.setStatus('success'))
+    sourceLists.search = searchJobs.slice(0, 15)
     sourceLists.group = []
     jobListRef.value = searchJobs.slice(0, 15)
-    pagerNext.mockReturnValue(false)
+    pagerNext.mockImplementationOnce(() => {
+      jobListRef.value = searchJobs.slice(15)
+      jobListRevision.value += 1
+      return true
+    })
     routerPush.mockImplementation(async (route?: string) => {
       window.history.replaceState({}, '', route)
       if (route?.includes('/web/geek/job?')) {
@@ -4291,8 +4739,9 @@ describe('operation panel pagination delivery', () => {
     expect(groupStep.prefetchRetryAt).toEqual(expect.any(Number))
     expect(groupStep.prefetchRetryAt).toBeGreaterThan(checkpoint.startedAt)
     expect(logInfo).toHaveBeenCalledWith(
-      '投递批次',
+      '投递任务',
       expect.stringContaining('当前取岗步骤暂时不可用，保留并稍后自动重试'),
+      expect.anything(),
     )
   })
 })

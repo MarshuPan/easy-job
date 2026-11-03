@@ -191,6 +191,18 @@ export class GreetError extends AgentDeliveryError {
   }
 }
 
+/**
+ * 建立沟通之前，AI 招呼语这一次没有生成出可用内容。
+ *
+ * 沟通还没建立、额度还没花，所以它只是岗位级失败：记为可重试，继续后面的岗位。
+ */
+export class GreetingGenerationError extends AgentDeliveryError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, 'danger', options)
+    this.name = '招呼语生成失败'
+  }
+}
+
 export class LimitError extends AgentDeliveryError {
   constructor(message: string, options?: ErrorOptions) {
     super(message, 'danger', options)

@@ -3,17 +3,24 @@ import { ChevronRight, Copy, ScrollText, Trash2 } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 
 import type { log, logData } from '@/stores/log'
-import { newestDeliveryLogs, useLog } from '@/stores/log'
-import { AgentButton, AgentMessage, AgentTag } from '@/ui/instrument'
+import { isDiagnosticsEnabled, newestRunEvents, setDiagnosticsEnabled, useLog } from '@/stores/log'
+import { AgentButton, AgentMessage, AgentSwitch, AgentTag } from '@/ui/instrument'
 import { safeStringify } from '@/utils/safeJson'
 
 import InstrumentEmptyState from './InstrumentEmptyState.vue'
 
+// 运行日志只展示运行事件和 AI 请求诊断；岗位的处理过程在「投递记录」里看。
 const logStore = useLog()
 const logs = computed(() =>
-  newestDeliveryLogs([...logStore.data.value, ...(logStore.runtimeData?.value ?? [])]),
+  newestRunEvents([...logStore.events.value, ...(logStore.runtimeData?.value ?? [])]),
 )
 const expandedEntries = ref<Set<number>>(new Set())
+const diagnostics = ref(isDiagnosticsEnabled())
+
+function toggleDiagnostics(value: boolean) {
+  diagnostics.value = value
+  setDiagnosticsEnabled(value)
+}
 
 function stateType(state: log['state']) {
   return state === 'info' ? 'primary' : state
@@ -79,46 +86,16 @@ function fallbackCopy(text: string) {
   document.body.removeChild(textarea)
 }
 
+/** 只有后台 AI 请求诊断带过程明细；运行事件的内容全在 message 里。 */
 function formatLogDetail(data?: logData) {
-  if (!data) return []
-
-  const lines: string[] = []
-  if (data.trace?.length) {
-    lines.push(sectionText('流程追踪', data.trace.map(formatTrace).join('\n')))
-  }
-  if (data.publish) lines.push(sectionText('投递接口', stringify(data.publish)))
-  if (data.greetingSend) lines.push(sectionText('招呼语发送', stringify(data.greetingSend)))
-  if (data.state) lines.push(`状态: ${data.state}`)
-  if (data.message) lines.push(`消息: ${data.message}`)
-  if (data.err) lines.push(`错误: ${data.err}`)
-  if (data.aiFilteringR) lines.push(sectionText('AI匹配度思考', data.aiFilteringR))
-  if (data.aiFilteringAtext) lines.push(sectionText('AI匹配度响应', data.aiFilteringAtext))
-  if (data.aiFilteringAjson)
-    lines.push(sectionText('AI匹配度JSON', stringify(data.aiFilteringAjson)))
-  if (data.aiGreetingR) lines.push(sectionText('AI招呼语思考', data.aiGreetingR))
-  if (data.aiGreetingA) lines.push(sectionText('AI招呼语响应', data.aiGreetingA))
-  if (data.aiGreetingMessages?.length) {
-    lines.push(
-      sectionText(
-        'AI招呼语拆分',
-        data.aiGreetingMessages.map((item, index) => `${index + 1}. ${item}`).join('\n'),
-      ),
-    )
-  }
-  if (data.greetingWarning) lines.push(`招呼语状态: ${data.greetingWarning}`)
-  lines.push(sectionText('原始数据', stringify(data)))
-
-  return lines
+  if (!data?.trace?.length) return []
+  return [data.trace.map(formatTrace).join('\n')]
 }
 
 function formatTrace(item: NonNullable<logData['trace']>[number]) {
   const time = formatTime(item.at)
   const detail = item.detail == null ? '' : `\n${stringify(item.detail)}`
   return `[${time}] ${item.status} / ${item.stage}: ${item.message}${detail}`
-}
-
-function sectionText(title: string, content: string) {
-  return `--- ${title} ---\n${content}`
 }
 
 function stringify(value: unknown) {
@@ -147,6 +124,17 @@ function clearLogs() {
     <div class="console-log__toolbar instrument-view-toolbar">
       <strong class="console-log__count">运行日志 · {{ logs.length }}</strong>
       <div class="console-log__actions">
+        <label
+          class="console-log__diagnostics"
+          title="记录分页、心跳、运行时检查等实现细节，排查问题时再打开"
+        >
+          <AgentSwitch
+            :model-value="diagnostics"
+            size="small"
+            @update:model-value="toggleDiagnostics(Boolean($event))"
+          />
+          诊断模式
+        </label>
         <AgentButton
           size="small"
           aria-label="复制全部日志"

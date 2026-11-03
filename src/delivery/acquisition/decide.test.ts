@@ -12,11 +12,36 @@ function input(overrides: Partial<AcquisitionInput> = {}): AcquisitionInput {
     lowWaterMark: 20,
     warmupJustCompleted: false,
     readyBatchSize: 10,
+    refillDue: true,
     ...overrides,
   }
 }
 
 describe('decideAcquisition', () => {
+  it.each([1, 7])('processes %i remaining jobs while the refill countdown runs', (size) => {
+    expect(
+      decideAcquisition(
+        input({
+          poolSizes: { group: size, search: 0 },
+          lowWaterMark: 8,
+          readyBatchSize: size,
+          refillDue: false,
+        }),
+      ),
+    ).toEqual({ kind: 'process-batch' })
+  })
+
+  it('refills an empty pool without waiting for a ready batch', () => {
+    expect(
+      decideAcquisition(
+        input({
+          poolSizes: { group: 0, search: 0 },
+          readyBatchSize: 0,
+          refillDue: false,
+        }),
+      ),
+    ).toMatchObject({ kind: 'prefetch-current' })
+  })
   it('consumes the ready batch when both pools are full', () => {
     expect(decideAcquisition(input())).toEqual({ kind: 'process-batch' })
   })
@@ -56,10 +81,26 @@ describe('decideAcquisition', () => {
     ).toMatchObject({ kind: 'switch-source', source: 'group', trigger: 'underfilled' })
   })
 
-  it('uses stable source order when both sources have the same gap', () => {
+  it('stays on the current source when both sources are equally short', () => {
+    // 切来源要多一次跳转，也就是多一次列表刷新；其他条件都一样时不值得。
     expect(
       decideAcquisition(input({ poolSizes: { group: 5, search: 5 }, currentSource: 'search' })),
-    ).toMatchObject({ kind: 'switch-source', source: 'group', trigger: 'low-water' })
+    ).toMatchObject({ kind: 'prefetch-current', source: 'search', trigger: 'low-water' })
+  })
+
+  it('refills the source furthest below its ratio today, not the one with the emptier pool', () => {
+    // 真机：设 50/50，今天求职期望已处理 24、搜索 0。该补搜索，哪怕求职期望池更空。
+    expect(
+      decideAcquisition(
+        input({
+          poolSizes: { group: 2, search: 3 },
+          lowWaterMark: 8,
+          currentSource: 'group',
+          weights: { group: 50, search: 50 },
+          processedBySource: { group: 24, search: 0 },
+        }),
+      ),
+    ).toMatchObject({ kind: 'switch-source', source: 'search', trigger: 'low-water' })
   })
 
   it('does not trigger low-water refill right after a full warmup pass', () => {

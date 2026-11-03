@@ -23,6 +23,7 @@ import {
   AgentSelect,
   AgentSwitch,
 } from '@/ui/instrument'
+import { clampInteger } from '@/utils/clampInteger'
 import { jsonClone } from '@/utils/deepmerge'
 
 const conf = useConf()
@@ -147,10 +148,41 @@ watchDebounced(
   { deep: true, debounce: 250, maxWait: 1_000 },
 )
 
+/**
+ * 把 AI 的三个数值拉回合法范围。后台对超出范围的值是静默忽略的：原来填「30 字」
+ * 看起来保存成功了，下一次配置刷新又变回原值，用户只看到「改不了」。
+ * 返回 true 表示有值被修正——修正本身会再触发一次保存，这一次先跳过。
+ */
+function normalizeAiTaskNumbers() {
+  const previous = aiTaskResetSnapshot
+  const filtering = conf.formData.aiFiltering
+  const greeting = conf.formData.aiGreeting
+  const next = {
+    score: clampInteger(filtering.score, 0, 100, previous?.aiFiltering.score ?? 60),
+    messageCount: clampInteger(greeting.messageCount, 1, 5, previous?.aiGreeting.messageCount ?? 3),
+    target: clampInteger(
+      greeting.targetTotalCharacters,
+      GREETING_TARGET_MIN,
+      GREETING_TARGET_MAX,
+      previous?.aiGreeting.targetTotalCharacters ?? GREETING_TARGET_MIN,
+    ),
+  }
+  const changed =
+    next.score !== filtering.score ||
+    next.messageCount !== greeting.messageCount ||
+    next.target !== greeting.targetTotalCharacters
+  if (!changed) return false
+  filtering.score = next.score
+  greeting.messageCount = next.messageCount
+  greeting.targetTotalCharacters = next.target
+  return true
+}
+
 watchDebounced(
   () => aiTaskKeys.map((key) => conf.formData[key]),
   () => {
     if (!autoSaveReady || resetInProgress) return
+    if (normalizeAiTaskNumbers()) return
     const candidate = serializeAiTasks()
     if (candidate === persistedAiTaskSnapshot) return
     persistedAiTaskSnapshot = candidate
@@ -245,7 +277,7 @@ defineExpose({ resetRuntimeSettings })
             </span>
             <label class="runtime-settings__unit-field">
               <input
-                v-model.number="conf.formData.deliveryLimit.search"
+                v-model.lazy.number="conf.formData.deliveryLimit.search"
                 type="number"
                 inputmode="numeric"
                 aria-label="搜索取岗比例"
@@ -264,7 +296,7 @@ defineExpose({ resetRuntimeSettings })
             </span>
             <label class="runtime-settings__unit-field">
               <input
-                v-model.number="conf.formData.deliveryLimit.group"
+                v-model.lazy.number="conf.formData.deliveryLimit.group"
                 type="number"
                 inputmode="numeric"
                 aria-label="求职期望取岗比例"
@@ -283,7 +315,7 @@ defineExpose({ resetRuntimeSettings })
             </div>
             <div class="runtime-settings__compound-field">
               <input
-                v-model.number="conf.formData.delay.deliveryInterval"
+                v-model.lazy.number="conf.formData.delay.deliveryInterval"
                 type="number"
                 inputmode="numeric"
                 aria-label="单个岗位最短处理间隔"
@@ -293,7 +325,7 @@ defineExpose({ resetRuntimeSettings })
               />
               <span>至</span>
               <input
-                v-model.number="conf.formData.delay.deliveryIntervalMax"
+                v-model.lazy.number="conf.formData.delay.deliveryIntervalMax"
                 type="number"
                 inputmode="numeric"
                 aria-label="单个岗位最长处理间隔"
@@ -312,7 +344,7 @@ defineExpose({ resetRuntimeSettings })
             </div>
             <div class="runtime-settings__compound-field">
               <input
-                v-model.number="conf.formData.delay.greetingSegment"
+                v-model.lazy.number="conf.formData.delay.greetingSegment"
                 type="number"
                 inputmode="numeric"
                 aria-label="招呼语分段基础间隔秒数"
@@ -331,7 +363,7 @@ defineExpose({ resetRuntimeSettings })
             </div>
             <div class="runtime-settings__compound-field">
               <input
-                v-model.number="conf.formData.delay.batchSize"
+                v-model.lazy.number="conf.formData.delay.batchSize"
                 type="number"
                 inputmode="numeric"
                 aria-label="批量岗位数量"
@@ -341,7 +373,7 @@ defineExpose({ resetRuntimeSettings })
               />
               <span>个 /</span>
               <input
-                v-model.number="conf.formData.delay.batchRestMinutes"
+                v-model.lazy.number="conf.formData.delay.batchRestMinutes"
                 type="number"
                 inputmode="numeric"
                 aria-label="批量休息分钟数"
@@ -377,7 +409,7 @@ defineExpose({ resetRuntimeSettings })
           <label class="instrument-setting-row">
             <span class="instrument-setting-copy">
               <strong>同 HR 去重</strong>
-              <span>当天不重复触达同一招聘者</span>
+              <span>本周不重复触达同一招聘者，跨周可再次投递</span>
             </span>
             <AgentSwitch v-model="conf.formData.sameHrFilter.value" />
           </label>
@@ -485,7 +517,7 @@ defineExpose({ resetRuntimeSettings })
               <label>
                 <span>直线 km</span>
                 <input
-                  v-model.number="conf.formData.amap.straightDistance"
+                  v-model.lazy.number="conf.formData.amap.straightDistance"
                   type="number"
                   min="0"
                   max="1000"
@@ -496,7 +528,7 @@ defineExpose({ resetRuntimeSettings })
               <label>
                 <span>驾车 km</span>
                 <input
-                  v-model.number="conf.formData.amap.drivingDistance"
+                  v-model.lazy.number="conf.formData.amap.drivingDistance"
                   type="number"
                   min="0"
                   max="1000"
@@ -507,7 +539,7 @@ defineExpose({ resetRuntimeSettings })
               <label>
                 <span>驾车 min</span>
                 <input
-                  v-model.number="conf.formData.amap.drivingDuration"
+                  v-model.lazy.number="conf.formData.amap.drivingDuration"
                   type="number"
                   min="0"
                   max="1440"
@@ -518,7 +550,7 @@ defineExpose({ resetRuntimeSettings })
               <label>
                 <span>步行 km</span>
                 <input
-                  v-model.number="conf.formData.amap.walkingDistance"
+                  v-model.lazy.number="conf.formData.amap.walkingDistance"
                   type="number"
                   min="0"
                   max="1000"
@@ -529,7 +561,7 @@ defineExpose({ resetRuntimeSettings })
               <label>
                 <span>步行 min</span>
                 <input
-                  v-model.number="conf.formData.amap.walkingDuration"
+                  v-model.lazy.number="conf.formData.amap.walkingDuration"
                   type="number"
                   min="0"
                   max="1440"
@@ -569,7 +601,7 @@ defineExpose({ resetRuntimeSettings })
               </span>
               <label class="runtime-settings__unit-field">
                 <input
-                  v-model.number="conf.formData.aiFiltering.score"
+                  v-model.lazy.number="conf.formData.aiFiltering.score"
                   type="number"
                   inputmode="numeric"
                   aria-label="最低匹配度"
@@ -618,7 +650,7 @@ defineExpose({ resetRuntimeSettings })
               </span>
               <label class="runtime-settings__unit-field">
                 <input
-                  v-model.number="conf.formData.aiGreeting.messageCount"
+                  v-model.lazy.number="conf.formData.aiGreeting.messageCount"
                   type="number"
                   inputmode="numeric"
                   aria-label="AI 招呼语消息条数"
@@ -642,7 +674,7 @@ defineExpose({ resetRuntimeSettings })
               </span>
               <label class="runtime-settings__unit-field">
                 <input
-                  v-model.number="conf.formData.aiGreeting.targetTotalCharacters"
+                  v-model.lazy.number="conf.formData.aiGreeting.targetTotalCharacters"
                   type="number"
                   inputmode="numeric"
                   aria-label="AI 招呼语目标总字数"

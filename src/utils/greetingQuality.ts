@@ -1,22 +1,53 @@
+import { CONTROLLED_CLAIM_VERBS } from '@/profile/resumeEvidenceRules'
 import type {
   ClaimPolicy,
   GreetingDraft,
-  GreetingFilteringContext,
   GreetingLengthConfig,
   SelectedGreetingFact,
 } from '@/types/aiGreeting'
+import {
+  findReusedPhrases,
+  findStockPhrases,
+  hasSelfDeprecation,
+  jdQuoteAppears,
+  MAX_GREETING_OVERLAP,
+  maxOverlapWithRecent,
+} from '@/utils/greetingDiversity'
 
 export type GreetingQualityCode =
   | 'SCHEMA_INVALID'
   | 'MESSAGE_COUNT'
   | 'MESSAGE_EMPTY'
-  | 'MESSAGE_TOO_LONG'
-  | 'TOTAL_TOO_SHORT'
-  | 'TOTAL_TOO_LONG'
   | 'FACT_NOT_ALLOWED'
-  | 'CLAIM_MODE_MISMATCH'
   | 'THIRD_PERSON_SELF_REFERENCE'
   | 'FORBIDDEN_CLAIM'
+  | 'JD_QUOTE_NOT_FOUND'
+  | 'SELF_DEPRECATION'
+  | 'STOCK_PHRASE'
+  | 'REUSED_PHRASE'
+  | 'TOO_SIMILAR'
+  | 'SEGMENT_FACT_MAPPING'
+
+/**
+ * 风格问题：会带着问题重写一次，重写后还在也照发，并记进体检。
+ * 其余问题涉及结构或事实边界，重写后还在就不发。风格问题不值得为它丢掉一个岗位——
+ * 列表每刷新一次都很珍贵，岗位凭据半小时就过期。
+ */
+export const STYLE_ISSUE_CODES: ReadonlySet<GreetingQualityCode> = new Set([
+  'JD_QUOTE_NOT_FOUND',
+  'SELF_DEPRECATION',
+  'STOCK_PHRASE',
+  'REUSED_PHRASE',
+  'TOO_SIMILAR',
+])
+
+export const STYLE_ISSUE_LABELS: Readonly<Record<string, string>> = {
+  JD_QUOTE_NOT_FOUND: 'JD 摘录对不上',
+  SELF_DEPRECATION: '主动免责',
+  STOCK_PHRASE: '套话',
+  REUSED_PHRASE: '重复近期句子',
+  TOO_SIMILAR: '与近期招呼语雷同',
+}
 
 export interface GreetingQualityIssue {
   code: GreetingQualityCode
@@ -27,23 +58,17 @@ export interface GreetingQualityIssue {
 interface ValidateGreetingDraftArgs {
   candidateName?: string
   draft: GreetingDraft
-  filtering?: GreetingFilteringContext
   selectedFacts: SelectedGreetingFact[]
   claimPolicy: ClaimPolicy
   length?: GreetingLengthConfig
+  /** 岗位名、JD 正文、标签拼成的文本，用来核对 anchor.jdQuote。为空时不核对。 */
+  jobText?: string
+  /** 近期被多条招呼语共用的长句。 */
+  avoidPhrases?: readonly string[]
+  /** 近期招呼语正文，用来判断整段是否照搬。 */
+  recentMessages?: ReadonlyArray<readonly string[]>
 }
 
-const controlledClaimVerbs = [
-  '主导',
-  '负责',
-  '牵头',
-  '搭建',
-  '落地',
-  '参与',
-  '使用',
-  '熟悉',
-  '做过',
-]
 const directOwnershipVerbs = ['主导', '负责', '牵头', '搭建', '做过', '落地过']
 
 function includesPhrase(value: string, phrase: string) {
@@ -80,8 +105,8 @@ export function validateGreetingDraft(args: ValidateGreetingDraftArgs): Greeting
     draft == null ||
     !Array.isArray((draft as GreetingDraft).messages) ||
     !Array.isArray((draft as GreetingDraft).usedFactIds) ||
-    typeof (draft as GreetingDraft).claimMode !== 'string' ||
-    typeof (draft as GreetingDraft).openingPattern !== 'string'
+    typeof (draft as GreetingDraft).anchor !== 'object' ||
+    (draft as GreetingDraft).anchor == null
   ) {
     return [{ code: 'SCHEMA_INVALID', message: 'AI招呼语草稿结构不合法' }]
   }
@@ -101,7 +126,7 @@ export function validateGreetingDraft(args: ValidateGreetingDraftArgs): Greeting
 
   messages.forEach((message, messageIndex) => {
     if (typeof message !== 'string' || message.trim().length === 0) {
-      issue(issues, 'MESSAGE_EMPTY', `第${messageIndex + 1}条消息为空`, messageIndex)
+      issue(issues, 'MESSAGE_EMPTY', `第${messageIndex + 1}条消息为空`, messageIndex + 1)
       return
     }
   })
@@ -109,14 +134,17 @@ export function validateGreetingDraft(args: ValidateGreetingDraftArgs): Greeting
   const stringMessages = messages.filter(
     (message): message is string => typeof message === 'string',
   )
+  const stringMessagesWithIndex = messages.flatMap((message, messageIndex) =>
+    typeof message === 'string' ? [{ message, messageIndex }] : [],
+  )
 
-  stringMessages.forEach((message, messageIndex) => {
+  stringMessagesWithIndex.forEach(({ message, messageIndex }) => {
     if (hasThirdPersonSelfReference(message, args.candidateName)) {
       issue(
         issues,
         'THIRD_PERSON_SELF_REFERENCE',
         `第${messageIndex + 1}条使用第三人称描述候选人本人`,
-        messageIndex,
+        messageIndex + 1,
       )
     }
   })
@@ -124,71 +152,118 @@ export function validateGreetingDraft(args: ValidateGreetingDraftArgs): Greeting
   const allowedFactIds = new Set(args.selectedFacts.map((fact) => fact.id))
   if (
     typedDraft.usedFactIds.length === 0 ||
+    new Set(typedDraft.usedFactIds).size !== typedDraft.usedFactIds.length ||
     typedDraft.usedFactIds.some((factId) => !allowedFactIds.has(factId))
   ) {
     issue(issues, 'FACT_NOT_ALLOWED', 'AI招呼语使用了筛选范围外的事实')
   }
 
-  const usedFacts = args.selectedFacts.filter((fact) => typedDraft.usedFactIds.includes(fact.id))
-  // claimMode 由「实际用于写作的事实」决定（契约 §4.2）。
-  //
-  // 这里曾经额外要求它等于匹配阶段的 claimMode，但两者的输入集合本来就不同：
-  // 匹配阶段对**选中的全部事实**推导，招呼语对**实际使用的子集**推导。当匹配选出
-  // direct 与 adjacent 混合的事实、而招呼语只引用了其中的 direct 事实时，前者是
-  // 'adjacent'、后者是 'direct'，于是必然判为不一致——且模型只有把所有事实都写进去
-  // 才可能通过，两次重试都会失败，最终表现为「已建立沟通但招呼语发不出去」。
-  //
-  // 安全边界由另外两条保证：usedFactIds 必须是选中事实的子集（FACT_NOT_ALLOWED），
-  // 且草稿声明的 claimMode 必须精确匹配它自己用的事实。用子集写作只会让声明更保守，
-  // 不会夸大候选人的经历。
-  const expectedClaimMode =
-    usedFacts.length > 0 && usedFacts.every((fact) => fact.evidenceType === 'direct_fact')
-      ? 'direct'
-      : 'adjacent'
-  if (typedDraft.claimMode !== expectedClaimMode) {
-    issue(issues, 'CLAIM_MODE_MISMATCH', '声明模式与事实边界不一致')
+  const segmentFactIds = typedDraft.segmentFactIds
+  const segmentMappingValid =
+    Array.isArray(segmentFactIds) &&
+    segmentFactIds.length === messages.length &&
+    segmentFactIds.every(
+      (ids) =>
+        Array.isArray(ids) &&
+        new Set(ids).size === ids.length &&
+        ids.every((factId) => allowedFactIds.has(factId)),
+    )
+  const mappedFactIds = new Set(segmentMappingValid ? segmentFactIds.flat() : [])
+  if (
+    !segmentMappingValid ||
+    mappedFactIds.size !== typedDraft.usedFactIds.length ||
+    typedDraft.usedFactIds.some((factId) => !mappedFactIds.has(factId))
+  ) {
+    issue(issues, 'SEGMENT_FACT_MAPPING', '招呼语分段事实映射必须覆盖且仅覆盖正文实际引用的事实')
   }
 
-  stringMessages.forEach((message, messageIndex) => {
+  const usedFacts = args.selectedFacts.filter((fact) => typedDraft.usedFactIds.includes(fact.id))
+  // 措辞越界由下面的受控动词检查和相邻经验检查负责，依据是事实本身，不看模型自报什么。
+
+  stringMessagesWithIndex.forEach(({ message, messageIndex }) => {
     for (const forbiddenClaim of args.claimPolicy.forbiddenClaims) {
       if (forbiddenClaim && includesPhrase(message, forbiddenClaim)) {
-        issue(issues, 'FORBIDDEN_CLAIM', `第${messageIndex + 1}条包含禁用主张`, messageIndex)
+        issue(issues, 'FORBIDDEN_CLAIM', `第${messageIndex + 1}条包含禁用主张`, messageIndex + 1)
       }
     }
   })
 
   const allowedClaimVerbs = new Set(usedFacts.flatMap((fact) => fact.allowedClaimVerbs))
-  stringMessages.forEach((message, messageIndex) => {
-    for (const verb of controlledClaimVerbs) {
+  stringMessagesWithIndex.forEach(({ message, messageIndex }) => {
+    for (const verb of CONTROLLED_CLAIM_VERBS) {
       if (includesPhrase(message, verb) && !allowedClaimVerbs.has(verb)) {
         issue(
           issues,
           'FORBIDDEN_CLAIM',
           `第${messageIndex + 1}条使用了事实未授权的主张动词: ${verb}`,
-          messageIndex,
+          messageIndex + 1,
         )
       }
     }
   })
 
-  if (typedDraft.claimMode === 'adjacent') {
-    stringMessages.forEach((message, messageIndex) => {
-      const hasAdjacentPhrase = args.claimPolicy.adjacentOnly.some(
-        (phrase) => phrase && includesPhrase(message, phrase),
+  // 仅相邻的主题不论本次引用了什么事实，都不能被说成直接负责过。
+  //
+  // 按分句查，不按整条消息查：招呼语第一句就要点出 JD 的核心职责，JD 里的「RAG」「模型评测」
+  // 和自己事实里的「负责过」经常落在同一条消息的不同分句里。那是在说岗位要什么、我做过什么，
+  // 不是把相邻经验说成亲手做过；同一分句里同时出现才是。
+  stringMessagesWithIndex.forEach(({ message, messageIndex }) => {
+    const claimsAdjacentAsDirect = message
+      .split(/[，,。；;！!？?\n]/u)
+      .some(
+        (clause) =>
+          args.claimPolicy.adjacentOnly.some(
+            (phrase) => phrase && includesPhrase(clause, phrase),
+          ) && directOwnershipVerbs.some((verb) => includesPhrase(clause, verb)),
       )
-      const claimsDirectOwnership = directOwnershipVerbs.some((verb) =>
-        includesPhrase(message, verb),
+    if (claimsAdjacentAsDirect) {
+      issue(
+        issues,
+        'FORBIDDEN_CLAIM',
+        `第${messageIndex + 1}条把相邻经验表述为直接经验`,
+        messageIndex + 1,
       )
-      if (hasAdjacentPhrase && claimsDirectOwnership) {
-        issue(
-          issues,
-          'FORBIDDEN_CLAIM',
-          `第${messageIndex + 1}条把相邻经验表述为直接经验`,
-          messageIndex,
-        )
-      }
-    })
-  }
+    }
+  })
+
+  checkStyle(issues, typedDraft, stringMessages, args)
 
   return issues
+}
+
+function checkStyle(
+  issues: GreetingQualityIssue[],
+  draft: GreetingDraft,
+  messages: string[],
+  args: ValidateGreetingDraftArgs,
+) {
+  if (args.jobText?.trim() && !jdQuoteAppears(args.jobText, draft.anchor.jdQuote)) {
+    issue(
+      issues,
+      'JD_QUOTE_NOT_FOUND',
+      'anchor.jdQuote 在岗位原文中找不到，需逐字摘录 JD 里的一句或一个短语，并据此调整正文',
+    )
+  }
+  if (hasSelfDeprecation(messages)) {
+    issue(
+      issues,
+      'SELF_DEPRECATION',
+      '不要主动说明自己没做过什么、经历偏哪一侧；只写做过的、能回应需求的事',
+    )
+  }
+  const stock = findStockPhrases(messages)
+  if (stock.length > 0) {
+    issue(issues, 'STOCK_PHRASE', `去掉模板化说法：${stock.join('、')}`)
+  }
+  const reused = findReusedPhrases(messages, args.avoidPhrases ?? [])
+  if (reused.length > 0) {
+    issue(
+      issues,
+      'REUSED_PHRASE',
+      `以下句子最近已在多条招呼语里用过，换角度讲或改用另一条事实：${reused.join('；')}`,
+    )
+  }
+  if (maxOverlapWithRecent(messages, args.recentMessages ?? []) >= MAX_GREETING_OVERLAP) {
+    issue(issues, 'TOO_SIMILAR', '与最近某条招呼语大段相同，换一个项目或切入角度重写')
+  }
 }

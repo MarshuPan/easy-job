@@ -5,18 +5,27 @@ import {
 import type { AiModelConfig } from '@/config/types'
 import type { messageReps, prompt } from '@/types/aiProtocol'
 import type { AiTaskDiagnostics } from '@/utils/backgroundAiDiagnostics'
+import type { AiDiagnosticContext } from '@/utils/backgroundAiProtocol'
 import { AI_TASK_MAX_RETRIES, AI_TASK_MAX_RETRY_DELAY_SECONDS } from '@/utils/backgroundAiProtocol'
 
 import { assertHttpUrl, assertRequestTimeout, normalizeRequestTimeout } from './httpGuards'
 import { toSafeJsonValue } from './safeJson'
 
 const templateExpressionRE = /\{\{\s*([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*\}\}/g
-const maxAiRequestBodyBytes = 1024 * 1024
-const maxAiResponseBodyBytes = 1024 * 1024
-const maxAiStreamBodyBytes = 16 * 1024 * 1024
+// Last-resort transport guards. Normal full resumes, JDs and provider
+// responses must reach the local diagnostic mirror before a size guard fires.
+export const MAX_AI_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+export const MAX_AI_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+export const MAX_AI_STREAM_BODY_BYTES = 64 * 1024 * 1024
 /** 供应商失败正文在日志里保留的长度。够看清原因，又不至于把整段响应灌进日志。 */
 const maxProviderFailureDetailLength = 220
-const retryBackoffBaseMs = 50
+/** 超出响应资源上限时仍保留一小段原文，便于判断供应商实际返回了什么。 */
+const providerResponsePreviewLength = 64 * 1024
+/**
+ * 重试间隔 2 秒、4 秒。原来是 50、100 毫秒：网关 502 这类故障要几秒才恢复，
+ * 真机上三次请求在 0.1 秒内打完全部失败，任务随即按 AI 不可用暂停，等于没有重试。
+ */
+const retryBackoffBaseMs = 2000
 const maxRetryDelayMs = AI_TASK_MAX_RETRY_DELAY_SECONDS * 1000
 /** Anthropic 不接受省略 max_tokens，「不设上限」在这个协议下只能退化成一个足够大的值。 */
 const anthropicUnboundedMaxTokens = 64_000
@@ -28,6 +37,8 @@ const responsesBackgroundProgressIntervalMs = 30_000
 
 export interface AiRuntimeDiagnosticEvent {
   at: number
+  requestId?: string
+  parentRequestId?: string
   diagnostics: AiTaskDiagnostics
   durationMs: number
   error?: unknown
@@ -42,6 +53,18 @@ export interface AiRuntimeDiagnosticEvent {
   unsupportedSettings?: string[]
   /** 供应商返回的 token 用量。只有它能区分「模型本身慢」和「我们要的输出变多了」。 */
   usage?: messageReps['usage']
+  /** 本机测试诊断：完整提示词消息，不通过页面桥接返回。 */
+  promptMessages?: prompt
+  /** 本机测试诊断：实际发送给供应商的请求体，不含鉴权请求头。 */
+  requestBody?: unknown
+  /** 本机测试诊断：供应商返回的原始 JSON/SSE 汇总。 */
+  providerResponse?: unknown
+  /** 本机测试诊断：解析后的结果和模型推理文本。 */
+  resultContent?: string
+  reasoningContent?: string
+  diagnosticContext?: AiDiagnosticContext
+  /** Full resume source used to build the prompt; only sent to the local mirror. */
+  resumeMarkdown?: string
 }
 
 export type AiRuntimeDiagnosticHandler = (event: AiRuntimeDiagnosticEvent) => void | Promise<void>
@@ -89,11 +112,29 @@ function sanitizeProviderFailureDetail(value: unknown, maxLength: number) {
 
 class BackgroundAiRequestError extends Error {
   diagnostics: AiTaskDiagnostics
+  providerResponse?: unknown
 
   constructor(message: string, diagnostics: AiTaskDiagnostics, options?: ErrorOptions) {
     super(message, options)
     this.name = 'BackgroundAiRequestError'
     this.diagnostics = diagnostics
+    const cause = options?.cause
+    if (cause instanceof BackgroundAiRequestError) this.providerResponse = cause.providerResponse
+  }
+}
+
+function oversizedProviderResponseEvidence(args: {
+  declaredBytes?: number
+  bytesRead?: number
+  preview?: string
+}) {
+  return {
+    truncated: true,
+    reason: 'response-size-limit',
+    maxBytes: MAX_AI_RESPONSE_BODY_BYTES,
+    ...(args.declaredBytes == null ? {} : { declaredBytes: args.declaredBytes }),
+    ...(args.bytesRead == null ? {} : { bytesRead: args.bytesRead }),
+    ...(args.preview ? { preview: args.preview.slice(0, providerResponsePreviewLength) } : {}),
   }
 }
 
@@ -116,13 +157,18 @@ async function readAiResponseText(response: Response, diagnostics: AiTaskDiagnos
   const contentLength = response.headers.get('content-length')?.trim()
   if (contentLength) {
     const declaredBytes = Number(contentLength)
-    if (Number.isFinite(declaredBytes) && declaredBytes > maxAiResponseBodyBytes) {
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_AI_RESPONSE_BODY_BYTES) {
       try {
         await response.body?.cancel()
       } catch {
         // The size error is authoritative even if the provider stream cannot be cancelled.
       }
-      throw new BackgroundAiRequestError('AI响应体过大，最大允许 1 MiB', diagnostics)
+      const error = new BackgroundAiRequestError(
+        `AI响应体过大，最大允许 ${MAX_AI_RESPONSE_BODY_BYTES} 字节`,
+        diagnostics,
+      )
+      error.providerResponse = oversizedProviderResponseEvidence({ declaredBytes })
+      throw error
     }
   }
 
@@ -137,13 +183,21 @@ async function readAiResponseText(response: Response, diagnostics: AiTaskDiagnos
       const { done, value } = await reader.read()
       if (done) break
       bytesRead += value.byteLength
-      if (bytesRead > maxAiResponseBodyBytes) {
+      if (bytesRead > MAX_AI_RESPONSE_BODY_BYTES) {
         try {
           await reader.cancel()
         } catch {
           // The size error is authoritative even if the provider stream cannot be cancelled.
         }
-        throw new BackgroundAiRequestError('AI响应体过大，最大允许 1 MiB', diagnostics)
+        const error = new BackgroundAiRequestError(
+          `AI响应体过大，最大允许 ${MAX_AI_RESPONSE_BODY_BYTES} 字节`,
+          diagnostics,
+        )
+        error.providerResponse = oversizedProviderResponseEvidence({
+          bytesRead,
+          preview: text,
+        })
+        throw error
       }
       text += decoder.decode(value, { stream: true })
     }
@@ -286,8 +340,11 @@ async function fetchAiJson(args: {
   const { body, diagnostics, headers, maxRetries = AI_TASK_MAX_RETRIES, timeout, url } = args
   const bodyText = JSON.stringify(body)
   diagnostics.requestBodyChars = bodyText.length
-  if (new TextEncoder().encode(bodyText).byteLength > maxAiRequestBodyBytes) {
-    throw new BackgroundAiRequestError('AI请求体过大，最大允许 1 MiB', diagnostics)
+  if (new TextEncoder().encode(bodyText).byteLength > MAX_AI_REQUEST_BODY_BYTES) {
+    throw new BackgroundAiRequestError(
+      `AI请求体过大，最大允许 ${MAX_AI_REQUEST_BODY_BYTES} 字节`,
+      diagnostics,
+    )
   }
 
   let lastError: unknown
@@ -354,6 +411,7 @@ async function fetchAiJson(args: {
         durationMs: Date.now() - startedAt,
         error: message,
         ok: false,
+        providerResponse: failureBody,
         status: response.status,
       })
 
@@ -361,11 +419,13 @@ async function fetchAiJson(args: {
       // 判定失败前一律给满三次尝试：规则统一才不会在下一次改动里又漂掉，
       // 而重试一个确定性错误的代价只是多两次几百毫秒的往返。
       if (attempt === maxRetries) {
-        throw new BackgroundAiRequestError(
+        const requestError = new BackgroundAiRequestError(
           `AI请求失败，已重试 ${maxRetries} 次仍失败：${message}`,
           diagnostics,
           { cause: error },
         )
+        requestError.providerResponse = failureBody
+        throw requestError
       }
       await waitForRetry(getRetryDelayMs(response, attempt))
       continue
@@ -373,20 +433,28 @@ async function fetchAiJson(args: {
 
     const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
     if (!contentType.includes('application/json') && !contentType.includes('+json')) {
-      const error = new Error('AI响应 Content-Type 必须是 application/json')
+      const responseText = await readAiResponseText(response, diagnostics)
+      const error = new BackgroundAiRequestError(
+        'AI响应 Content-Type 必须是 application/json',
+        diagnostics,
+      )
+      error.providerResponse = responseText
       diagnostics.attempts.push({
         attempt: attempt + 1,
         durationMs: Date.now() - startedAt,
         error: error.message,
         ok: false,
+        providerResponse: responseText,
         status: response.status,
       })
-      throw new BackgroundAiRequestError(error.message, diagnostics, { cause: error })
+      throw error
     }
 
     let json: any
+    let responseText = ''
     try {
-      json = JSON.parse(await readAiResponseText(response, diagnostics))
+      responseText = await readAiResponseText(response, diagnostics)
+      json = JSON.parse(responseText)
     } catch (error) {
       if (error instanceof BackgroundAiRequestError) throw error
       const message = `AI响应不是合法 JSON：${getErrorMessage(error)}`
@@ -395,9 +463,12 @@ async function fetchAiJson(args: {
         durationMs: Date.now() - startedAt,
         error: 'AI响应不是合法 JSON',
         ok: false,
+        providerResponse: responseText,
         status: response.status,
       })
-      throw new BackgroundAiRequestError(message, diagnostics, { cause: error })
+      const requestError = new BackgroundAiRequestError(message, diagnostics, { cause: error })
+      requestError.providerResponse = responseText
+      throw requestError
     }
 
     diagnostics.attempts.push({
@@ -426,8 +497,10 @@ async function readResponsesStreamJson(response: Response, diagnostics: AiTaskDi
   let outputBytes = 0
   let usage: unknown
   const encoder = new TextEncoder()
+  const rawBlocks: string[] = []
 
   const consumeBlock = (block: string) => {
+    rawBlocks.push(block)
     const data = block
       .split(/\r?\n/)
       .filter((line) => line.startsWith('data:'))
@@ -447,8 +520,11 @@ async function readResponsesStreamJson(response: Response, diagnostics: AiTaskDi
     if (event?.type === 'response.output_text.delta' && typeof event.delta === 'string') {
       outputText += event.delta
       outputBytes += encoder.encode(event.delta).byteLength
-      if (outputBytes > maxAiResponseBodyBytes) {
-        throw new BackgroundAiRequestError('AI最终文本过大，最大允许 1 MiB', diagnostics)
+      if (outputBytes > MAX_AI_RESPONSE_BODY_BYTES) {
+        throw new BackgroundAiRequestError(
+          `AI最终文本过大，最大允许 ${MAX_AI_RESPONSE_BODY_BYTES} 字节`,
+          diagnostics,
+        )
       }
     }
     if (event?.type === 'response.completed' && event.response != null) {
@@ -456,8 +532,11 @@ async function readResponsesStreamJson(response: Response, diagnostics: AiTaskDi
       usage = event.response.usage
       if (!outputText) {
         outputText = parseResponsesContent(event.response)
-        if (encoder.encode(outputText).byteLength > maxAiResponseBodyBytes) {
-          throw new BackgroundAiRequestError('AI最终文本过大，最大允许 1 MiB', diagnostics)
+        if (encoder.encode(outputText).byteLength > MAX_AI_RESPONSE_BODY_BYTES) {
+          throw new BackgroundAiRequestError(
+            `AI最终文本过大，最大允许 ${MAX_AI_RESPONSE_BODY_BYTES} 字节`,
+            diagnostics,
+          )
         }
       }
     }
@@ -478,9 +557,12 @@ async function readResponsesStreamJson(response: Response, diagnostics: AiTaskDi
       const { done, value } = await reader.read()
       if (done) break
       bytesRead += value.byteLength
-      if (bytesRead > maxAiStreamBodyBytes) {
+      if (bytesRead > MAX_AI_STREAM_BODY_BYTES) {
         await reader.cancel().catch(() => undefined)
-        throw new BackgroundAiRequestError('AI流式响应过大，最大允许 16 MiB', diagnostics)
+        throw new BackgroundAiRequestError(
+          `AI流式响应过大，最大允许 ${MAX_AI_STREAM_BODY_BYTES} 字节`,
+          diagnostics,
+        )
       }
       buffer += decoder.decode(value, { stream: true })
 
@@ -493,12 +575,48 @@ async function readResponsesStreamJson(response: Response, diagnostics: AiTaskDi
     }
     buffer += decoder.decode()
     if (buffer.trim()) consumeBlock(buffer)
+  } catch (error) {
+    const providerResponse = {
+      format: 'text/event-stream',
+      rawEvents: rawBlocks.join('\n\n'),
+      outputText,
+      completed,
+    }
+    if (error instanceof BackgroundAiRequestError) {
+      if (error.providerResponse === undefined) error.providerResponse = providerResponse
+      throw error
+    }
+    const readErrorMessage = getErrorMessage(error)
+    const requestError = new BackgroundAiRequestError(
+      /timeout|abort|超时/i.test(readErrorMessage) ? 'AI流式响应读取超时' : 'AI流式响应读取失败',
+      diagnostics,
+      {
+        cause: error,
+      },
+    )
+    requestError.providerResponse = providerResponse
+    throw requestError
   } finally {
     reader.releaseLock()
   }
 
-  if (completed) return { output_text: outputText, usage }
-  throw new BackgroundAiRequestError('AI流式响应缺少完成事件', diagnostics)
+  if (completed) {
+    return {
+      output_text: outputText,
+      usage,
+      // Keep the complete SSE evidence for the local diagnostic mirror. The
+      // parser still consumes only output_text and usage for the product path.
+      rawEvents: rawBlocks.join('\n\n'),
+    }
+  }
+  const error = new BackgroundAiRequestError('AI流式响应缺少完成事件', diagnostics)
+  error.providerResponse = {
+    format: 'text/event-stream',
+    rawEvents: rawBlocks.join('\n\n'),
+    outputText,
+    completed: false,
+  }
+  throw error
 }
 
 async function fetchResponsesStreamJson(args: {
@@ -511,8 +629,11 @@ async function fetchResponsesStreamJson(args: {
   const { body, diagnostics, headers, timeout, url } = args
   const bodyText = JSON.stringify(body)
   diagnostics.requestBodyChars = bodyText.length
-  if (new TextEncoder().encode(bodyText).byteLength > maxAiRequestBodyBytes) {
-    throw new BackgroundAiRequestError('AI请求体过大，最大允许 1 MiB', diagnostics)
+  if (new TextEncoder().encode(bodyText).byteLength > MAX_AI_REQUEST_BODY_BYTES) {
+    throw new BackgroundAiRequestError(
+      `AI请求体过大，最大允许 ${MAX_AI_REQUEST_BODY_BYTES} 字节`,
+      diagnostics,
+    )
   }
 
   const startedAt = Date.now()
@@ -551,7 +672,7 @@ async function fetchResponsesStreamJson(args: {
     throw new BackgroundAiRequestError('AI流式响应不允许重定向', diagnostics)
   }
   if (!response.ok || response.status >= 400) {
-    await readAiResponseText(response, diagnostics)
+    const failureBody = await readAiResponseText(response, diagnostics)
     diagnostics.attempts.push({
       attempt: attemptNumber,
       durationMs: Date.now() - startedAt,
@@ -559,11 +680,17 @@ async function fetchResponsesStreamJson(args: {
       ok: false,
       status: response.status,
     })
-    throw new BackgroundAiRequestError(`AI流式请求失败，状态码: ${response.status}`, diagnostics)
+    const requestError = new BackgroundAiRequestError(
+      `AI流式请求失败，状态码: ${response.status}`,
+      diagnostics,
+    )
+    requestError.providerResponse = failureBody
+    throw requestError
   }
 
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
   if (!contentType.includes('text/event-stream')) {
+    const responseText = await readAiResponseText(response, diagnostics)
     diagnostics.attempts.push({
       attempt: attemptNumber,
       durationMs: Date.now() - startedAt,
@@ -571,10 +698,12 @@ async function fetchResponsesStreamJson(args: {
       ok: false,
       status: response.status,
     })
-    throw new BackgroundAiRequestError(
+    const error = new BackgroundAiRequestError(
       'AI流式响应 Content-Type 必须是 text/event-stream',
       diagnostics,
     )
+    error.providerResponse = responseText
+    throw error
   }
 
   let json: unknown
@@ -764,30 +893,48 @@ async function fetchBackgroundResponseJson(args: {
     throw new BackgroundAiRequestError('后台AI任务状态查询不允许重定向', diagnostics)
   }
   if (!response.ok || response.status >= 400) {
-    await readAiResponseText(response, diagnostics)
+    const failureBody = await readAiResponseText(response, diagnostics)
     if (isRetryableStatus(response.status)) {
-      throw new BackgroundAiPollingTransientError(
+      const error = new BackgroundAiPollingTransientError(
         `后台AI任务状态查询暂时失败，状态码: ${response.status}`,
         diagnostics,
         getRetryDelayMs(response, 0),
       )
+      error.providerResponse = failureBody
+      throw error
     }
-    throw new BackgroundAiRequestError(
+    const error = new BackgroundAiRequestError(
       `后台AI任务状态查询失败，状态码: ${response.status}`,
       diagnostics,
     )
+    error.providerResponse = failureBody
+    throw error
   }
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
   if (!contentType.includes('application/json') && !contentType.includes('+json')) {
-    throw new BackgroundAiRequestError('后台AI任务状态响应必须是 application/json', diagnostics)
+    const responseText = await readAiResponseText(response, diagnostics)
+    const error = new BackgroundAiRequestError(
+      '后台AI任务状态响应必须是 application/json',
+      diagnostics,
+    )
+    error.providerResponse = responseText
+    throw error
   }
+  let responseText = ''
   try {
-    return JSON.parse(await readAiResponseText(response, diagnostics))
+    responseText = await readAiResponseText(response, diagnostics)
+    return JSON.parse(responseText)
   } catch (error) {
     if (error instanceof BackgroundAiRequestError) throw error
-    throw new BackgroundAiRequestError('后台AI任务状态响应不是合法 JSON', diagnostics, {
-      cause: error,
-    })
+    const requestError = new BackgroundAiRequestError(
+      '后台AI任务状态响应不是合法 JSON',
+      diagnostics,
+      {
+        cause: error,
+      },
+    )
+    requestError.providerResponse = responseText
+    throw requestError
   }
 }
 
@@ -1062,15 +1209,18 @@ function parseConfiguredResult(
       } as messageReps['usage'],
     }
   }
-  const msg = (json.choices as any[] | undefined)?.pop()
+  // Do not mutate the provider response: the complete response object is
+  // mirrored for local diagnosis after parsing. `pop()` used to erase the
+  // selected choice from that evidence.
+  const choices = json.choices as any[] | undefined
+  const msg = choices?.[choices.length - 1]
   return {
     prompt: promptText,
     content: msg?.message?.content ?? '',
     diagnostics,
-    reasoning_content: (msg?.message?.reasoning_content as string | undefined)?.replaceAll(
-      '\n',
-      '',
-    ),
+    // Keep the provider's reasoning text byte-for-byte for the local diagnostic
+    // mirror. Presentation layers may collapse whitespace when they render it.
+    reasoning_content: msg?.message?.reasoning_content as string | undefined,
     usage: parseUsage(json),
   }
 }
@@ -1084,6 +1234,9 @@ export async function runConfiguredAiTask(args: {
   maxOutputTokens?: number | null
   onDiagnostic?: AiRuntimeDiagnosticHandler
   task?: ConfiguredAiTaskType
+  requestId?: string
+  diagnosticContext?: AiDiagnosticContext
+  resumeMarkdown?: string
 }) {
   if (args.template == null || args.template === '') {
     throw new Error('AI提示词为空')
@@ -1097,6 +1250,7 @@ export async function runConfiguredAiTask(args: {
 
   const prompts = buildPrompt(args.template, args.data)
   const promptText = prompts[prompts.length - 1].content
+  const promptChars = prompts.reduce((total, item) => total + item.content.length, 0)
   let useResponsesBackground = shouldUseResponsesBackground(model, args.task)
   let useResponsesStreaming = shouldUseResponsesStreaming(model, args.task)
   let requestMode: AiRuntimeDiagnosticEvent['requestMode'] = useResponsesBackground
@@ -1123,20 +1277,31 @@ export async function runConfiguredAiTask(args: {
           : 'chatCompletions',
     maxRetries: useResponsesBackground || useResponsesStreaming ? 0 : AI_TASK_MAX_RETRIES,
     model: model.model,
-    promptChars: promptText.length,
+    promptChars,
     requestBodyChars: 0,
     task: args.task,
     timeoutSeconds: timeout,
   }
   const startedAt = Date.now()
+  const generatedRequestId =
+    globalThis.crypto?.randomUUID?.() ?? `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`
   const emitDiagnostic = async (
     phase: AiRuntimeDiagnosticEvent['phase'],
-    options?: { error?: unknown; providerStatus?: string; usage?: messageReps['usage'] },
+    options?: {
+      error?: unknown
+      providerStatus?: string
+      usage?: messageReps['usage']
+      providerResponse?: unknown
+      resultContent?: string
+      reasoningContent?: string
+    },
   ) => {
     if (!args.onDiagnostic) return
     try {
       await args.onDiagnostic({
         at: Date.now(),
+        requestId: generatedRequestId,
+        parentRequestId: args.requestId,
         diagnostics,
         durationMs: Date.now() - startedAt,
         error: options?.error,
@@ -1149,6 +1314,13 @@ export async function runConfiguredAiTask(args: {
         task: args.task,
         unsupportedSettings: unsupportedModelSettings(model),
         usage: options?.usage,
+        promptMessages: prompts,
+        requestBody: body,
+        providerResponse: options?.providerResponse,
+        resultContent: options?.resultContent,
+        reasoningContent: options?.reasoningContent,
+        diagnosticContext: args.diagnosticContext,
+        resumeMarkdown: args.resumeMarkdown,
       })
     } catch {
       // Diagnostic persistence must never change the model request outcome.
@@ -1213,10 +1385,19 @@ export async function runConfiguredAiTask(args: {
         })
       : initialJson
     const result = parseConfiguredResult(model, json, promptText, aiDiagnostics)
-    await emitDiagnostic('succeeded', { usage: result.usage })
+    await emitDiagnostic('succeeded', {
+      usage: result.usage,
+      providerResponse: json,
+      resultContent: result.content,
+      reasoningContent: result.reasoning_content ?? undefined,
+    })
     return result
   } catch (error) {
-    await emitDiagnostic('failed', { error })
+    await emitDiagnostic('failed', {
+      error,
+      providerResponse:
+        error instanceof BackgroundAiRequestError ? error.providerResponse : undefined,
+    })
     throw error
   }
 }

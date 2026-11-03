@@ -29,19 +29,9 @@ export interface ResumeFact {
   end?: string
   action: string
   object: string
-  ownership: 'led' | 'owned' | 'contributed' | 'used' | 'learned'
   metrics?: ResumeMetric[]
-  domains: string[]
-  skills: string[]
   evidenceType: EvidenceType
   allowedClaimVerbs: string[]
-  confidence: 'high' | 'medium' | 'low'
-}
-
-export interface EvidenceBucket {
-  id: string
-  signals: Array<{ value: string; weight: number }>
-  factIds: string[]
 }
 
 export interface ClaimPolicy {
@@ -53,7 +43,6 @@ export interface ResumeEvidence {
   name?: string
   target?: Record<string, unknown>
   facts: ResumeFact[]
-  buckets: EvidenceBucket[]
   claimPolicy: ClaimPolicy
 }
 
@@ -62,22 +51,95 @@ export type SelectedGreetingFact = Omit<ResumeFact, 'sourceQuote'>
 export interface RecentGreetingSummary {
   sentAt: number
   usedFactIds: string[]
-  openingPattern: string
   messages: string[]
   fingerprint: string
 }
 
+/**
+ * 这条招呼语对准的 JD 需求：先写出这份 JD 最核心的一个需求，并原文摘一句作依据，
+ * 身份、项目和价值都围绕它来写。JD 是招呼语里唯一每次都不一样的输入，
+ * 不先对准它，模型就会退回到一套和岗位无关的固定自我介绍。
+ */
+export interface GreetingAnchor {
+  need: string
+  jdQuote: string
+}
+
+/** 代码对最终稿的复核结果，存进记录供体检统计。 */
+export interface GreetingReview {
+  /** jdQuote 是否确实出自这份 JD。 */
+  jdQuoteFound: boolean
+  /** 重试后仍未解决、但不涉及事实边界而放行的风格问题。 */
+  styleIssues: string[]
+  /** 生成了几次才得到这一稿。 */
+  attempts: number
+  /** 触发重写的问题：看重写率是哪项检查带来的。 */
+  rewriteReasons?: string[]
+}
+
+/** 每个发送分段实际引用的事实，供 JD / 话术 / 简历事实逐段核对。 */
+export interface GreetingSegmentAudit {
+  messageIndex: number
+  factIds: string[]
+  factIdsValid: boolean
+  claimBoundaryValid: boolean
+  claimIssueCodes: string[]
+}
+
+/**
+ * 招呼语生成后的结构化审计结果。只保存 ID、分数和校验状态，不保存简历原文或完整 JD，
+ * 便于把回复效果和岗位匹配、事实引用、主张边界放在同一条记录里复盘。
+ */
+export interface GreetingAudit {
+  matchEnabled: boolean
+  matchPercent?: number
+  matchThreshold?: number
+  matchSelectedFactIds: string[]
+  matchSelectedFactIdsValid: boolean
+  greetingUsedFactIds: string[]
+  greetingUsedFactIdsValid: boolean
+  greetingFactIdsInMatch: string[]
+  /** 仅兼容旧版审计，不再作为当前通过条件。 */
+  maxFacts?: number
+  factCountWithinLimit?: boolean
+  segmentFactMappingComplete: boolean
+  segmentAudits: GreetingSegmentAudit[]
+  jdQuoteFound: boolean
+  claimMode: ClaimMode
+  claimBoundaryValid: boolean
+  claimIssueCodes: string[]
+  qualityIssueCodes: string[]
+  resumeEvidenceVersion?: number
+  resumeSourceHash?: string
+  resumeEvidenceMatches?: boolean
+}
+
+/**
+ * 招呼语草稿不带 claimMode：措辞能不能说成「做过」，由事实本身的 evidenceType 和
+ * allowedClaimVerbs 决定，质量检查直接按这两项查；让模型再自报一遍只会多一个出错点。
+ */
 export interface GreetingDraft {
+  promptFingerprint?: string
+  anchor: GreetingAnchor
   messages: string[]
   usedFactIds: string[]
-  claimMode: ClaimMode
-  openingPattern: string
+  /** 与 messages 一一对应，完整列出每段实际引用的事实 ID。 */
+  segmentFactIds: string[][]
+  resumeEvidenceVersion?: number
+  resumeSourceHash?: string
+  review?: GreetingReview
+  audit?: GreetingAudit
 }
 
 export interface AiGreetingMeta {
+  promptFingerprint?: string
   usedFactIds: string[]
-  claimMode: ClaimMode
-  openingPattern: string
+  segmentFactIds?: string[][]
+  resumeEvidenceVersion?: number
+  resumeSourceHash?: string
+  anchor?: GreetingAnchor
+  review?: GreetingReview
+  audit?: GreetingAudit
   fingerprint: string
 }
 

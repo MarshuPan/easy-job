@@ -6,7 +6,7 @@ export function resolveSelectedGreetingFacts(
 ): SelectedGreetingFact[] {
   if (!evidence) throw new Error('后台结构化简历证据不可用')
   const ids = [...new Set(selectedFactIds)]
-  if (ids.length === 0 || ids.length > 2) throw new Error('筛选事实数量必须为1到2个')
+  if (ids.length === 0) throw new Error('筛选事实不能为空')
   const byId = new Map(evidence.facts.map((fact) => [fact.id, fact]))
   return ids.map((id) => {
     const fact = byId.get(id)

@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   cachePipelineResultMock,
@@ -127,6 +127,7 @@ vi.mock('@/stores/log', async () => {
       hydrate: hydrateMock,
       finishDelivery: logFinishDeliveryMock,
       info: logInfoMock,
+      debug: logInfoMock,
       startDelivery: logStartDeliveryMock,
       touchDelivery: logTouchDeliveryMock,
     }),
@@ -171,6 +172,7 @@ import {
   AIFilteringError,
   AIProviderError,
   GreetError,
+  GreetingGenerationError,
   JobDetailAccessError,
   JobDataIncompleteError,
   JobTitleError,
@@ -183,6 +185,11 @@ import { getCurrentPaceMultiplier } from '@/utils/actionGateStore'
 
 import { DAILY_DELIVERY_LIMIT } from '../utils/deliveryLimit'
 import { useDeliver } from './useDeliver'
+
+afterEach(() => {
+  document.querySelectorAll('[data-test-security-check]').forEach((node) => node.remove())
+  window.history.replaceState({}, '', '/web/geek/jobs')
+})
 
 function createJob(encryptJobId: string) {
   const status = {
@@ -238,6 +245,117 @@ describe('useDeliver job list flow', () => {
       state_name: '待处理',
       title: job.jobName,
     }))
+  })
+
+  it('processes a job when the page only carries the post-verification marker', async () => {
+    window.history.replaceState({}, '', '/web/geek/jobs?_security_check=1_123')
+    formData.aiGreeting.enable = false
+    jobListRef.value = [createJob('after-verification')]
+    createHandleMock.mockResolvedValue({ before: [], after: [], retryGreeting: vi.fn() })
+
+    expect(await useDeliver().jobListHandle()).toBe('completed')
+    expect(sendPublishReqMock).toHaveBeenCalledTimes(1)
+    expect(statistics.todayData.success).toBe(1)
+  })
+
+  it('keeps a job pending during visible verification and resumes without double counting', async () => {
+    formData.aiGreeting.enable = false
+    const job = createJob('pending-verification')
+    jobListRef.value = [job]
+    createHandleMock.mockResolvedValue({ before: [], after: [], retryGreeting: vi.fn() })
+    const challenge = document.createElement('form')
+    challenge.setAttribute('data-test-security-check', '')
+    challenge.innerHTML = '<h2>安全验证</h2><input name="answer">'
+    document.body.append(challenge)
+    const deliver = useDeliver()
+
+    expect(await deliver.jobListHandle()).toBe('securityCheck')
+    expect(sendPublishReqMock).not.toHaveBeenCalled()
+    expect(job.status.status).toBe('wait')
+    expect(statistics.todayData.total).toBe(0)
+
+    challenge.remove()
+    common.deliverStop = false
+    expect(await deliver.jobListHandle()).toBe('completed')
+    expect(sendPublishReqMock).toHaveBeenCalledTimes(1)
+    expect(statistics.todayData.total).toBe(1)
+    expect(statistics.todayData.success).toBe(1)
+  })
+
+  it('yields at a job checkpoint and resumes without counting a filtered job twice', async () => {
+    const jobs = [createJob('fast-filter-1'), createJob('fast-filter-2')]
+    jobListRef.value = jobs
+    createHandleMock.mockResolvedValue({
+      before: [
+        async () => {
+          throw new JobTitleError('不符合岗位要求')
+        },
+      ],
+      after: [],
+      retryGreeting: vi.fn(),
+    })
+    const deliver = useDeliver()
+    const hooks = { taskId: 'supply-task', shouldRefill: vi.fn(() => true) }
+    expect(await deliver.jobListHandle(undefined, undefined, hooks)).toBe('refill')
+    expect(jobs[0].status.status).toBe('filtered')
+    expect(jobs[1].status.status).toBe('wait')
+    expect(statistics.todayData.total).toBe(1)
+    expect(deliver.getProcessingDurations('supply-task')).toHaveLength(1)
+
+    hooks.shouldRefill.mockReturnValue(false)
+    expect(await deliver.jobListHandle(undefined, undefined, hooks)).toBe('completed')
+    expect(statistics.todayData.total).toBe(2)
+    expect(logFinishDeliveryMock).toHaveBeenCalledTimes(2)
+    expect(deliver.getProcessingDurations('supply-task')).toHaveLength(2)
+    expect(deliver.getProcessingDurations('another-task')).toEqual([])
+  })
+
+  it('plans replenishment before pace and rest waits and excludes batch rest from consumption', async () => {
+    const clock = { now: Date.now() }
+    vi.spyOn(Date, 'now').mockImplementation(() => clock.now)
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    const startedAt = clock.now
+    delayMock.mockImplementation(async (seconds: number) => {
+      clock.now += seconds * 1000
+    })
+    formData.delay.deliveryInterval = 40
+    formData.delay.deliveryIntervalMax = 40
+    formData.delay.batchSize = 1
+    formData.delay.batchRestMinutes = 10
+    jobListRef.value = [createJob('wait-and-rest')]
+    createHandleMock.mockResolvedValue({ before: [], after: [], retryGreeting: vi.fn() })
+    const idleTimes: number[] = []
+    const deliver = useDeliver()
+
+    await deliver.jobListHandle(undefined, undefined, {
+      taskId: 'wait-task',
+      onIdle: () => {
+        idleTimes.push(clock.now)
+      },
+    })
+
+    expect(idleTimes).toEqual([startedAt, startedAt + 40_000])
+    expect(clock.now - startedAt).toBe(640_000)
+    expect(deliver.getProcessingDurations('wait-task')).toEqual([40_000])
+  })
+
+  it('does not yield to acquisition after a manual stop during a pace wait', async () => {
+    jobListRef.value = [createJob('stop-at-idle'), createJob('still-pending')]
+    formData.delay.deliveryInterval = 40
+    formData.delay.deliveryIntervalMax = 40
+    createHandleMock.mockResolvedValue({ before: [], after: [], retryGreeting: vi.fn() })
+    const shouldRefill = vi.fn(() => true)
+    const result = await useDeliver().jobListHandle(undefined, undefined, {
+      taskId: 'stop-task',
+      onIdle: () => {
+        common.deliverStop = true
+      },
+      shouldRefill,
+    })
+    expect(result).toBe('stopped')
+    expect(shouldRefill).not.toHaveBeenCalled()
+    expect(jobListRef.value[1].status.status).toBe('wait')
+    expect(sendPublishReqMock).toHaveBeenCalledOnce()
   })
 
   it('does not establish communication after a manual stop during filtering', async () => {
@@ -533,6 +651,13 @@ describe('useDeliver job list flow', () => {
       status: { status: 'wait' },
     })
     expect(before).toHaveBeenCalledTimes(2)
+    // 凭据过期的岗位没被评估、也没发出投递，刷新后会重投。运行日志写成「注意 · 失败」，
+    // 真机上用户就以为这个岗位投坏了。
+    const outcome = logInfoMock.mock.calls.find(
+      ([title, message]) => title === '岗位' && String(message).includes('旧凭据已失效'),
+    )
+    expect(outcome?.[1]).toMatch(/^暂缓 · /)
+    expect(outcome?.[2]).toBe('info')
   })
 
   // 这个用例原来断言的是相反的行为：看到「您的环境存在异常」就立刻收工。那是 1.3.0 把它
@@ -659,6 +784,33 @@ describe('useDeliver job list flow', () => {
         retryable: true,
         communicationCounted: true,
       }),
+    )
+  })
+
+  it('does not spend a communication when the greeting cannot be generated', async () => {
+    // 契约 §6：招呼语先于建立沟通。生成失败时这个岗位记为可重试失败，额度不动，继续下一个。
+    jobListRef.value = [createJob('job-1'), createJob('job-2')]
+    createHandleMock.mockResolvedValue({
+      before: [
+        vi.fn(async ({ data }: any) => {
+          if (data.encryptJobId === 'job-1') {
+            throw new GreetingGenerationError('后台AI响应格式异常（第2次：FORBIDDEN_CLAIM）')
+          }
+        }),
+      ],
+      after: [],
+      retryGreeting: vi.fn(),
+    })
+
+    const result = await useDeliver().jobListHandle()
+
+    expect(result).toBe('completed')
+    expect(sendPublishReqMock).toHaveBeenCalledTimes(1)
+    expect(statistics.todayData.success).toBe(1)
+    expect(logFinishDeliveryMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(GreetingGenerationError),
+      expect.objectContaining({ retryable: true, state: '失败' }),
     )
   })
 
@@ -1368,6 +1520,10 @@ describe('an AI request that failed', () => {
     await deliver.jobListHandle()
 
     expect(job.status.status).toBe('wait')
+    // 日志不能写「失败」：岗位放回了待处理，继续后会重新处理。
+    const outcome = logInfoMock.mock.calls.find(([stage]) => stage === '岗位')
+    expect(outcome?.[1]).toMatch(/^暂停 · .*岗位已放回待处理/)
+    expect(outcome?.[2]).toBe('warning')
   })
 })
 

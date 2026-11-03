@@ -1,3 +1,4 @@
+import { pruneRemovedEvidenceFields } from '@/profile/resumeEvidenceRules'
 import { hashResumeMarkdown } from '@/profile/resumeHash'
 import deepmerge, { isPlainObject, jsonClone } from '@/utils/deepmerge'
 
@@ -53,9 +54,12 @@ export function migrateConfigBundleToCurrent(value: unknown): ConfigBundleV1 {
     ])
   }
 
-  return canonicalizeAiConfiguration(
+  const bundle = canonicalizeAiConfiguration(
     deepmerge(createDefaultConfigBundle(), value) as ConfigBundleV1,
   )
+  // 旧版本导出的文件里，简历证据还带着证据版本 3 删掉的字段。
+  pruneRemovedEvidenceFields(bundle.profile?.resume?.evidence)
+  return bundle
 }
 
 export async function prepareImportedConfigBundle(value: unknown): Promise<{

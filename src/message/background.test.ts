@@ -11,14 +11,21 @@ import {
   getCurrentAppVersion,
 } from '@/utils/extensionRuntimeHealth'
 
-const { runConfiguredAiTask, runtimeListeners, storageGet, tabRemovedListeners, tabsSendMessage } =
-  vi.hoisted(() => ({
-    runConfiguredAiTask: vi.fn(),
-    runtimeListeners: [] as Array<(message: unknown, sender: unknown) => unknown>,
-    storageGet: vi.fn(),
-    tabRemovedListeners: [] as Array<(tabId: number) => void>,
-    tabsSendMessage: vi.fn(),
-  }))
+const {
+  localDiagnosticAppend,
+  runConfiguredAiTask,
+  runtimeListeners,
+  storageGet,
+  tabRemovedListeners,
+  tabsSendMessage,
+} = vi.hoisted(() => ({
+  localDiagnosticAppend: vi.fn(async () => true),
+  runConfiguredAiTask: vi.fn(),
+  runtimeListeners: [] as Array<(message: unknown, sender: unknown) => unknown>,
+  storageGet: vi.fn(),
+  tabRemovedListeners: [] as Array<(tabId: number) => void>,
+  tabsSendMessage: vi.fn(),
+}))
 
 vi.mock('comctx', async (importOriginal) => {
   const actual = await importOriginal<typeof import('comctx')>()
@@ -66,15 +73,59 @@ vi.mock('@/utils/backgroundAi', () => ({
   testConfiguredAiModel: vi.fn(),
 }))
 
+vi.mock('@/background/localDiagnosticSink', () => ({
+  appendLocalDiagnosticEvent: localDiagnosticAppend,
+}))
+
+import { browser } from '#imports'
 import { createDefaultStoredConfigState, createDefaultDeliverySettings } from '@/config/defaults'
 import type { StoredConfigStateV1 } from '@/config/types'
 
 import { BackgroundCounter, ProvideBackgroundAdapter, userKey } from './background'
+import { CHAT_RUNTIME_RESPONSE } from './chatRuntimeProtocol'
+
+describe('chat tab connection reuse', () => {
+  it('reuses a different selected conversation without reloading or navigating the socket', async () => {
+    vi.mocked(browser.tabs.query).mockResolvedValueOnce([
+      { id: 11, url: 'https://www.zhipin.com/web/geek/chat?id=other', status: 'complete' },
+    ] as any)
+    vi.mocked(browser.tabs.get).mockResolvedValueOnce({ id: 11, status: 'complete' } as any)
+    tabsSendMessage.mockImplementationOnce(async (_tabId, request) => ({
+      type: CHAT_RUNTIME_RESPONSE,
+      requestId: request.requestId,
+      ready: true,
+      code: 'READY',
+      reason: 'ready',
+      mainVersion: getCurrentAppVersion(),
+      contentVersion: getCurrentAppVersion(),
+      accountReady: true,
+      accountMatches: true,
+      consumerStarted: true,
+      channelReady: true,
+      wakeDelivered: true,
+    }))
+    const result = await new BackgroundCounter().openChatTab(
+      'https://www.zhipin.com/web/geek/chat?id=target',
+      'account-a',
+    )
+    expect(result).toMatchObject({
+      tabId: 11,
+      reused: true,
+      reloaded: false,
+      sameTarget: false,
+      loaded: true,
+    })
+    expect(browser.tabs.reload).not.toHaveBeenCalled()
+    expect(browser.tabs.update).not.toHaveBeenCalled()
+    expect(browser.tabs.create).not.toHaveBeenCalled()
+  })
+})
 
 function canonicalState(options: { messageCount?: number } = {}): StoredConfigStateV1 {
   const state = createDefaultStoredConfigState()
   state.profile = {
     displayName: '候选人',
+    targetRole: 'AI 产品经理',
     resume: {
       markdown: '负责 B 端 SaaS 平台',
       sourceHash: `sha256:${'1'.repeat(64)}`,
@@ -86,15 +137,10 @@ function canonicalState(options: { messageCount?: number } = {}): StoredConfigSt
             sourceQuote: '负责 B 端 SaaS 平台',
             action: '负责',
             object: 'B 端 SaaS 平台',
-            ownership: 'owned',
-            domains: ['企业服务'],
-            skills: ['平台规划'],
             evidenceType: 'direct_fact',
             allowedClaimVerbs: ['负责'],
-            confidence: 'high',
           },
         ],
-        buckets: [],
         claimPolicy: { adjacentOnly: [], forbiddenClaims: [] },
       },
     },
@@ -145,7 +191,10 @@ function greetingMessage(requestId: string) {
       filteringThreshold: 70,
       data: { skills: ['平台产品'] },
       boss: { data: { name: '王女士' } },
-      card: { jobName: 'AI 产品经理' },
+      card: {
+        jobName: 'AI 产品经理',
+        postDescription: '负责AI平台产品规划与落地',
+      },
       filtering: {
         matchPercent: 82,
         level: 'good',
@@ -235,7 +284,9 @@ describe('background RPC adapter lifecycle', () => {
       )
     })
     const listener = runtimeListeners.at(-1)!
-    const lifecycle = listener(backgroundRpcRequest(), { tab: { id: 12 } }) as Promise<void>
+    const lifecycle = listener(backgroundRpcRequest(), {
+      tab: { id: 12 },
+    }) as Promise<void>
     let settled = false
     void lifecycle.then(() => {
       settled = true
@@ -482,6 +533,53 @@ describe('background account state', () => {
       errorCode: 'AI_TASK_FAILED',
     })
     expect(runConfiguredAiTask).not.toHaveBeenCalled()
+    expect(localDiagnosticAppend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'runtime.ai-task-failed',
+        data: expect.objectContaining({
+          requestId: 'missing-canonical-account',
+          stage: 'execution',
+          error: expect.objectContaining({ message: 'AI任务缺少当前 BOSS 账号' }),
+        }),
+      }),
+    )
+  })
+
+  it('mirrors rejected input before returning a validation error without calling the model', async () => {
+    const message = {
+      type: AI_TASK_REQUEST_TYPE,
+      requestId: 'rejected-history',
+      task: 'aiGreeting',
+      data: {
+        accountUid: 'account-canonical',
+        filteringThreshold: 60,
+        recentGreetings: [{ sentAt: 1, usedFactIds: null, messages: ['历史正文'] }],
+      },
+    }
+    const response = await dispatchRuntimeMessage(message, { tab: { id: 30 } })
+    expect(response).toMatchObject({
+      ok: false,
+      errorCode: 'AI_TASK_REQUEST_INVALID',
+      error: '后台AI请求参数校验失败：AI招呼语近期记录不合法（未调用模型）',
+    })
+    expect(runConfiguredAiTask).not.toHaveBeenCalled()
+    expect(localDiagnosticAppend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'runtime.ai-task-failed',
+        accountUid: 'account-canonical',
+        data: expect.objectContaining({
+          requestId: 'rejected-history',
+          stage: 'request-validation',
+          requestSnapshot: expect.objectContaining({
+            data: {
+              filteringThreshold: 60,
+              recentGreetings: message.data.recentGreetings,
+            },
+          }),
+          error: expect.objectContaining({ message: 'AI招呼语近期记录不合法' }),
+        }),
+      }),
+    )
   })
 
   it('runs canonical filtering with the stored model and resume evidence', async () => {
@@ -493,7 +591,10 @@ describe('background account state', () => {
       reason: '平台经验匹配',
       selectedFactIds: ['fact-canonical'],
     })
-    runConfiguredAiTask.mockResolvedValue({ content, prompt: 'private-canonical-prompt' })
+    runConfiguredAiTask.mockResolvedValue({
+      content,
+      prompt: 'private-canonical-prompt',
+    })
 
     const response = await dispatchRuntimeMessage(
       {
@@ -554,8 +655,9 @@ describe('background account state', () => {
         '过往负责过B端SaaS平台，希望进一步了解岗位目标。',
       ],
       usedFactIds: ['fact-canonical'],
+      segmentFactIds: [['fact-canonical'], []],
       claimMode: 'direct',
-      openingPattern: 'job-hook',
+      anchor: { need: '平台产品从规划到落地', jdQuote: 'AI平台产品规划与落地' },
     }
     runConfiguredAiTask.mockResolvedValue({
       content: JSON.stringify(draft),
@@ -584,12 +686,84 @@ describe('background account state', () => {
       type: AI_TASK_RESPONSE_TYPE,
       requestId: 'canonical-greeting',
       ok: true,
-      data: { content: JSON.stringify(draft) },
+      // 模型多给的 claimMode 不往下传：措辞边界按事实检查，下游用不到它。
+      data: {
+        content: expect.any(String),
+      },
+    })
+    expect(JSON.parse((response as { data: { content: string } }).data.content)).toEqual({
+      anchor: draft.anchor,
+      messages: draft.messages,
+      usedFactIds: draft.usedFactIds,
+      segmentFactIds: draft.segmentFactIds,
+      resumeEvidenceVersion: 1,
+      resumeSourceHash: `sha256:${'1'.repeat(64)}`,
+      review: { jdQuoteFound: true, styleIssues: [], attempts: 1 },
+      audit: {
+        matchEnabled: true,
+        matchPercent: 82,
+        matchThreshold: 70,
+        matchSelectedFactIds: ['fact-canonical'],
+        matchSelectedFactIdsValid: true,
+        greetingUsedFactIds: ['fact-canonical'],
+        greetingUsedFactIdsValid: true,
+        greetingFactIdsInMatch: ['fact-canonical'],
+        segmentFactMappingComplete: true,
+        segmentAudits: [
+          {
+            messageIndex: 1,
+            factIds: ['fact-canonical'],
+            factIdsValid: true,
+            claimBoundaryValid: true,
+            claimIssueCodes: [],
+          },
+          {
+            messageIndex: 2,
+            factIds: [],
+            factIdsValid: true,
+            claimBoundaryValid: true,
+            claimIssueCodes: [],
+          },
+        ],
+        jdQuoteFound: true,
+        claimMode: 'direct',
+        claimBoundaryValid: true,
+        claimIssueCodes: [],
+        qualityIssueCodes: [],
+        resumeEvidenceVersion: 1,
+        resumeSourceHash: `sha256:${'1'.repeat(64)}`,
+        resumeEvidenceMatches: true,
+      },
+      promptFingerprint: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
     })
     expect(runConfiguredAiTask).toHaveBeenCalledTimes(1)
     const call = runConfiguredAiTask.mock.calls[0][0]
     expect(call.task).toBe('aiGreeting')
-    expect(call.jsonSchema.properties.messages).toMatchObject({ minItems: 2, maxItems: 2 })
+    expect(call.jsonSchema.required).not.toContain('claimMode')
+    // 招呼语只需要知道这份工作做什么：通勤、薪资、分数和风险都不给。
+    const inputData = call.template[2].content
+    expect(inputData).toContain('"matchReason": "平台经验匹配"')
+    // 求职定位交给招呼语写身份；匹配选出的事实作为优先项，全部事实都给。
+    expect(inputData).toContain('"targetRole": "AI 产品经理"')
+    const block = (tag: string) =>
+      JSON.parse(
+        inputData.slice(
+          inputData.indexOf(`<${tag}>`) + tag.length + 2,
+          inputData.indexOf(`</${tag}>`),
+        ),
+      )
+    const input = block('input_data')
+    expect(input.primaryFactIds).toEqual(['fact-canonical'])
+    expect(block('candidate').facts.map((fact: { id: string }) => fact.id)).toContain(
+      'fact-canonical',
+    )
+    expect(inputData).not.toContain('matchPercent')
+    expect(inputData).not.toContain('amap')
+    expect(inputData).not.toContain('salaryDesc')
+    expect(call.jsonSchema.properties.messages).toMatchObject({
+      minItems: 2,
+      maxItems: 2,
+    })
     expect(call.template[0].content).toContain('恰好 2 条')
     expect(call.template[0].content).toContain('45-95')
     expect(JSON.stringify(response)).not.toContain('private-canonical-prompt')
@@ -604,8 +778,12 @@ describe('background account state', () => {
       content: JSON.stringify({
         messages: [`王老师您好，我是候选人。${'x'.repeat(45)}`, 'y'.repeat(45)],
         usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
         claimMode: 'direct',
-        openingPattern: 'job-hook',
+        anchor: {
+          need: '平台产品从规划到落地',
+          jdQuote: 'AI平台产品规划与落地',
+        },
       }),
     })
     const message = greetingMessage('greeting-too-long-twice')
@@ -628,6 +806,86 @@ describe('background account state', () => {
     ).toHaveLength(2)
   })
 
+  it('uses the BOSS expectation the job was found under when no target role is set', async () => {
+    // 求职定位留空时按岗位所属的期望决定身份：同时挂两个期望的人，从「用户运营」期望下
+    // 抓到的岗位不能按第一个期望「产品经理」去写开场白。
+    const state = canonicalState({ messageCount: 2 })
+    state.profile.targetRole = ''
+    state.accountSettings['account-canonical'].jobRules.sources.enabledExpectations = [
+      {
+        id: 'exp-pm',
+        positionName: '产品经理',
+        locationName: '上海',
+        salaryDesc: '',
+      },
+      {
+        id: 'exp-ops',
+        positionName: '用户运营',
+        locationName: '上海',
+        salaryDesc: '',
+      },
+    ]
+    storageGet.mockResolvedValue(state)
+    runConfiguredAiTask.mockResolvedValue({
+      content: JSON.stringify({
+        messages: ['王老师您好，我是做用户运营的。', '我负责过 B 端 SaaS 平台。'],
+        usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
+        anchor: {
+          need: '平台产品从规划到落地',
+          jdQuote: 'AI平台产品规划与落地',
+        },
+      }),
+    })
+    const message = greetingMessage('greeting-expectation-role')
+    ;(message.data as typeof message.data & { accountUid: string }).accountUid = 'account-canonical'
+    message.data.filtering.selectedFactIds = ['fact-canonical']
+    ;(message.data.data as Record<string, unknown>).deliveryGroupTargetIds = ['exp-ops']
+
+    await dispatchRuntimeMessage(message, {
+      tab: { id: 38 },
+      documentId: 'greeting-expectation-role-document',
+    })
+
+    const call = runConfiguredAiTask.mock.calls[0][0]
+    expect(call.template[2].content).toContain('"targetRole": "用户运营"')
+  })
+
+  it('accepts a draft whatever claim mode the model declares', async () => {
+    const state = canonicalState({ messageCount: 2 })
+    storageGet.mockResolvedValue(state)
+    runConfiguredAiTask.mockResolvedValue({
+      content: JSON.stringify({
+        messages: [
+          '王老师您好，我是候选人，关注到当前平台产品经理岗位。',
+          '我负责过B端SaaS平台，相关经验能够支持产品规划和持续迭代。',
+        ],
+        usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
+        // 事实是 direct_fact，模型却自报 adjacent：标签不一致不应让整次生成失败。
+        claimMode: 'adjacent',
+        anchor: {
+          need: '平台产品从规划到落地',
+          jdQuote: 'AI平台产品规划与落地',
+        },
+      }),
+    })
+    const message = greetingMessage('greeting-mislabeled-claim-mode')
+    ;(message.data as typeof message.data & { accountUid: string }).accountUid = 'account-canonical'
+    message.data.filtering.selectedFactIds = ['fact-canonical']
+
+    const response = await dispatchRuntimeMessage(message, {
+      tab: { id: 37 },
+      documentId: 'greeting-mislabeled-claim-mode-document',
+    })
+
+    expect(runConfiguredAiTask).toHaveBeenCalledTimes(1)
+    expect(response).toMatchObject({ ok: true })
+    expect(
+      JSON.parse((response as { data: { content: string } }).data.content).claimMode,
+    ).toBeUndefined()
+  })
+
   it('regenerates an explicit third-person self-description once', async () => {
     const state = canonicalState({ messageCount: 2 })
     storageGet.mockResolvedValue(state)
@@ -638,8 +896,12 @@ describe('background account state', () => {
           '相关经验能够支持产品规划和持续迭代。',
         ],
         usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
         claimMode: 'direct',
-        openingPattern: 'job-hook',
+        anchor: {
+          need: '平台产品从规划到落地',
+          jdQuote: 'AI平台产品规划与落地',
+        },
       }),
     })
     runConfiguredAiTask.mockResolvedValueOnce({
@@ -649,8 +911,12 @@ describe('background account state', () => {
           '我负责过B端SaaS平台，相关经验能够支持产品规划和持续迭代。',
         ],
         usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
         claimMode: 'direct',
-        openingPattern: 'job-hook-repaired',
+        anchor: {
+          need: '平台产品从规划到落地',
+          jdQuote: 'AI平台产品规划与落地',
+        },
       }),
     })
     const message = greetingMessage('greeting-third-person-twice')
@@ -670,6 +936,98 @@ describe('background account state', () => {
     })
   })
 
+  describe('greeting style review', () => {
+    const quote = 'AI平台产品规划与落地'
+    const draftWith = (second: string, jdQuote = quote) =>
+      JSON.stringify({
+        anchor: { need: '平台产品从规划到落地', jdQuote },
+        messages: ['王老师您好，我做了8年B端平台产品。', second],
+        usedFactIds: ['fact-canonical'],
+        segmentFactIds: [['fact-canonical'], []],
+      })
+    const send = async (requestId: string, recentGreetings: unknown[] = []) => {
+      storageGet.mockResolvedValue(canonicalState({ messageCount: 2 }))
+      const message = greetingMessage(requestId)
+      ;(message.data as typeof message.data & { accountUid: string }).accountUid =
+        'account-canonical'
+      message.data.filtering.selectedFactIds = ['fact-canonical']
+      message.data.recentGreetings = recentGreetings as never[]
+      const response = await dispatchRuntimeMessage(message, {
+        tab: { id: 39 },
+        documentId: `${requestId}-document`,
+      })
+      return JSON.parse((response as { data: { content: string } }).data.content)
+    }
+
+    it('rewrites once for a stock phrase or an unfound JD quote, and sends the rewrite even if some remain', async () => {
+      runConfiguredAiTask
+        .mockResolvedValueOnce({
+          content: draftWith('我希望把B端SaaS平台的经验带过来。', '负责平台的整体规划'),
+        })
+        .mockResolvedValueOnce({ content: draftWith('我希望把B端SaaS平台做成熟。') })
+
+      const content = await send('greeting-style-rewrite')
+
+      expect(runConfiguredAiTask).toHaveBeenCalledTimes(2)
+      const retry = runConfiguredAiTask.mock.calls[1][0].template[2].content
+      expect(retry).toContain('STOCK_PHRASE')
+      expect(retry).toContain('JD_QUOTE_NOT_FOUND')
+      // 风格问题不值得丢掉一个岗位：重写后仍有，也照发，记进复核结果供体检统计。
+      expect(content.messages[1]).toBe('我希望把B端SaaS平台做成熟。')
+      // 记下是哪些问题触发了重写：重写率高时才知道该调哪项检查。
+      expect(content.review).toEqual({
+        jdQuoteFound: true,
+        styleIssues: ['STOCK_PHRASE'],
+        attempts: 2,
+        rewriteReasons: ['JD_QUOTE_NOT_FOUND', 'STOCK_PHRASE'],
+      })
+    })
+
+    it('falls back to the style-only draft when the rewrite breaks a fact boundary', async () => {
+      runConfiguredAiTask
+        .mockResolvedValueOnce({ content: draftWith('我希望继续做B端SaaS平台。') })
+        .mockResolvedValueOnce({
+          content: draftWith('候选人担任平台产品经理，负责过B端SaaS平台。'),
+        })
+
+      const content = await send('greeting-style-fallback')
+
+      expect(content.messages[1]).toBe('我希望继续做B端SaaS平台。')
+      expect(content.review).toEqual({
+        jdQuoteFound: true,
+        styleIssues: ['STOCK_PHRASE'],
+        attempts: 1,
+      })
+    })
+
+    it('gives the model phrase and fact statistics instead of recent greeting text', async () => {
+      const shared = '平台单季新增约300家付费企业'
+      const recent = ['甲', '乙', '丙', '丁'].map((word, index) => ({
+        sentAt: index,
+        usedFactIds: ['fact-canonical'],
+        messages: ['老师您好，我做B端平台产品。', `我做过${word}${word}模块，${shared}。`],
+        fingerprint: `fp-${index}`,
+      }))
+      runConfiguredAiTask
+        .mockResolvedValueOnce({ content: draftWith(`我负责过B端SaaS平台，${shared}。`) })
+        .mockResolvedValueOnce({ content: draftWith('我负责过B端SaaS平台的计费改造。') })
+
+      const content = await send('greeting-diversity', recent)
+
+      const input = runConfiguredAiTask.mock.calls[0][0].template[2].content
+      expect(input).toContain('"recentFactUses"')
+      expect(input).toContain('"fact-canonical": 4')
+      // 匹配又选了这条，但近 10 条已用 4 次：不再作为优先项，它仍在 facts 里可用。
+      expect(input).toContain('"primaryFactIds": []')
+      expect(input).toContain(shared)
+      expect(input).not.toContain('甲甲模块')
+      expect(input).not.toContain('recentGreetings')
+      // 草稿照搬了近期反复出现的句子：带着问题重写一次。
+      expect(runConfiguredAiTask.mock.calls[1][0].template[2].content).toContain('REUSED_PHRASE')
+      expect(content.review.styleIssues).toEqual([])
+    })
+  })
+
   it('generates greetings directly from resume evidence when AI filtering is disabled', async () => {
     const state = canonicalState()
     state.tasks.aiFiltering.enabled = false
@@ -680,8 +1038,9 @@ describe('background account state', () => {
         '过往负责过B端SaaS平台，希望进一步了解岗位目标。',
       ],
       usedFactIds: ['fact-canonical'],
+      segmentFactIds: [['fact-canonical'], []],
       claimMode: 'direct',
-      openingPattern: 'job-hook',
+      anchor: { need: '平台产品从规划到落地', jdQuote: 'AI平台产品规划与落地' },
     }
     runConfiguredAiTask.mockResolvedValue({ content: JSON.stringify(draft) })
     const message = greetingMessage('greeting-without-filtering')
@@ -700,7 +1059,7 @@ describe('background account state', () => {
     })
     const call = runConfiguredAiTask.mock.calls[0][0]
     expect(JSON.stringify(call.template)).toContain('fact-canonical')
-    expect(call.template[0].content).toContain('不要跟随 filtering.claimMode')
+    expect(call.template[0].content).toContain('只有 evidenceType 为 direct_fact 的事实')
   })
 
   it('rejects a filtering context without usable fact IDs at the protocol boundary', async () => {
@@ -710,7 +1069,6 @@ describe('background account state', () => {
       ...state.profile.resume.evidence!.facts[0],
       id: 'fact-secondary',
       object: '企业服务产品规划',
-      skills: ['需求分析'],
     })
     storageGet.mockResolvedValue(state)
     const draft = {
@@ -719,8 +1077,9 @@ describe('background account state', () => {
         '相关平台经验可以迁移到当前岗位，希望进一步了解团队目标。',
       ],
       usedFactIds: ['fact-canonical'],
+      segmentFactIds: [['fact-canonical'], []],
       claimMode: 'adjacent',
-      openingPattern: 'job-hook',
+      anchor: { need: '平台产品从规划到落地', jdQuote: 'AI平台产品规划与落地' },
     }
     runConfiguredAiTask.mockResolvedValue({ content: JSON.stringify(draft) })
 
@@ -733,7 +1092,11 @@ describe('background account state', () => {
       documentId: 'greeting-empty-filtering-facts-document',
     })
 
-    expect(response).toBeUndefined()
+    expect(response).toMatchObject({
+      ok: false,
+      errorCode: 'AI_TASK_REQUEST_INVALID',
+      error: '后台AI请求参数校验失败：AI招呼语筛选上下文不合法（未调用模型）',
+    })
     expect(runConfiguredAiTask).not.toHaveBeenCalled()
   })
 
@@ -744,7 +1107,10 @@ describe('background account state', () => {
       if (runConfiguredAiTask.mock.calls.length <= 2) {
         return new Promise((resolve) => pendingResolvers.push(resolve))
       }
-      return Promise.resolve({ content: 'unexpected third result', prompt: 'internal' })
+      return Promise.resolve({
+        content: 'unexpected third result',
+        prompt: 'internal',
+      })
     })
     const message = (requestId: string) => ({
       type: AI_TASK_REQUEST_TYPE,

@@ -62,6 +62,7 @@ export type ConfigRequest =
       action: 'save-profile-draft'
       uid: string
       displayName: string
+      targetRole: string
       markdown: string
     }
   | {
@@ -132,6 +133,7 @@ export function isConfigRequest(value: unknown): value is ConfigRequest {
       typeof value.uid === 'string' &&
       value.uid.length > 0 &&
       typeof value.displayName === 'string' &&
+      typeof value.targetRole === 'string' &&
       typeof value.markdown === 'string'
     )
   }

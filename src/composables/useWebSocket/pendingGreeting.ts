@@ -1,12 +1,14 @@
 import { counter } from '@/message'
+import { PENDING_GREETING_STORAGE_KEY } from '@/message/pendingGreetingProtocol'
 import { useUser } from '@/stores/user'
 import { isPlainObject } from '@/utils/deepmerge'
 import { logger } from '@/utils/logger'
 import { isGeekChatUrl } from '@/utils/zhipinRoute'
 
+import { GreetingChannelUnavailableError } from './greetingChannelError'
 import { Message } from './protobuf'
 
-export const pendingGreetingKey = 'local:pending-greetings'
+export const pendingGreetingKey = PENDING_GREETING_STORAGE_KEY
 const pendingGreetingLockName = `${pendingGreetingKey}:queue`
 let pendingGreetingQueueTail = Promise.resolve()
 
@@ -45,6 +47,7 @@ export interface PendingGreetingSendResult {
 }
 
 export interface PendingGreetingStatus {
+  waitingFor?: 'connection' | 'pacing'
   stage: 'queued' | 'waiting' | 'sending' | 'sent' | 'failed' | 'cancelled'
   reason?: string
   pageUrl?: string
@@ -52,7 +55,6 @@ export interface PendingGreetingStatus {
   observedAt: number
 }
 
-const maxQueueLength = 50
 export const PENDING_GREETING_MAX_AGE_MS = 5 * 60 * 1000
 const chatReadyDelayMs = 6000
 const minSendIntervalMs = 3000
@@ -62,6 +64,20 @@ let consumeTimer: number | undefined
 let lastChatUrl = ''
 let chatReadyAt = 0
 let nextSendAt = 0
+const reportedStates = new Map<string, string>()
+let lastAccountMissingAt = 0
+
+function recordQueueDiagnostic(accountUid: string | undefined, data: Record<string, unknown>) {
+  if (typeof counter.localDiagnosticAppend !== 'function') return
+  void counter
+    .localDiagnosticAppend({
+      stream: 'logs',
+      event: 'runtime.greeting-queue',
+      accountUid,
+      data: { ...data, route: location.pathname },
+    })
+    .catch(() => undefined)
+}
 
 function isCurrentUid(expectedUid: string) {
   const currentUid = useUser().getUserId()
@@ -101,7 +117,10 @@ export async function enqueuePendingGreeting(
     const otherAccounts = queue.filter((entry) => entry.fromUid !== item.fromUid)
     const currentAccount = queue.filter((entry) => entry.fromUid === item.fromUid)
     currentAccount.push(item)
-    await savePendingGreetings([...otherAccounts, ...currentAccount.slice(-maxQueueLength)])
+    // A queued greeting is a business action. Do not evict older greetings by a
+    // fixed count while the chat page is unavailable; the durable storage quota
+    // or an explicit expiry/stop decision is the only boundary.
+    await savePendingGreetings([...otherAccounts, ...currentAccount])
     return item
   })
 }
@@ -115,8 +134,16 @@ export async function consumePendingGreetings(
     return await withPendingGreetingQueue(async () => {
       const queue = await getPendingGreetings()
       if (queue.length === 0) return []
-      if (currentUid == null) {
+      if (currentUid == null || String(currentUid).trim().length === 0) {
         logger.warn('当前账号 UID 不可用，保留待发送招呼语队列')
+        if (Date.now() - lastAccountMissingAt >= 10_000) {
+          lastAccountMissingAt = Date.now()
+          recordQueueDiagnostic(undefined, {
+            stage: 'blocked',
+            code: 'ACCOUNT_UNAVAILABLE',
+            queueLength: queue.length,
+          })
+        }
         return []
       }
       const normalizedCurrentUid = String(currentUid)
@@ -127,11 +154,36 @@ export async function consumePendingGreetings(
 
       const remaining: PendingGreeting[] = []
       const results: PendingGreetingSendResult[] = []
+      const uncertainRecipients = new Set(
+        queue
+          .filter(
+            (item) =>
+              item.fromUid === normalizedCurrentUid &&
+              (item.status?.stage === 'sending' || item.status?.stage === 'sent'),
+          )
+          .map((item) => item.toUid),
+      )
       const now = Date.now()
       let changed = false
       for (const [index, item] of queue.entries()) {
         if (item.fromUid !== normalizedCurrentUid) {
           remaining.push(item)
+          continue
+        }
+        if (uncertainRecipients.has(item.toUid)) {
+          remaining.push(item)
+          results.push({
+            id: item.id,
+            ok: false,
+            error: '该会话有发送结果不确定的消息，已停止自动重试',
+          })
+          continue
+        }
+        if (item.status?.stage === 'failed' || item.status?.stage === 'cancelled') {
+          // Retain terminal receipts until the owner reads/removes them. Missing entries
+          // mean success to the caller, and a failed receipt must never auto-send later.
+          remaining.push(item)
+          results.push({ id: item.id, ok: false, error: item.status.reason ?? '待发送消息已终止' })
           continue
         }
         if (now - item.createdAt > PENDING_GREETING_MAX_AGE_MS) {
@@ -141,29 +193,27 @@ export async function consumePendingGreetings(
             ageMs: now - item.createdAt,
           })
           results.push({ id: item.id, ok: false, error: '待发送招呼语已过期' })
-          changed = true
-          continue
-        }
-        if (item.status?.stage === 'sending' || item.status?.stage === 'sent') {
-          remaining.push(item, ...queue.slice(index + 1))
-          results.push({ id: item.id, ok: false, error: '招呼语发送结果不确定，已停止自动重试' })
-          break
-        }
-        if (item.status?.stage === 'cancelled') {
-          results.push({ id: item.id, ok: false, error: item.status.reason ?? '待发送文本已取消' })
+          // Keep a failure receipt: disappearance is interpreted by the caller as sent.
+          remaining.push(withStatus(item, 'failed', '待发送招呼语已过期'))
           changed = true
           continue
         }
         const readiness = getChatReadiness()
         if (!readiness.ready) {
-          remaining.push(withStatus(item, 'waiting', readiness.reason), ...queue.slice(index + 1))
+          remaining.push(
+            withStatus(item, 'waiting', readiness.reason, undefined, 'connection'),
+            ...queue.slice(index + 1),
+          )
           results.push({ id: item.id, ok: false, error: readiness.reason })
           changed = true
           break
         }
         const sendTiming = getSendTimingReadiness()
         if (!sendTiming.ready) {
-          remaining.push(withStatus(item, 'waiting', sendTiming.reason), ...queue.slice(index + 1))
+          remaining.push(
+            withStatus(item, 'waiting', sendTiming.reason, undefined, 'pacing'),
+            ...queue.slice(index + 1),
+          )
           results.push({ id: item.id, ok: false, error: sendTiming.reason })
           changed = true
           break
@@ -216,11 +266,24 @@ export async function consumePendingGreetings(
             contentLength: item.content.length,
           })
           scheduleNextSend()
+          recordQueueDiagnostic(item.fromUid, {
+            pendingId: item.id,
+            stage: 'local-channel-handoff',
+            channel,
+          })
           results.push({ id: item.id, ok: true, channel })
           changed = true
         } catch (e) {
           const error = e instanceof Error ? e.message : String(e)
-          remaining.push(withStatus(item, 'failed', error), ...queue.slice(index + 1))
+          const safeToRetry = e instanceof GreetingChannelUnavailableError
+          remaining.push(
+            withStatus(
+              item,
+              safeToRetry ? 'failed' : 'sending',
+              safeToRetry ? error : `发送通道返回异常，结果不确定：${error}`,
+            ),
+            ...queue.slice(index + 1),
+          )
           results.push({
             id: item.id,
             ok: false,
@@ -275,10 +338,12 @@ function withStatus(
   stage: PendingGreetingStatus['stage'],
   reason?: string,
   channel?: PendingGreetingStatus['channel'],
+  waitingFor?: PendingGreetingStatus['waitingFor'],
 ): PendingGreeting {
   return {
     ...item,
     status: {
+      waitingFor,
       stage,
       reason,
       channel,
@@ -321,7 +386,7 @@ function getChatReadiness() {
   return { ready: true }
 }
 
-function getSendChannelReadiness() {
+export function getSendChannelReadiness() {
   const geekClient = window.GeekChatCore?.getInstance?.()?.getClient?.()?.client
   if (geekClient?.send != null) {
     return { ready: true }
@@ -407,6 +472,8 @@ export async function removePendingGreeting(
     const nextQueue = queue.filter(
       (item) => item.id !== id || item.fromUid !== normalizedExpectedUid,
     )
+    const target = queue.find((item) => item.id === id && item.fromUid === normalizedExpectedUid)
+    if (target?.status?.stage === 'sending' || target?.status?.stage === 'sent') return false
     if (nextQueue.length === queue.length) return false
     if (!isCurrentUid(normalizedExpectedUid)) return false
     await savePendingGreetings(nextQueue)
@@ -430,6 +497,8 @@ export function stopPendingGreetingConsumer() {
 
 function handlePendingGreetingConsumerError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
+  const uid = useUser().getUserId()
+  recordQueueDiagnostic(uid == null ? undefined : String(uid), { stage: 'error', reason: message })
   if (/Extension context invalidated/i.test(message)) {
     stopPendingGreetingConsumer()
     logger.error('插件已更新，当前聊天页需刷新后才能继续发送招呼语', {
@@ -462,4 +531,20 @@ async function savePendingGreetings(queue: PendingGreeting[]) {
     return
   }
   await counter.storageSet(pendingGreetingKey, queue)
+  const uid = useUser().getUserId()
+  const present = new Set(queue.map((item) => item.id))
+  for (const id of reportedStates.keys()) if (!present.has(id)) reportedStates.delete(id)
+  for (const item of queue) {
+    if (uid == null || String(uid) !== item.fromUid) continue
+    const signature = `${item.status?.stage}:${item.status?.waitingFor}`
+    if (reportedStates.get(item.id) === signature) continue
+    reportedStates.set(item.id, signature)
+    recordQueueDiagnostic(item.fromUid, {
+      pendingId: item.id,
+      stage: item.status?.stage,
+      waitingFor: item.status?.waitingFor,
+      reason: item.status?.reason,
+      channel: item.status?.channel,
+    })
+  }
 }

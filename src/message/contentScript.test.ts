@@ -15,10 +15,12 @@ import {
   getCurrentAppVersion,
 } from '@/utils/extensionRuntimeHealth'
 
+import { CHAT_RUNTIME_REQUEST, CHAT_RUNTIME_RESPONSE } from './chatRuntimeProtocol'
+import { PENDING_GREETING_WAKE_TYPE } from './pendingGreetingProtocol'
 import type { BackgroundCounterApi } from './types'
 
 const { runtimeListeners, runtimeSendMessage, storageGet } = vi.hoisted(() => ({
-  runtimeListeners: [] as Array<(message: unknown) => unknown>,
+  runtimeListeners: [] as Array<(message: unknown, sender?: unknown) => unknown>,
   runtimeSendMessage: vi.fn().mockResolvedValue(undefined),
   storageGet: vi.fn().mockResolvedValue(null),
 }))
@@ -47,6 +49,65 @@ const { ContentCounter, InjectBackgroundAdapter, ProvideContentAdapter, setBridg
   contentScriptModule
 
 describe('MAIN-world content counter', () => {
+  it('returns the authenticated main-world readiness receipt to this extension only', async () => {
+    setBridgeToken('readiness-token')
+    const request = {
+      type: CHAT_RUNTIME_REQUEST,
+      requestId: 'ready-request',
+      expectedUid: 'account-a',
+      wake: true,
+    }
+    const post = vi.spyOn(window, 'postMessage').mockImplementation((data) => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window,
+          origin: location.origin,
+          data: {
+            type: CHAT_RUNTIME_RESPONSE,
+            requestId: data.requestId,
+            bridgeToken: 'readiness-token',
+            ready: true,
+            code: 'READY',
+            reason: 'ready',
+            accountReady: true,
+            accountMatches: true,
+            consumerStarted: true,
+            channelReady: true,
+            mainVersion: getCurrentAppVersion(),
+            wakeDelivered: true,
+          },
+        }),
+      )
+    })
+    for (const listener of runtimeListeners) listener(request, { id: 'another-extension' })
+    expect(post).not.toHaveBeenCalled()
+    const response = runtimeListeners
+      .map((listener) => listener(request, { id: 'test-extension' }))
+      .find(Boolean)
+    await expect(response).resolves.toMatchObject({
+      type: CHAT_RUNTIME_RESPONSE,
+      requestId: 'ready-request',
+      ready: true,
+      contentVersion: getCurrentAppVersion(),
+      wakeDelivered: true,
+    })
+    post.mockRestore()
+  })
+
+  it('forwards queue wake only from this extension with the current bridge token', () => {
+    setBridgeToken('wake-token')
+    const post = vi.spyOn(window, 'postMessage').mockImplementation(() => {})
+    const wake = { type: PENDING_GREETING_WAKE_TYPE }
+    for (const listener of runtimeListeners) listener(wake, { id: 'another-extension' })
+    expect(post).not.toHaveBeenCalled()
+    for (const listener of runtimeListeners) listener(wake, { id: 'test-extension' })
+    expect(post).toHaveBeenCalledOnce()
+    expect(post).toHaveBeenCalledWith(
+      { ...wake, bridgeToken: 'wake-token' },
+      window.location.origin,
+    )
+    post.mockRestore()
+  })
   it('resolves a tab-scoped delivery worker identity through a direct runtime message', async () => {
     runtimeSendMessage.mockResolvedValueOnce({
       type: DELIVERY_WORKER_IDENTITY_RESPONSE_TYPE,
@@ -208,6 +269,9 @@ describe('MAIN-world content counter', () => {
     'local:web-geek-job-StatisticsEpoch:account-a',
     'local:web-geek-job-Today:123456',
     'local:agent-delivery-runtime-logs:account-a',
+    'local:agent-delivery-records:account-a:2026-09-23',
+    'local:agent-delivery-records:account-a:days',
+    'local:agent-delivery-run-events:account-a',
     'local:boss-action-gate',
     'local:risk-backoff',
   ])('allows an account-scoped runtime storage key %s', async (key) => {
@@ -223,6 +287,10 @@ describe('MAIN-world content counter', () => {
     'local:web-geek-job-Unknown:account-a',
     'local:agent-delivery-runtime-logs:',
     'local:agent-delivery-runtime-logs:account/a',
+    'local:agent-delivery-records:account-a',
+    'local:agent-delivery-records:account-a:2026-9-23',
+    'local:agent-delivery-records:account/a:days',
+    'local:agent-delivery-run-events:',
   ])('rejects a malformed account-scoped storage key %s', async (key) => {
     const counter = new ContentCounter({} as BackgroundCounterApi)
 
@@ -300,14 +368,17 @@ describe('MAIN-world content counter', () => {
       }),
     )
 
-    expect(runtimeSendMessage).not.toHaveBeenCalled()
+    expect(runtimeSendMessage).toHaveBeenCalledWith(
+      'test-extension',
+      expect.objectContaining({ requestId: 'invalid-ai-request', model: 'forbidden-page-model' }),
+    )
     expect(postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         type: AI_TASK_RESPONSE_TYPE,
         requestId: 'invalid-ai-request',
         ok: false,
-        errorCode: 'AI_TASK_FAILED',
-        error: '后台AI任务失败',
+        errorCode: 'AI_TASK_REQUEST_INVALID',
+        error: '后台AI请求参数校验失败（未调用模型，请查看本机诊断）',
       }),
       window.location.origin,
     )
