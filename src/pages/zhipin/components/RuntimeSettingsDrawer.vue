@@ -39,7 +39,11 @@ const runtimeConfigKeys = [
   'amap',
 ] as const satisfies readonly (keyof FormData)[]
 // AI 任务是全局数据，与按账号分区的运行配置分开保存（契约 §3）。
-const aiTaskKeys = ['aiFiltering', 'aiGreeting'] as const satisfies readonly (keyof FormData)[]
+const aiTaskKeys = [
+  'aiFiltering',
+  'aiGreeting',
+  'customGreeting',
+] as const satisfies readonly (keyof FormData)[]
 type RuntimeConfigSnapshot = Pick<FormData, (typeof runtimeConfigKeys)[number]>
 type AiTaskSnapshot = Pick<FormData, (typeof aiTaskKeys)[number]>
 
@@ -185,8 +189,17 @@ watchDebounced(
     if (normalizeAiTaskNumbers()) return
     const candidate = serializeAiTasks()
     if (candidate === persistedAiTaskSnapshot) return
+    const previous = persistedAiTaskSnapshot
     persistedAiTaskSnapshot = candidate
-    void conf.persistAiTasks()
+    void conf.persistAiTasks().then((saved) => {
+      if (saved || persistedAiTaskSnapshot !== candidate || previous == null) return
+      const values = JSON.parse(previous) as AiTaskSnapshot[keyof AiTaskSnapshot][]
+      Object.assign(
+        conf.formData,
+        Object.fromEntries(aiTaskKeys.map((key, index) => [key, values[index]])),
+      )
+      persistedAiTaskSnapshot = previous
+    })
   },
   { deep: true, debounce: 250, maxWait: 1_000 },
 )
@@ -226,11 +239,30 @@ function setAiGreetingEnabled(value: string | number | boolean) {
     // 关闭是即时安全控制：先让界面和执行链路立刻停用，再异步落盘，
     // 不等网络往返。投递运行中也必须生效，因此走专用入口而不是常规保存。
     conf.formData.aiGreeting.enable = false
-    persistedAiTaskSnapshot = serializeAiTasks()
+    rememberDisabledGreeting('aiGreeting')
     void conf.disableAiGreetingNow()
     return
   }
-  conf.formData.aiGreeting.enable = enabled
+  conf.formData.customGreeting.enable = false
+  conf.formData.aiGreeting.enable = true
+}
+
+function setCustomGreetingEnabled(value: string | number | boolean) {
+  const enabled = Boolean(value)
+  conf.formData.customGreeting.enable = enabled
+  if (enabled) {
+    conf.formData.aiGreeting.enable = false
+  } else {
+    rememberDisabledGreeting('customGreeting')
+    void conf.disableCustomGreetingNow()
+  }
+}
+
+function rememberDisabledGreeting(key: 'aiGreeting' | 'customGreeting') {
+  if (persistedAiTaskSnapshot == null) return
+  const values = JSON.parse(persistedAiTaskSnapshot) as Array<{ enable: boolean }>
+  values[aiTaskKeys.indexOf(key)].enable = false
+  persistedAiTaskSnapshot = JSON.stringify(values)
 }
 
 function setCommuteEnabled(value: string | number | boolean) {
@@ -310,8 +342,8 @@ defineExpose({ resetRuntimeSettings })
 
           <div class="instrument-setting-row">
             <div class="instrument-setting-copy">
-              <strong>单 JD 耗时</strong>
-              <span>典型值 / 九成不超过；刚开工更快，跑久了变慢</span>
+              <strong>投递最低间隔 / 参考耗时</strong>
+              <span>最低间隔不会被加速缩短；AI 等处理耗时计入，不足时在发送前补等</span>
             </div>
             <div class="runtime-settings__compound-field">
               <input
@@ -323,12 +355,12 @@ defineExpose({ resetRuntimeSettings })
                 max="180"
                 step="5"
               />
-              <span>至</span>
+              <span>/</span>
               <input
                 v-model.lazy.number="conf.formData.delay.deliveryIntervalMax"
                 type="number"
                 inputmode="numeric"
-                aria-label="单个岗位最长处理间隔"
+                aria-label="单个岗位参考处理耗时"
                 min="30"
                 max="240"
                 step="5"
@@ -637,6 +669,35 @@ defineExpose({ resetRuntimeSettings })
               @update:model-value="setAiGreetingEnabled"
             />
           </label>
+
+          <label class="instrument-setting-row">
+            <span class="instrument-setting-copy">
+              <strong>自定义招呼语</strong>
+              <span>使用固定话术，与 AI 招呼语互斥；开启 AI 匹配时先筛选再发送</span>
+            </span>
+            <AgentSwitch
+              :model-value="conf.formData.customGreeting.enable"
+              aria-label="启用自定义招呼语"
+              @update:model-value="setCustomGreetingEnabled"
+            />
+          </label>
+
+          <div
+            v-if="conf.formData.customGreeting.enable"
+            class="runtime-settings__greeting-panel"
+            data-test="custom-greeting-panel"
+          >
+            <label class="runtime-settings__prompt-field">
+              <span>固定话术</span>
+              <textarea
+                v-model="conf.formData.customGreeting.value"
+                data-test="custom-greeting-text"
+                aria-label="自定义招呼语内容"
+                placeholder="填写要发送的固定话术，将保留换行并作为一条消息发送"
+                rows="6"
+              />
+            </label>
+          </div>
 
           <div
             v-if="conf.formData.aiGreeting.enable"

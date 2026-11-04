@@ -52,6 +52,10 @@ export interface PersonalProfileConfig {
 }
 
 export interface AiTaskConfig {
+  customGreeting: {
+    enabled: boolean
+    value: string
+  }
   resumeExtraction: {
     modelId: string | null
   }
@@ -143,6 +147,7 @@ export interface DeliveryTimingConfig {
 }
 
 export interface DeliveryConfig {
+  /** Legacy account data, retained for import/export only. Active text is in tasks. */
   customGreeting: {
     enabled: boolean
     value: string
@@ -220,7 +225,7 @@ export class ConfigImportRunningError extends Error {
 }
 
 export class ConfigMutationRunningError extends Error {
-  constructor(message = '投递正在运行，仅可关闭 AI 招呼语，停止投递后才能修改其他配置') {
+  constructor(message = '投递正在运行，仅可关闭当前招呼语，停止投递后才能修改其他配置') {
     super(message)
     this.name = 'ConfigMutationRunningError'
   }

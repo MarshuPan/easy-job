@@ -11,6 +11,8 @@ const {
   changeUser,
   configRuntime,
   configRuntimeSave,
+  configAiTasksSave,
+  configGreetingDisable,
   revisionListenerState,
   storageGet,
   storageSet,
@@ -20,6 +22,8 @@ const {
   changeUser: vi.fn(async () => undefined),
   configRuntime: vi.fn(),
   configRuntimeSave: vi.fn(),
+  configAiTasksSave: vi.fn(async () => ({ configRevision: 1 })),
+  configGreetingDisable: vi.fn(async () => ({ configRevision: 2 })),
   revisionListenerState: {
     value: undefined as ((configRevision: number) => void) | undefined,
   },
@@ -33,6 +37,8 @@ vi.mock('@/message', () => ({
     accountState,
     configRuntime,
     configRuntimeSave,
+    configAiTasksSave,
+    configGreetingDisable,
     storageGet,
     storageRm: vi.fn(async () => true),
     storageSet,
@@ -135,6 +141,23 @@ describe('configuration commands', () => {
 
   it('defaults AI filtering to the approved 60-point delivery gate', () => {
     expect(defaultFormData.aiFiltering.score).toBe(60)
+  })
+
+  it('saves custom text with global tasks and disables only its switch through the immediate control', async () => {
+    const conf = useConf()
+    conf.formData.aiGreeting.enable = false
+    conf.formData.customGreeting = { enable: true, value: '固定\n原文' }
+    expect(await conf.persistAiTasks()).toBe(true)
+    expect(configAiTasksSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customGreeting: { enabled: true, value: '固定\n原文' },
+        aiGreeting: expect.objectContaining({ enabled: false }),
+      }),
+    )
+    expect(configRuntimeSave).not.toHaveBeenCalled()
+    expect(await conf.disableCustomGreetingNow()).toBe(true)
+    expect(configGreetingDisable).toHaveBeenCalledWith('custom')
+    expect(conf.formData.customGreeting).toEqual({ enable: false, value: '固定\n原文' })
   })
 
   it('loads the product-manager search preset for a first-run account', async () => {

@@ -9,6 +9,7 @@ import {
 } from '@/composables/useApplying'
 import { useCommon } from '@/composables/useCommon'
 import { createEmptyStatistics, useStatistics } from '@/composables/useStatistics'
+import { getRuntimeGreetingMode } from '@/config/greetingMode'
 import { useConf } from '@/stores/conf'
 import { reportDeliveryStage, reportDeliveryWait } from '@/stores/deliveryActivity'
 import type { MyJobListData } from '@/stores/jobs'
@@ -37,7 +38,7 @@ import type { FormData } from '@/types/formData'
 import { AgentMessage } from '@/ui/instrument'
 import { delay, getCurDay } from '@/utils'
 import { ActionGateTimeoutError } from '@/utils/actionGate'
-import { acquireBossAction, getCurrentPaceMultiplier } from '@/utils/actionGateStore'
+import { getCurrentPaceMultiplier } from '@/utils/actionGateStore'
 import { assertBossSecurityCheckClear } from '@/utils/bossPageState'
 import { sampleHumanDelayMs } from '@/utils/humanPace'
 import { logger } from '@/utils/logger'
@@ -140,8 +141,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       return activeRuntimeFormData ?? liveConf.formData
     },
   }
-  const isAiGreetingRuntimeEnabled = () =>
-    conf.formData.aiGreeting.enable && liveConf.formData.aiGreeting.enable
+  const isGreetingRuntimeEnabled = () =>
+    getRuntimeGreetingMode(conf.formData, liveConf.formData) !== 'none'
   const terminalError = ref('')
   /** 触发平台限流后本次运行额外增加的单岗间隔（秒），随每次 jobListHandle 重置。 */
   let rateLimitBackoffSeconds = 0
@@ -270,7 +271,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     const mode = options.mode ?? 'full'
     const isRetry = options.record != null
     let delivered = false
-    let shouldWaitForHumanLikePace = false
+    let fullJobPaceApplied = false
     let shouldWaitForBatchRest = false
     let shouldCachePipeline = true
     // 这个岗位是不是「根本没评上」——详情取不到、数据缺字段。它决定连续计数加还是清。
@@ -326,21 +327,23 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           }
           addLogTrace(ctx, '前置筛选', 'success', '前置筛选通过，准备投递')
           assertDeliveryNotStopped('用户已停止投递，当前岗位未建立沟通')
-          setDeliveryStage(ctx, data, '正在建立沟通', record)
-          await acquireBossAction('publish', {
-            shouldAbort: () => common.deliverStop,
-            onWait: (waitMs) =>
-              addLogTrace(
-                ctx,
-                '动作闸门',
-                'info',
-                `投递限速，等待 ${Math.round(waitMs / 1000)} 秒`,
-              ),
-          })
+          // Credit all preceding work, including AI, before the external action.
+          // Waiting after sending allowed slow AI followed by fast AI to burst.
+          await waitForHumanLikeJobPace(
+            ctx,
+            jobStartedAt,
+            targetJobDuration,
+            currentPaceMultiplier,
+            'before-publish',
+          )
           assertDeliveryNotStopped('用户已停止投递，当前岗位未建立沟通')
+          fullJobPaceApplied = true
+          assertBossSecurityCheckClear()
+          setDeliveryStage(ctx, data, '正在建立沟通', record)
           await sendPublishReq(data, undefined, 3, {}, ctx, {
             limitConfirmationAttempted: false,
             shouldAbort: () => common.deliverStop,
+            minIntervalMs: getMinimumJobIntervalMs(),
           })
           shouldWaitForBatchRest = countConfirmedCommunication(ctx)
           // Keep processed/source totals consistent with success before the next
@@ -352,7 +355,6 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           for (const handler of chandle.afterPublish ?? []) {
             await handler({ data }, ctx)
           }
-          shouldWaitForHumanLikePace = true
           addLogTrace(ctx, '投递后处理', 'info', `开始执行 ${chandle.after.length} 个投递后处理`)
         }
 
@@ -361,13 +363,24 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           await flushJobRunState(ctx, record, '已建立沟通，进入招呼语阶段')
         }
         if (mode === 'greetingOnly') {
-          if (isAiGreetingRuntimeEnabled()) {
+          if (isGreetingRuntimeEnabled()) {
             assertDeliveryNotStopped('用户已停止投递，未继续补发招呼语')
+            await waitForHumanLikeJobPace(
+              ctx,
+              jobStartedAt,
+              targetJobDuration,
+              currentPaceMultiplier,
+              'before-greeting',
+            )
+            assertDeliveryNotStopped('用户已停止投递，未继续补发招呼语')
+            assertBossSecurityCheckClear()
+            fullJobPaceApplied = true
+            setDeliveryStage(ctx, data, '正在打招呼', record)
           }
           await chandle.retryGreeting({ data }, ctx)
         } else {
           for (const [afterIndex, h] of chandle.after.entries()) {
-            if (isAiGreetingRuntimeEnabled()) {
+            if (isGreetingRuntimeEnabled()) {
               assertDeliveryNotStopped('用户已停止投递，未继续发送招呼语')
             }
             const label = `第 ${afterIndex + 1}/${chandle.after.length} 个投递后处理`
@@ -386,7 +399,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
             }
           }
         }
-        if (isAiGreetingRuntimeEnabled()) {
+        if (isGreetingRuntimeEnabled()) {
           if (ctx.greetingSend?.ok !== true) {
             throw new GreetError('招呼语未确认发送成功')
           }
@@ -446,7 +459,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         ) {
           shouldWaitForBatchRest = countUnknownCommunication(ctx)
           countProcessedOnce()
-          shouldWaitForHumanLikePace = true
+          fullJobPaceApplied = true
           const failureStage = inferFailureStage(ctx)
           const failureReason = e instanceof Error ? e.message : String(e)
           shouldCachePipeline = false
@@ -469,7 +482,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           if (publishPhase === 'sent' || publishPhase === 'unknown') {
             shouldWaitForBatchRest = countUnknownCommunication(ctx)
             countProcessedOnce()
-            shouldWaitForHumanLikePace = true
+            fullJobPaceApplied = true
           }
           const failureStage = inferFailureStage(ctx)
           const diagnostic = {
@@ -720,7 +733,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       await flushJobRunState(ctx, record, delivered ? '岗位处理成功' : '岗位处理结束')
       logJobOutcome(ctx, data, jobStartedAt)
       const browseOnlyDuration =
-        ctx.detailAttempted === true && !shouldWaitForHumanLikePace
+        ctx.detailAttempted === true && !fullJobPaceApplied
           ? getBrowseOnlyDurationMs(targetJobDuration)
           : 0
       if (
@@ -728,13 +741,11 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         shouldCountTotal &&
         ['success', 'filtered', 'error'].includes(data.status.status)
       ) {
-        const paceMs = shouldWaitForHumanLikePace ? targetJobDuration : browseOnlyDuration
+        const paceMs = fullJobPaceApplied ? targetJobDuration : browseOnlyDuration
         processingDurations.push(Math.max(0, Date.now() - jobStartedAt, paceMs))
         processingDurations = processingDurations.slice(-20)
       }
-      if (shouldWaitForHumanLikePace) {
-        await waitForHumanLikeJobPace(ctx, jobStartedAt, targetJobDuration, currentPaceMultiplier)
-      } else if (ctx.detailAttempted === true) {
+      if (!fullJobPaceApplied && ctx.detailAttempted === true) {
         // 节奏要按「向 BOSS 发过请求」算，不能按「投递成功」算，也不能按「请求成功」算。
         // 原来只有真的投出去才等，于是一页里被 AI 或岗位规则筛掉的岗位是零等待；
         // 后来改成按详情拿到手算，失败的详情请求仍然是零等待——而详情开始失败恰恰是
@@ -1045,7 +1056,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
   }
 
   function getPendingGreetingRetryRecords() {
-    if (!isAiGreetingRuntimeEnabled()) return []
+    const greetingMode = getRuntimeGreetingMode(conf.formData, liveConf.formData)
+    if (greetingMode === 'none') return []
     const records = log.data.value
     const todayStartedAt = new Date()
     todayStartedAt.setHours(0, 0, 0, 0)
@@ -1066,6 +1078,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
           ctx?.retryable !== true ||
           ctx.publish?.ok !== true ||
           ctx.greetingSend?.ok === true ||
+          (ctx.greetingSend?.type ?? 'ai') !== greetingMode ||
           resultUnknown ||
           (ctx.retryAttempts ?? 0) >= maxManualJobRetries
         ) {
@@ -1247,9 +1260,8 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
   /**
    * 单个岗位的目标耗时。
    *
-   * 用户配的两个数按「典型值」和「十次里九次不超过」理解，不是「最短」和「最长」。
-   * 按区间均匀取值会把均值抬到区间中点，那是均匀抖动最亏效率的地方；重尾分布的
-   * 大多数样本落在典型值附近甚至更快，只有少数落到长尾上——真人也是这个形状。
+   * 第一个配置是真正的最低耗时，第二个仍用于抽样较慢的目标。
+   * 会话倍率和随机抖动只能在最低耗时之上起作用。
    */
   function getRandomJobDurationMs(paceMultiplier = 1) {
     const typicalSeconds =
@@ -1258,13 +1270,17 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       typicalSeconds,
       conf.formData.delay.deliveryIntervalMax + rateLimitBackoffSeconds,
     )
-    // 倍率越高节奏越快，所以是除不是乘：用户配的值代表「常规档」，曲线在它上下浮动。
+    const minimumMs = typicalSeconds * 1000
     const pace = Math.max(0.1, paceMultiplier)
     return sampleHumanDelayMs((typicalSeconds * 1000) / pace, {
       p90Ms: (p90Seconds * 1000) / pace,
-      minMs: 4000,
-      maxMs: (p90Seconds * 4000) / pace,
+      minMs: minimumMs,
+      maxMs: Math.max(minimumMs, (p90Seconds * 4000) / pace),
     })
+  }
+
+  function getMinimumJobIntervalMs() {
+    return Math.max(0, Number(conf.formData.delay.deliveryInterval) || 0) * 1000
   }
 
   async function waitForHumanLikeJobPace(
@@ -1272,12 +1288,32 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     startedAt: number,
     targetDurationMs: number,
     paceMultiplier = 1,
+    phase: 'before-publish' | 'before-greeting' | 'browse' = 'browse',
   ) {
-    const remainingMs = targetDurationMs - (Date.now() - startedAt)
+    const elapsedMs = Math.max(0, Date.now() - startedAt)
+    const remainingMs = Math.max(0, targetDurationMs - elapsedMs)
+    log.recordDiagnostic('投递节奏核对', {
+      phase,
+      jobId: ctx.listData.encryptJobId,
+      source: ctx.deliverySource ?? getDeliveryLimitSource(),
+      greetingMode: getRuntimeGreetingMode(conf.formData, liveConf.formData),
+      aiFilteringEnabled: Boolean(conf.formData.aiFiltering?.enable),
+      minimumIntervalMs: getMinimumJobIntervalMs(),
+      targetDurationMs,
+      elapsedMs,
+      waitMs: remainingMs,
+      paceMultiplier,
+    })
     if (remainingMs <= 0) return
     const waitSeconds = Math.ceil(remainingMs / 1000)
     const targetSeconds = Math.ceil(targetDurationMs / 1000)
-    const msg = `投递节奏等待 ${waitSeconds} 秒后继续下一个岗位`
+    const waitLabel =
+      phase === 'before-publish'
+        ? '建立沟通前补足岗位耗时'
+        : phase === 'before-greeting'
+          ? '续发前补足岗位耗时'
+          : '等待处理下一个岗位'
+    const msg = `${waitLabel}，等待 ${waitSeconds} 秒`
     log.debug(
       '投递节奏',
       `${msg}\n${JSON.stringify({
@@ -1286,13 +1322,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
         source: ctx.deliverySource ?? getDeliveryLimitSource(),
         waitSeconds,
         targetSeconds,
+        phase,
+        elapsedMs,
+        minimumIntervalMs: getMinimumJobIntervalMs(),
         // 没有档位就没法判断曲线该不该调：同一个「目标 22 秒」可能来自 1.8 档，
         // 也可能来自用户把配置调小了，两者要采取的动作完全相反。
         paceMultiplier,
       })}`,
     )
     logger.info(`${msg}，目标单JD耗时 ${targetSeconds} 秒`)
-    reportDeliveryWait('等待处理下一个岗位', remainingMs)
+    reportDeliveryWait(waitLabel, remainingMs)
     if (!common.deliverStop && hasDailyDeliveryRemaining(statistics.todayData))
       activeBatchHooks?.onIdle?.()
     await delayWithStop(remainingMs)

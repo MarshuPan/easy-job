@@ -254,6 +254,8 @@ export function migrateLegacyAiTasks(value: unknown): AiTaskConfig {
   const filtering = asRecord(source.aiFiltering)
   const greeting = asRecord(source.aiGreeting)
   return {
+    // Old account switches never reached the send chain. Do not activate them on upgrade.
+    customGreeting: { ...defaults.customGreeting },
     resumeExtraction: { modelId: null },
     aiFiltering: {
       ...defaults.aiFiltering,
@@ -346,8 +348,8 @@ export function settingsToLegacyFormData(
   result.sameHrFilter.value = filters.sameHr
   result.goldHunterFilter.value = filters.goldHunter
   result.customGreeting = {
-    enable: settings.delivery.customGreeting.enabled,
-    value: settings.delivery.customGreeting.value,
+    enable: tasks.customGreeting.enabled,
+    value: tasks.customGreeting.value,
   }
   result.useCache.value = settings.delivery.useCache
   result.deliveryLimit = {

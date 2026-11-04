@@ -59,6 +59,7 @@ const pageCallableMethods = new Set([
   'configRuntimeSave',
   'configAiTasksSave',
   'configAiGreetingDisable',
+  'configGreetingDisable',
   'deliveryTaskRead',
   'deliveryTaskStart',
   'deliveryTaskClaim',
@@ -140,6 +141,10 @@ export class ContentCounter implements ContentCounterApi {
 
   async configAiGreetingDisable() {
     return this.background.configAiGreetingDisable()
+  }
+
+  async configGreetingDisable(type: 'ai' | 'custom') {
+    return this.background.configGreetingDisable(type)
   }
 
   async deliveryTaskRead(...args: Parameters<BackgroundCounterApi['deliveryTaskRead']>) {

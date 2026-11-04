@@ -110,10 +110,19 @@ async function readEvents() {
  *
  * 记账和判定必须在同一把锁里，否则两个标签页会同时判定「可以发」。
  */
-async function tryClaim(kind: BossActionKind, now: number) {
+async function tryClaim(kind: BossActionKind, minIntervalMs = 0) {
   return withGateLock(async () => {
-    const events = pruneEvents(await readEvents(), now)
-    const waitMs = waitMsFor(events, kind, now, defaultGateRules)
+    const storedEvents = await readEvents()
+    const now = Date.now()
+    const events = pruneEvents(storedEvents, now)
+    const lastAt = events.reduce(
+      (latest, event) => (event.kind === kind ? Math.max(latest, event.at) : latest),
+      Number.NEGATIVE_INFINITY,
+    )
+    const waitMs = Math.max(
+      waitMsFor(events, kind, now, defaultGateRules),
+      lastAt + minIntervalMs - now,
+    )
     if (waitMs > 0) return waitMs
     const next = [...events, { kind, at: now }]
     memoryEvents = next
@@ -131,6 +140,10 @@ async function tryClaim(kind: BossActionKind, now: number) {
 }
 
 export interface AcquireActionOptions {
+  /** Hard interval between requests of this kind; independent of session speed. */
+  minIntervalMs?: number
+  /** Explain planned pacing separately from platform rate limiting. */
+  waitLabel?: string
   /** 用户点了停止就别再等下去了。 */
   shouldAbort?: () => boolean
   /** 每次实际等待时回调，用于把等待写进日志。 */
@@ -150,17 +163,24 @@ export async function acquireBossAction(kind: BossActionKind, options: AcquireAc
   options.onWait?.(firstWaitMs)
   logger.info('动作闸门限速', { kind, waitMs: firstWaitMs })
   // 等待期间面板显示「BOSS 请求限速」，等完回到原来的阶段。
-  return withDeliveryWait(`BOSS 请求限速（${gateActionLabels[kind]}）`, firstWaitMs, async () => {
-    let nextWaitMs = firstWaitMs
-    for (;;) {
-      const waited = Date.now() - startedAt
-      if (waited >= maxGateWaitMs) throw new ActionGateTimeoutError(kind, waited)
-      await new Promise((resolve) => setTimeout(resolve, Math.min(pollStepMs, nextWaitMs)))
-      const claimed = await tryClaimOrAbort(kind, options)
-      if (claimed === true || claimed === false) return claimed
-      nextWaitMs = claimed
-    }
-  })
+  return withDeliveryWait(
+    options.waitLabel ?? `BOSS 请求限速（${gateActionLabels[kind]}）`,
+    firstWaitMs,
+    async () => {
+      let nextWaitMs = firstWaitMs
+      for (;;) {
+        const waited = Date.now() - startedAt
+        // Explicitly configured long intervals are planned waiting, not gate failures.
+        if (waited >= maxGateWaitMs + normalizedMinIntervalMs(options)) {
+          throw new ActionGateTimeoutError(kind, waited)
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(pollStepMs, nextWaitMs)))
+        const claimed = await tryClaimOrAbort(kind, options)
+        if (claimed === true || claimed === false) return claimed
+        nextWaitMs = claimed
+      }
+    },
+  )
 }
 
 const gateActionLabels: Record<BossActionKind, string> = {
@@ -174,8 +194,12 @@ const gateActionLabels: Record<BossActionKind, string> = {
 /** 拿到名额返回 true，用户停止返回 false，否则返回还要等多久。 */
 async function tryClaimOrAbort(kind: BossActionKind, options: AcquireActionOptions) {
   if (options.shouldAbort?.() === true) return false
-  const waitMs = await tryClaim(kind, Date.now())
+  const waitMs = await tryClaim(kind, normalizedMinIntervalMs(options))
   return waitMs === 0 ? true : waitMs
+}
+
+function normalizedMinIntervalMs(options: AcquireActionOptions) {
+  return Number.isFinite(options.minIntervalMs) ? Math.max(0, options.minIntervalMs!) : 0
 }
 
 /**

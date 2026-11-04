@@ -124,6 +124,7 @@ export function createDefaultProfile(): PersonalProfileConfig {
 
 export function createDefaultAiTasks(): AiTaskConfig {
   return {
+    customGreeting: { enabled: false, value: '' },
     resumeExtraction: {
       modelId: null,
     },

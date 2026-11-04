@@ -557,9 +557,9 @@ describe('useApplying handles greeting flow', () => {
     expect(ctx.greetingSend).toMatchObject({ ok: true, type: 'ai', messageCount: 3 })
   })
 
-  it('sends zero text when AI greeting is disabled even if legacy custom text is enabled', async () => {
+  it('sends zero text when both greeting modes are disabled', async () => {
     confState.formData.aiGreeting.enable = false
-    confState.formData.customGreeting.enable = true
+    confState.formData.customGreeting.enable = false
     confState.formData.customGreeting.value = '不应发送的旧话术'
     const ctx = createCtx()
     const greetingStep = handles().greeting() as { after: Handler }
@@ -1434,6 +1434,9 @@ describe('useApplying handles greeting flow', () => {
     const ctx = createCtx()
     ctx.aiGreetingMessages = ['您好']
     ctx.greetingSend = { ok: false, type: 'custom' }
+    ctx.message = '您好'
+    confState.formData.aiGreeting.enable = false
+    confState.formData.customGreeting.enable = true
     const continuation = handles().retryGreeting({ data: ctx.listData }, ctx)
     const continuationError = continuation.catch((error) => error)
     for (let index = 0; index < 10 && getPendingGreetingMock.mock.calls.length === 0; index++) {

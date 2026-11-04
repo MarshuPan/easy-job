@@ -22,8 +22,7 @@ export const formInfoData: FormInfoData = {
   },
   customGreeting: {
     label: '自定义招呼语',
-    'data-help':
-      '因为boss不支持将自定义的招呼语设置为默认招呼语。开启表示发送boss默认的招呼语后还会发送自定义招呼语',
+    'data-help': '使用固定原文发送一条消息，与 AI 招呼语互斥；启用 AI 匹配时先筛选再发送。',
   },
   activityFilter: {
     label: '活跃度过滤',
@@ -59,8 +58,7 @@ export const formInfoData: FormInfoData = {
   },
   aiGreeting: {
     label: 'AI招呼语',
-    'data-help':
-      '即使前面招呼语开了也不会发送，只会发送AI生成的招呼语，让gpt来打招呼真是太棒了，毕竟开场白很重要。',
+    'data-help': '根据完整 JD 与简历事实生成招呼语，与自定义招呼语互斥。',
     example: [
       `请根据岗位 JD 和候选人简历，生成 Boss 直聘开场招呼语。
 
@@ -155,12 +153,12 @@ export const formInfoData: FormInfoData = {
   },
   delay: {
     deliveryInterval: {
-      label: '单JD典型耗时',
+      label: '投递最低间隔',
       'data-help':
-        '单个岗位的典型总耗时，一半的岗位比它快。AI分析和招呼语生成时间会计入。实际节奏还会随会话时长变化：刚开工更快，跑久了变慢。',
+        '单个岗位的最低处理耗时和相邻建联请求的最短间隔。AI 分析、生成和详情请求计入耗时，不足时在发送前补等；随机抖动和会话加速不能突破下限。',
     },
     deliveryIntervalMax: {
-      label: '单JD常见上限',
+      label: '单JD参考耗时',
       'data-help':
         '十次里大约九次不超过这个耗时。少数岗位会超出（真人也会偶尔在一个岗位上停很久），实际处理已经超过时不再额外等待。',
     },

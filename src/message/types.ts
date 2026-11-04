@@ -97,6 +97,7 @@ export interface BackgroundCounterApi {
   localDiagnosticAppend(event: LocalDiagnosticEventInput): Promise<boolean>
   configRuntime(uid: string): Promise<PublicRuntimeConfig>
   configAiTasksSave(tasks: {
+    customGreeting?: { enabled?: boolean; value?: string }
     aiFiltering?: { enabled?: boolean; score?: number }
     aiGreeting?: {
       enabled?: boolean
@@ -106,6 +107,7 @@ export interface BackgroundCounterApi {
     }
   }): Promise<import('@/background/configService').PublicConfigReadiness>
   configAiGreetingDisable(): Promise<import('@/background/configService').PublicConfigReadiness>
+  configGreetingDisable(type: 'ai' | 'custom'): Promise<PublicConfigReadiness>
   configRuntimeSave(
     uid: string,
     formData: unknown,
@@ -132,6 +134,7 @@ export interface ContentCounterApi extends Pick<
   | 'configRuntimeSave'
   | 'configAiTasksSave'
   | 'configAiGreetingDisable'
+  | 'configGreetingDisable'
   | 'deliveryTaskRead'
   | 'deliveryTaskStart'
   | 'deliveryTaskClaim'

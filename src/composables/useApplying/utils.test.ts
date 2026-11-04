@@ -166,6 +166,22 @@ describe('sendPublishReq publish phase', () => {
     window.Cookie = { get: vi.fn(() => 'bst-token') } as any
   })
 
+  it('keeps the request unsent when stopped during the minimum interval wait', async () => {
+    const permission = createDeferred<boolean>()
+    vi.mocked(acquireBossAction).mockReturnValueOnce(permission.promise)
+    const { ctx, data } = createPublishContext()
+    const request = sendPublishReq(data, undefined, 3, {}, ctx, {
+      limitConfirmationAttempted: false,
+      minIntervalMs: 30_000,
+    })
+    expect(ctx.publish).toEqual({ ok: false, attempts: 1 })
+    expect(axiosMock).not.toHaveBeenCalled()
+    permission.resolve(false)
+    await expect(request).rejects.toBeInstanceOf(DeliveryStoppedError)
+    expect(ctx.publish.phase).toBeUndefined()
+    expect(axiosMock).not.toHaveBeenCalled()
+  })
+
   it('marks a dispatched request sent until its response confirms the result', async () => {
     const response = createDeferred<any>()
     axiosMock.mockReturnValueOnce(response.promise)
@@ -173,6 +189,7 @@ describe('sendPublishReq publish phase', () => {
 
     const request = sendPublishReq(data, undefined, 3, {}, ctx)
 
+    await vi.waitFor(() => expect(axiosMock).toHaveBeenCalled())
     expect(ctx.publish).toMatchObject({ attempts: 1, phase: 'sent' })
     expect(axiosMock).toHaveBeenCalledWith(expect.objectContaining({ timeout: 15_000 }))
 
@@ -199,6 +216,7 @@ describe('sendPublishReq publish phase', () => {
     const { ctx, data } = createPublishContext()
 
     const request = sendPublishReq(data, undefined, 3, {}, ctx)
+    await vi.waitFor(() => expect(axiosMock).toHaveBeenCalled())
     expect(ctx.publish).toMatchObject({ attempts: 1, phase: 'sent' })
     response.reject(networkError)
     await expect(request).rejects.toBe(networkError)
@@ -268,7 +286,9 @@ describe('sendPublishReq publish phase', () => {
         },
       },
     })
-    vi.mocked(acquireBossAction).mockRejectedValueOnce(new DeliveryStoppedError('用户已停止投递'))
+    vi.mocked(acquireBossAction)
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(new DeliveryStoppedError('用户已停止投递'))
     const { ctx, data } = createPublishContext()
 
     await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toBeInstanceOf(
@@ -288,7 +308,9 @@ describe('sendPublishReq publish phase', () => {
         },
       },
     })
-    vi.mocked(acquireBossAction).mockRejectedValueOnce(new GateTimeoutError('publish', 15 * 60_000))
+    vi.mocked(acquireBossAction)
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce(new GateTimeoutError('publish', 15 * 60_000))
     const { ctx, data } = createPublishContext()
 
     await expect(sendPublishReq(data, undefined, 3, {}, ctx)).rejects.toBeInstanceOf(

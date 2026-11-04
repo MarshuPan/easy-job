@@ -119,7 +119,7 @@ describe('pending greeting account scope', () => {
     storageReadBarrier.remainingReads = 0
     configRuntimeMock.mockReset().mockResolvedValue({
       accountInitialized: true,
-      formData: { aiGreeting: { enable: true } },
+      formData: { aiGreeting: { enable: false }, customGreeting: { enable: true, value: '您好' } },
     })
     loggerError.mockReset()
     storageGetMock.mockReset().mockImplementation(async (key: string, fallback?: unknown) => {
@@ -157,6 +157,25 @@ describe('pending greeting account scope', () => {
     expect(results).toEqual([])
     expect(sendMessage).not.toHaveBeenCalled()
     expect(storageData.get(pendingGreetingKey)).toEqual([pending])
+  })
+
+  it('sends custom text with AI disabled and cancels queued AI text after a mode switch', async () => {
+    vi.resetModules()
+    const queue = await import('./pendingGreeting')
+    const ai = { ...pendingGreeting('account-b', 'stale-ai'), type: 'ai' as const }
+    const custom = { ...pendingGreeting('account-b', 'fixed'), content: '固定\n原文' }
+    storageData.set(pendingGreetingKey, [ai, custom])
+    await queue.consumePendingGreetings('account-b')
+    vi.advanceTimersByTime(7_000)
+    await queue.consumePendingGreetings('account-b')
+    vi.advanceTimersByTime(6_000)
+    await queue.consumePendingGreetings('account-b')
+    expect(sendMessage).toHaveBeenCalledOnce()
+    expect(sendMessage).toHaveBeenCalledWith(expect.objectContaining({ content: '固定\n原文' }))
+    expect(await queue.getPendingGreeting(ai.id, 'account-b')).toMatchObject({
+      status: { stage: 'cancelled' },
+    })
+    expect(await queue.getPendingGreeting(custom.id, 'account-b')).toBeUndefined()
   })
 
   it('does not read or remove a pending greeting when its UID does not match', async () => {
@@ -293,7 +312,7 @@ describe('pending greeting account scope', () => {
     ])
   })
 
-  it('cancels the active account queue without sending when AI greeting is disabled', async () => {
+  it('cancels only queued text of the disabled mode while retaining other accounts', async () => {
     const accountAFirst = pendingGreeting('account-a', 'pending-a-1')
     const accountB = pendingGreeting('account-b', 'pending-b')
     const accountASecond = pendingGreeting('account-a', 'pending-a-2')
@@ -309,12 +328,12 @@ describe('pending greeting account scope', () => {
       {
         id: accountAFirst.id,
         ok: false,
-        error: 'AI招呼语已关闭，已取消待发送文本',
+        error: '自定义招呼语已关闭，已取消待发送文本',
       },
       {
         id: accountASecond.id,
         ok: false,
-        error: 'AI招呼语已关闭，已取消待发送文本',
+        error: '自定义招呼语已关闭，已取消待发送文本',
       },
     ])
 

@@ -56,6 +56,7 @@ export interface PublicConfigReadiness {
   resumeStatus?: 'empty' | 'ready' | 'error'
   aiFilteringReady: boolean
   aiGreetingReady: boolean
+  customGreetingReady?: boolean
 }
 
 export interface PublicRuntimeConfig {
@@ -127,6 +128,8 @@ function createReadiness(state: StoredConfigStateV1): PublicConfigReadiness {
     aiGreetingReady:
       !state.tasks.aiGreeting.enabled ||
       (greetingModelReady && greetingProfileReady && resumeReady),
+    customGreetingReady:
+      !state.tasks.customGreeting.enabled || Boolean(state.tasks.customGreeting.value.trim()),
   }
 }
 
@@ -261,12 +264,17 @@ export class ConfigService {
     // 不再需要靠比较整份配置来判断本次改动是否只动了那一个字段。
     if (await this.isConfigMutationBlocked(uid)) throw new ConfigMutationRunningError()
     return this.mutate((state) => {
+      const legacyGreeting =
+        state.accountSettings[uid]?.delivery.customGreeting ??
+        createDefaultDeliverySettings().delivery.customGreeting
       state.accountSettings[uid] = canonicalizeDeliveryFeatureAvailability(
         migrateLegacyFormDataToSettings(projected, {
           appearance: state.accountSettings[uid]?.appearance,
           expectations: parsePublicExpectations(expectations),
         }),
       )
+      // Greeting settings are global. An older account form cannot overwrite them.
+      state.accountSettings[uid].delivery.customGreeting = jsonClone(legacyGreeting)
       return createReadiness({ ...state, configRevision: state.configRevision + 1 })
     })
   }
@@ -276,6 +284,7 @@ export class ConfigService {
    * 账号级运行配置保存——混在一起会让新账号的首次保存静默丢掉 AI 设置。
    */
   async saveAiTasks(value: {
+    customGreeting?: { enabled?: boolean; value?: string }
     aiFiltering?: { enabled?: boolean; score?: number }
     aiGreeting?: {
       enabled?: boolean
@@ -288,6 +297,16 @@ export class ConfigService {
     return this.mutate((state) => {
       const filtering = value.aiFiltering ?? {}
       const greeting = value.aiGreeting ?? {}
+      const custom = value.customGreeting ?? {}
+      if (greeting.enabled === true && custom.enabled === true) {
+        throw new ConfigValidationError([
+          { path: '$.tasks.customGreeting', message: 'AI 招呼语与自定义招呼语不能同时开启' },
+        ])
+      }
+      if (typeof custom.enabled === 'boolean') state.tasks.customGreeting.enabled = custom.enabled
+      if (typeof custom.value === 'string') state.tasks.customGreeting.value = custom.value
+      if (custom.enabled === true) state.tasks.aiGreeting.enabled = false
+      if (greeting.enabled === true) state.tasks.customGreeting.enabled = false
       if (typeof filtering.enabled === 'boolean') {
         state.tasks.aiFiltering.enabled = filtering.enabled
       }
@@ -335,8 +354,15 @@ export class ConfigService {
    * 它是唯一允许在投递运行期间写入配置的操作，且只能改这一个字段。
    */
   async disableAiGreeting() {
+    return this.disableGreeting('ai')
+  }
+
+  async disableGreeting(type: 'ai' | 'custom') {
+    if (type !== 'ai' && type !== 'custom') {
+      throw new ConfigValidationError([{ path: '$.type', message: '无效的招呼语类型' }])
+    }
     return this.mutate((state) => {
-      state.tasks.aiGreeting.enabled = false
+      state.tasks[type === 'ai' ? 'aiGreeting' : 'customGreeting'].enabled = false
       return createReadiness({ ...state, configRevision: state.configRevision + 1 })
     })
   }

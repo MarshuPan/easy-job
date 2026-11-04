@@ -194,4 +194,11 @@ describe('pruneEvents', () => {
     const fresh = events('detail', 1000)
     expect(pruneEvents([...old, ...fresh], now)).toEqual(fresh)
   })
+
+  it('retains the last request of each kind for intervals longer than a rate window', () => {
+    const olderPublish = { kind: 'publish', at: now - 3 * getMaxWindowMs() } as const
+    const lastPublish = { kind: 'publish', at: now - 2 * getMaxWindowMs() } as const
+    const fresh = events('detail', 1000)
+    expect(pruneEvents([olderPublish, lastPublish, ...fresh], now)).toEqual([lastPublish, ...fresh])
+  })
 })

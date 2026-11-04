@@ -21,6 +21,7 @@ export interface DeliveryConfigSnapshot {
   pipeline: {
     aiFiltering: boolean
     aiGreeting: boolean
+    customGreeting: boolean
   }
 }
 
@@ -69,6 +70,7 @@ export function buildDeliveryConfigSnapshot(
   // clone. Delivery configuration is JSON-backed, so serialize it into plain
   // data before the snapshot crosses the extension message boundary.
   const runtimeFormData = jsonClone(formData) as FormData
+  runtimeFormData.customGreeting ??= { enable: false, value: '' }
   // Older configurations do not have the public source selector yet. Keep
   // their historical behavior (both sources available) in the durable task
   // instead of registering a snapshot that cannot be parsed on resume.
@@ -103,6 +105,7 @@ export function buildDeliveryConfigSnapshot(
     pipeline: {
       aiFiltering: Boolean(formData.aiFiltering?.enable),
       aiGreeting: Boolean(formData.aiGreeting?.enable),
+      customGreeting: Boolean(runtimeFormData.customGreeting.enable),
     },
   }
 }
@@ -114,8 +117,12 @@ export function parseDeliveryConfigSnapshot(value: unknown): DeliveryConfigSnaps
   if (typeof value.configFingerprint !== 'string' || value.configFingerprint.length === 0) {
     return null
   }
-  if (!isRuntimeFormData(value.formData)) return null
-  if (!isRecord(value.sources) || !isRecord(value.weights) || !isRecord(value.pipeline)) {
+  if (
+    !isRecord(value.formData) ||
+    !isRecord(value.sources) ||
+    !isRecord(value.weights) ||
+    !isRecord(value.pipeline)
+  ) {
     return null
   }
   if (
@@ -130,9 +137,30 @@ export function parseDeliveryConfigSnapshot(value: unknown): DeliveryConfigSnaps
   ) {
     return null
   }
+  const hasCustomGreeting = Object.hasOwn(value.pipeline, 'customGreeting')
+  if (hasCustomGreeting && typeof value.pipeline.customGreeting !== 'boolean') return null
+
+  const snapshot = structuredClone(value)
+  const formData = snapshot.formData as Record<string, unknown>
+  const pipeline = snapshot.pipeline as Record<string, unknown>
+  // Older tasks stored an unused account-level field with the same name.
+  // Only snapshots with the new pipeline marker may execute fixed text.
+  if (!hasCustomGreeting) {
+    formData.customGreeting = {
+      enable: false,
+      value:
+        isRecord(formData.customGreeting) && typeof formData.customGreeting.value === 'string'
+          ? formData.customGreeting.value
+          : '',
+    }
+    pipeline.customGreeting = false
+  }
+  if (!isRuntimeFormData(formData) || pipeline.customGreeting !== formData.customGreeting.enable) {
+    return null
+  }
   // 运行期间必须使用同一份配置版本（当前产品契约 §3）。冻结让「就地改写快照」
   // 变成一个立即失败的错误，而不是一处静默的配置漂移。
-  return deepFreeze(structuredClone(value) as unknown as DeliveryConfigSnapshot)
+  return deepFreeze(snapshot as unknown as DeliveryConfigSnapshot)
 }
 
 function deepFreeze<T>(value: T): T {
@@ -150,6 +178,10 @@ function isRuntimeFormData(value: unknown): value is FormData {
     isRecord(value.deliveryLimit) &&
     isRecord(value.aiFiltering) &&
     isRecord(value.aiGreeting) &&
+    isRecord(value.customGreeting) &&
+    typeof value.customGreeting.enable === 'boolean' &&
+    typeof value.customGreeting.value === 'string' &&
+    !(value.customGreeting.enable && value.aiGreeting.enable) &&
     isRecord(value.delay)
   )
 }

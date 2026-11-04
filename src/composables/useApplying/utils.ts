@@ -17,6 +17,7 @@ import { AgentMessage } from '@/ui/instrument'
 import { ActionGateTimeoutError } from '@/utils/actionGate'
 import { acquireBossAction } from '@/utils/actionGateStore'
 import { parseFilteringDecisionContent } from '@/utils/aiGreetingDraft'
+import { assertBossSecurityCheckClear } from '@/utils/bossPageState'
 import { logger } from '@/utils/logger'
 import { parseGptJson } from '@/utils/parse'
 
@@ -25,6 +26,7 @@ type PublishState = NonNullable<logData['publish']> & { phase?: PublishPhase }
 type PublishControl = {
   limitConfirmationAttempted: boolean
   shouldAbort?: () => boolean
+  minIntervalMs?: number
 }
 const publishRequestTimeoutMs = 15_000
 
@@ -92,6 +94,23 @@ export async function sendPublishReq(
     AgentMessage.error('页面状态已失效，请刷新后重试')
     throw new PageSessionUnavailableError('没有获取到 bst token，请刷新 BOSS 页面后继续')
   }
+  // Claim at the actual request boundary, including the cid=1 retry. Waiting
+  // for permission must not be recorded as an already dispatched request.
+  const acquired = await acquireBossAction('publish', {
+    shouldAbort: state.shouldAbort,
+    minIntervalMs: state.minIntervalMs,
+    waitLabel: '投递间隔保护（建立沟通前）',
+    onWait: (waitMs) =>
+      addLogTrace(ctx, '投递节奏', 'info', '等待满足建联请求间隔', {
+        phase: 'before-publish',
+        minIntervalMs: state.minIntervalMs ?? 0,
+        waitMs,
+      }),
+  })
+  if (!acquired || state.shouldAbort?.()) {
+    throw new DeliveryStoppedError('用户已停止投递，当前岗位未建立沟通')
+  }
+  assertBossSecurityCheckClear()
   addLogTrace(ctx, '投递接口', 'info', `第 ${attempt} 次发送投递请求`, {
     url,
     params,
@@ -130,7 +149,7 @@ export async function sendPublishReq(
         code: res.data.code,
         message: res.data.message,
       })
-      // 命中限额弹窗 → 立刻发送确认请求
+      // 限额弹窗确认和 cid=1 补发仍须经过动作闸门。
       const riskSignal = detectPlatformRisk(res.data)
       if (riskSignal === 'daily-limit-warning') {
         if (state.limitConfirmationAttempted) {
@@ -161,11 +180,10 @@ export async function sendPublishReq(
           addLogTrace(ctx, '投递接口', 'danger', `投递限制确认失败：${errorHandle(e)}`)
           throw new PublishError(`投递限制确认失败]${content}`)
         }
-        const acquired = await acquireBossAction('publish', { shouldAbort: state.shouldAbort })
-        if (!acquired) throw new DeliveryStoppedError('用户已停止投递，未继续确认额度后的投递')
         return sendPublishReq(data, undefined, retries, { cid: 1 }, ctx, {
           limitConfirmationAttempted: true,
           shouldAbort: state.shouldAbort,
+          minIntervalMs: state.minIntervalMs,
         })
       } else if (riskSignal === 'daily-limit-reached') {
         addLogTrace(ctx, '投递接口', 'danger', '命中 BOSS 150 位沟通上限')

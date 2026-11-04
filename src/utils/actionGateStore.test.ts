@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const storage = new Map<string, unknown>()
 const storageGet = vi.fn(async (key: string, fallback: unknown) =>
@@ -16,6 +16,7 @@ const { acquireBossAction, actionGateKey, countRecentBossActions, resetActionGat
 const { defaultGateRules } = await import('./actionGate')
 
 describe('acquireBossAction', () => {
+  afterEach(() => vi.useRealTimers())
   beforeEach(async () => {
     storage.clear()
     storageGet.mockClear()
@@ -53,6 +54,50 @@ describe('acquireBossAction', () => {
         expect.objectContaining({ kind: 'publish' }),
       ])
     })()
+  })
+
+  it('enforces a minimum gap even while the publish burst still has tokens', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2030-01-07T02:00:00Z'))
+    const startedAt = Date.now()
+    await acquireBossAction('publish', { minIntervalMs: 30_000 })
+    const onWait = vi.fn()
+    const pending = acquireBossAction('publish', { minIntervalMs: 30_000, onWait })
+    await vi.advanceTimersByTimeAsync(29_999)
+    expect(storage.get(actionGateKey) as unknown[]).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await pending).toBe(true)
+    expect(onWait).toHaveBeenCalledWith(30_000)
+    expect(storage.get(actionGateKey)).toEqual([
+      { kind: 'publish', at: startedAt },
+      { kind: 'publish', at: startedAt + 30_000 },
+    ])
+  })
+
+  it('honors another page history and only waits for the missing part', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2030-01-07T02:00:00Z'))
+    storage.set(actionGateKey, [{ kind: 'publish', at: Date.now() - 20_000 }])
+    const onWait = vi.fn()
+    const pending = acquireBossAction('publish', { minIntervalMs: 30_000, onWait })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(await pending).toBe(true)
+    expect(onWait).toHaveBeenCalledWith(10_000)
+  })
+
+  it('allows a configured long interval without treating it as a gate timeout', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2030-01-07T02:00:00Z'))
+    const startedAt = Date.now()
+    storage.set(actionGateKey, [{ kind: 'publish', at: startedAt - 3_600_000 - 1_000 }])
+    await acquireBossAction('detail')
+    const pending = acquireBossAction('publish', { minIntervalMs: 7_200_000 })
+    await vi.advanceTimersByTimeAsync(3_599_000)
+    expect(await pending).toBe(true)
+    const publishes = (storage.get(actionGateKey) as Array<{ kind: string; at: number }>).filter(
+      (e) => e.kind === 'publish',
+    )
+    expect(publishes.at(-1)?.at).toBe(startedAt + 3_599_000)
   })
 
   it('holds the caller once the burst is spent instead of letting the action out', async () => {

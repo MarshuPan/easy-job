@@ -16,6 +16,9 @@ const fixture = vi.hoisted(() => ({
   sequence: [] as string[],
   formData: undefined as any,
   aiDown: false,
+  modelDelayMs: 0,
+  publishTimes: [] as number[],
+  sendTimes: [] as number[],
   send: vi.fn(),
   http: vi.fn(),
   get: vi.fn(),
@@ -174,25 +177,37 @@ function detail(id: string, securityId: string) {
 
 async function finish<T>(operation: Promise<T>): Promise<T> {
   // Observe rejection before advancing timers; every wait is simulated locally.
-  const result = operation.then(
-    (value) => ({ value }),
-    (error) => ({ error }),
+  let settled: { value: T } | { error: unknown } | undefined
+  void operation.then(
+    (value) => {
+      settled = { value }
+    },
+    (error) => {
+      settled = { error }
+    },
   )
-  await vi.advanceTimersByTimeAsync(180_000)
-  const settled = await result
+  // Native promises can schedule timers after a one-shot clock advance ends.
+  for (let step = 0; settled == null && step < 300; step++) {
+    await vi.advanceTimersByTimeAsync(1_000)
+  }
+  if (settled == null)
+    throw new Error('Local workflow did not settle within five simulated minutes')
   if ('error' in settled) throw settled.error
   return settled.value
 }
 
-async function initialize() {
+async function initialize(options: { customText?: string; filtering?: boolean } = {}) {
+  const custom = options.customText !== undefined
+  const filtering = options.filtering ?? true
   const { defaultFormData } = await import('@/stores/conf/info')
   const { createDefaultStoredConfigState, createDefaultDeliverySettings } =
     await import('@/config/defaults')
   const { CONFIG_STORAGE_KEY } = await import('@/config/types')
   const form = copy(defaultFormData) as typeof defaultFormData
-  form.aiFiltering.enable = true
+  form.aiFiltering.enable = filtering
   form.aiFiltering.score = 60
-  form.aiGreeting.enable = true
+  form.aiGreeting.enable = !custom
+  form.customGreeting = { enable: custom, value: options.customText ?? '' }
   form.aiGreeting.messageCount = 3
   form.friendStatus.value = true
   form.sameCompanyFilter.value = true
@@ -238,15 +253,23 @@ async function initialize() {
   ]
   state.tasks.aiFiltering = {
     ...state.tasks.aiFiltering,
-    enabled: true,
+    enabled: filtering,
     modelId: 'fixture-model',
     score: 60,
   }
   state.tasks.aiGreeting = {
     ...state.tasks.aiGreeting,
-    enabled: true,
+    enabled: !custom,
     modelId: 'fixture-model',
     messageCount: 3,
+  }
+  state.tasks.customGreeting = { enabled: custom, value: options.customText ?? '' }
+  if (custom && !filtering) {
+    state.profile = createDefaultStoredConfigState().profile
+    state.models = []
+    state.tasks.resumeExtraction.modelId = null
+    state.tasks.aiFiltering.modelId = null
+    state.tasks.aiGreeting.modelId = null
   }
   state.accountSettings['10001'] = createDefaultDeliverySettings()
   fixture.storage.set(CONFIG_STORAGE_KEY, state)
@@ -313,6 +336,8 @@ describe('local simulation of the delivery workflow across internal boundaries',
       fixture.sequence.length =
         0
     fixture.aiDown = false
+    fixture.modelDelayMs = 0
+    fixture.publishTimes.length = fixture.sendTimes.length = 0
     const addListener = window.addEventListener.bind(window)
     vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
       fixture.windowListeners.push({ type, listener })
@@ -327,7 +352,10 @@ describe('local simulation of the delivery workflow across internal boundaries',
       GeekChatCore: undefined,
       ChatWebsocket: { send: fixture.send, client: { isConnected: () => true } },
     })
-    fixture.send.mockImplementation(() => fixture.sequence.push('text-send'))
+    fixture.send.mockImplementation(() => {
+      fixture.sequence.push('text-send')
+      fixture.sendTimes.push(Date.now())
+    })
     const script = document.createElement('script')
     script.setAttribute('data-agent-delivery-token', 'fixture-bridge')
     Object.defineProperty(document, 'currentScript', { configurable: true, value: script })
@@ -344,6 +372,7 @@ describe('local simulation of the delivery workflow across internal boundaries',
     fixture.http.mockImplementation(async (request) => {
       if (request.url.endsWith('/friend/add.json')) {
         fixture.sequence.push('publish')
+        fixture.publishTimes.push(Date.now())
         return { data: { code: 0, message: 'Success' } }
       }
       if (request.url.endsWith('/getBossData')) {
@@ -361,6 +390,9 @@ describe('local simulation of the delivery workflow across internal boundaries',
       vi.fn(async (_url, init) => {
         const body = JSON.parse(String(init?.body))
         fixture.modelBodies.push(body)
+        if (fixture.modelDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, fixture.modelDelayMs))
+        }
         if (fixture.aiDown)
           return new Response(
             JSON.stringify({
@@ -507,5 +539,306 @@ describe('local simulation of the delivery workflow across internal boundaries',
     expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
     expect(fixture.sequence.filter((step) => step === 'publish')).toHaveLength(1)
     expect(fixture.send).toHaveBeenCalledTimes(3)
+  })
+
+  it.each([false, true])(
+    'sends exact custom text through acquisition, filtering, contact and recording (AI filter: %s)',
+    async (filtering) => {
+      const text = '您好，我做过平台规划与交付。\n期待进一步交流。'
+      const { form, stats, pool, deliver, log } = await initialize({ customText: text, filtering })
+      const item = pool.listBySource('group')[0]
+      expect(await finish(deliver.jobListHandle([{ item, source: 'group' }], form))).toBe(
+        'completed',
+      )
+      expect(item.status.status).toBe('success')
+      expect(fixture.sequence).toEqual([
+        'detail',
+        ...(filtering ? ['match'] : []),
+        'publish',
+        'text-send',
+      ])
+      expect(fixture.aiRequests.map((request) => request.task)).toEqual(
+        filtering ? ['aiFiltering'] : [],
+      )
+      const { AwesomeMessage } = await import('@/composables/useWebSocket/type')
+      expect(
+        (
+          AwesomeMessage.decode(
+            fixture.send.mock.calls[0][0].msg,
+          ) as unknown as TechwolfChatProtocol
+        ).messages?.[0]?.body?.text,
+      ).toBe(text)
+      const record = log.data.value.find((entry) => entry.job?.encryptJobId === item.encryptJobId)!
+      expect(record.data?.message).toBe(text)
+      expect(record.data?.greetingSend).toMatchObject({
+        ok: true,
+        type: 'custom',
+        messageCount: 1,
+        messages: [{ ok: true, content: text }],
+      })
+      expect(record.data?.aiGreetingMeta).toBeUndefined()
+      expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+      await log.flush()
+      expect(fixture.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'greeting.generated',
+            data: expect.objectContaining({
+              greetingType: 'custom',
+              segments: [expect.objectContaining({ text })],
+            }),
+          }),
+          expect.objectContaining({
+            event: 'greeting.sent',
+            data: expect.objectContaining({ greetingType: 'custom', text }),
+          }),
+        ]),
+      )
+    },
+  )
+
+  it('filters below-threshold jobs before contact and custom text sending', async () => {
+    const { form, stats, pool, deliver } = await initialize({
+      customText: '您好，期待交流。',
+      filtering: true,
+    })
+    form.aiFiltering.score = 99
+    const item = pool.listBySource('group')[0]
+    await finish(deliver.jobListHandle([{ item, source: 'group' }], form))
+    expect(item.status.status).toBe('filtered')
+    expect(fixture.sequence).toEqual(['detail', 'match'])
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(stats.todayData).toMatchObject({ total: 1, success: 0, aiFiltering: 1 })
+  })
+
+  it('handles custom greetings in pool order without AI calls', async () => {
+    const { form, stats, pool, deliver } = await initialize({
+      customText: '您好，期待交流。',
+      filtering: false,
+    })
+    form.sameHrFilter.value = false
+    form.sameCompanyFilter.value = false
+    form.delay.deliveryInterval = 30
+    form.delay.deliveryIntervalMax = 30
+    fixture.pages.push(listJob('second-job', 'second-brand'))
+    await pool.initJobList(form)
+    pool.captureCurrentPageToDeliveryPool('group')
+    const items = pool.listBySource('group').map((item) => ({ item, source: 'group' as const }))
+    expect(items).toHaveLength(2)
+    expect(await finish(deliver.jobListHandle(items, form))).toBe('completed')
+    const processedIds = fixture.get.mock.calls.map(([, options]) =>
+      String(options.params.lid).replace('fixture-lid-', ''),
+    )
+    expect(processedIds).toEqual(items.map(({ item }) => item.encryptJobId))
+    expect(fixture.send).toHaveBeenCalledTimes(2)
+    expect(fixture.aiRequests).toHaveLength(0)
+    expect(fixture.publishTimes[1] - fixture.publishTimes[0]).toBeGreaterThanOrEqual(30_000)
+    expect(fixture.sendTimes[1] - fixture.sendTimes[0]).toBeGreaterThanOrEqual(30_000)
+    expect(stats.todayData).toMatchObject({ total: 2, success: 2 })
+  })
+
+  it.each([
+    { custom: true, filtering: false, modelDelayMs: 0, aiCalls: 0 },
+    { custom: true, filtering: true, modelDelayMs: 5_000, aiCalls: 1 },
+    { custom: false, filtering: false, modelDelayMs: 5_000, aiCalls: 1 },
+    { custom: false, filtering: true, modelDelayMs: 5_000, aiCalls: 2 },
+    { custom: true, filtering: true, modelDelayMs: 40_000, aiCalls: 1 },
+    { custom: false, filtering: false, modelDelayMs: 40_000, aiCalls: 1 },
+    { custom: false, filtering: true, modelDelayMs: 20_000, aiCalls: 2 },
+  ])(
+    'credits AI processing and only waits for the remaining job budget: %j',
+    async ({ custom, filtering, modelDelayMs, aiCalls }) => {
+      vi.spyOn(Math, 'random').mockReturnValue(0.5)
+      const { form, pool, deliver, stats, log } = await initialize({
+        customText: custom ? '您好，期待交流。' : undefined,
+        filtering,
+      })
+      form.delay.deliveryInterval = form.delay.deliveryIntervalMax = 30
+      fixture.modelDelayMs = modelDelayMs
+      const startedAt = Date.now()
+      const item = pool.listBySource('group')[0]
+
+      expect(await finish(deliver.jobListHandle([{ item, source: 'group' }], form))).toBe(
+        'completed',
+      )
+
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(fixture.publishTimes[0] - startedAt).toBeGreaterThanOrEqual(
+        Math.max(30_000, modelDelayMs * aiCalls),
+      )
+      expect(fixture.aiRequests).toHaveLength(aiCalls)
+      expect(item.status.status).toBe('success')
+      expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+      await log.flush()
+      const pace = fixture.diagnostics.find(
+        (event) =>
+          event.event === 'runtime.diagnostic' &&
+          event.data?.message === '投递节奏核对' &&
+          event.data?.detail?.phase === 'before-publish',
+      )?.data.detail
+      expect(pace).toBeDefined()
+      expect(pace.elapsedMs).toBeGreaterThanOrEqual(modelDelayMs * aiCalls)
+      expect(pace.targetDurationMs).toBe(30_000)
+      expect(pace.waitMs).toBe(Math.max(0, 30_000 - pace.elapsedMs))
+      expect(fixture.publishTimes[0] - startedAt).toBeGreaterThanOrEqual(
+        pace.elapsedMs + pace.waitMs,
+      )
+      expect(fixture.publishTimes[0] - startedAt).toBeLessThan(pace.elapsedMs + pace.waitMs + 1_000)
+      expect(fixture.diagnostics).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: 'runtime.diagnostic',
+            data: expect.objectContaining({
+              message: '投递节奏核对',
+              detail: expect.objectContaining({
+                phase: 'before-publish',
+                minimumIntervalMs: 30_000,
+                elapsedMs: pace.elapsedMs,
+                waitMs: pace.waitMs,
+              }),
+            }),
+          }),
+        ]),
+      )
+    },
+  )
+
+  it('keeps the next fast job separated after a slow AI job', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const { form, pool, deliver } = await initialize({
+      customText: '您好，期待交流。',
+      filtering: true,
+    })
+    form.sameHrFilter.value = form.sameCompanyFilter.value = false
+    form.delay.deliveryInterval = form.delay.deliveryIntervalMax = 30
+    fixture.modelDelayMs = 40_000
+    const http = fixture.http.getMockImplementation()!
+    fixture.http.mockImplementation(async (request) => {
+      const response = await http(request)
+      if (request.url.endsWith('/friend/add.json')) fixture.modelDelayMs = 0
+      return response
+    })
+    fixture.pages.push(listJob('fast-job', 'second-brand'))
+    await pool.initJobList(form)
+    pool.captureCurrentPageToDeliveryPool('group')
+    const items = pool.listBySource('group').map((item) => ({ item, source: 'group' as const }))
+
+    expect(await finish(deliver.jobListHandle(items, form))).toBe('completed')
+
+    expect(fixture.publishTimes).toHaveLength(2)
+    expect(fixture.publishTimes[1] - fixture.publishTimes[0]).toBe(30_000)
+    expect(fixture.sendTimes[1] - fixture.sendTimes[0]).toBe(30_000)
+  })
+
+  it('preserves the unsubmitted job when stopped during pacing and resumes it once', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const { form, pool, deliver, common, stats } = await initialize({
+      customText: '您好。',
+      filtering: false,
+    })
+    form.delay.deliveryInterval = form.delay.deliveryIntervalMax = 30
+    const item = pool.listBySource('group')[0]
+    const batch = [{ item, source: 'group' as const }]
+    const operation = deliver.jobListHandle(batch, form)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(fixture.publishTimes).toHaveLength(0)
+    common.deliverStop = true
+    expect(await finish(operation)).toBe('stopped')
+    expect(item.status.status).toBe('wait')
+    expect(stats.todayData).toMatchObject({ total: 0, success: 0 })
+    expect(fixture.send).not.toHaveBeenCalled()
+
+    common.deliverStop = false
+    expect(await finish(deliver.jobListHandle(batch, form))).toBe('completed')
+    expect(fixture.publishTimes).toHaveLength(1)
+    expect(fixture.send).toHaveBeenCalledOnce()
+    expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+  })
+
+  it('applies the same minimum interval to cid=1 after confirming the daily reminder', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0.5)
+    const { form, pool, deliver, stats } = await initialize({
+      customText: '您好。',
+      filtering: false,
+    })
+    form.delay.deliveryInterval = form.delay.deliveryIntervalMax = 30
+    const http = fixture.http.getMockImplementation()!
+    let reminded = false
+    fixture.http.mockImplementation(async (request) => {
+      if (request.url.endsWith('/chatremind.json')) return { data: { code: 0 } }
+      const response = await http(request)
+      if (request.url.endsWith('/friend/add.json') && !reminded) {
+        reminded = true
+        return {
+          data: {
+            code: 1,
+            zpData: {
+              bizData: {
+                chatRemindDialog: {
+                  ba: 'fixture-confirmation',
+                  content: '您今天已与120位BOSS沟通',
+                },
+              },
+            },
+          },
+        }
+      }
+      return response
+    })
+    const item = pool.listBySource('group')[0]
+
+    expect(await finish(deliver.jobListHandle([{ item, source: 'group' }], form))).toBe('completed')
+
+    expect(fixture.publishTimes).toHaveLength(2)
+    expect(fixture.publishTimes[1] - fixture.publishTimes[0]).toBeGreaterThanOrEqual(30_000)
+    expect(fixture.send).toHaveBeenCalledOnce()
+    expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+  })
+
+  it('rejects blank custom text before establishing contact or consuming quota', async () => {
+    const { form, stats, pool, deliver } = await initialize({
+      customText: ' \n ',
+      filtering: false,
+    })
+    const item = pool.listBySource('group')[0]
+    await finish(deliver.jobListHandle([{ item, source: 'group' }], form))
+    expect(fixture.sequence).not.toContain('publish')
+    expect(fixture.send).not.toHaveBeenCalled()
+    expect(stats.todayData.success).toBe(0)
+    expect(fixture.aiRequests).toHaveLength(0)
+  })
+
+  it('resumes the original fixed text after a stop following contact without duplicate contact or quota', async () => {
+    const text = '您好\n这是原始固定话术。'
+    const { form, stats, pool, deliver, common, log } = await initialize({
+      customText: text,
+      filtering: false,
+    })
+    const item = pool.listBySource('group')[0]
+    const http = fixture.http.getMockImplementation()!
+    fixture.http.mockImplementation(async (request) => {
+      const result = await http(request)
+      if (request.url.endsWith('/friend/add.json')) common.deliverStop = true
+      return result
+    })
+    expect(await finish(deliver.jobListHandle([{ item, source: 'group' }], form))).toBe('stopped')
+    expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+    expect(fixture.send).not.toHaveBeenCalled()
+    const record = log.data.value.find((entry) => entry.job?.encryptJobId === item.encryptJobId)!
+    expect(record.data).toMatchObject({ message: text, publish: { ok: true }, retryable: true })
+    form.customGreeting.value = '后来的话术不应替换原记录'
+    fixture.http.mockImplementation(http)
+    common.deliverStop = false
+    expect(await finish(deliver.jobListHandle([{ item, source: 'group' }], form))).toBe('completed')
+    expect(fixture.sequence.filter((step) => step === 'publish')).toHaveLength(1)
+    expect(fixture.send).toHaveBeenCalledOnce()
+    const { AwesomeMessage } = await import('@/composables/useWebSocket/type')
+    expect(
+      (AwesomeMessage.decode(fixture.send.mock.calls[0][0].msg) as unknown as TechwolfChatProtocol)
+        .messages?.[0]?.body?.text,
+    ).toBe(text)
+    expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+    await finish(deliver.jobListHandle([{ item, source: 'group' }], form))
+    expect(fixture.send).toHaveBeenCalledOnce()
   })
 })

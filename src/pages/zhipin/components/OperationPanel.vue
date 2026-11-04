@@ -11,6 +11,7 @@ import { DELIVERY_WORKER_LEASE_MS } from '@/background/deliveryTaskCoordinator'
 import { useCommon } from '@/composables/useCommon'
 import { useStatistics } from '@/composables/useStatistics'
 import { getRootVue } from '@/composables/useVue'
+import { getGreetingMode, getRuntimeGreetingMode } from '@/config/greetingMode'
 import { decideAcquisition, rankRefillSources } from '@/delivery/acquisition/decide'
 import { estimateSupplyPolicy, SupplyRefillSchedule } from '@/delivery/acquisition/supply'
 import {
@@ -209,8 +210,9 @@ const failureCategoryHintMap: Record<DeliveryFailureCategoryId, string> = {
 const operationPanelRuntimeStyleId = 'agent-delivery-operation-panel-runtime-style'
 const statisticsRefreshIntervalMs = 60_000
 // Keep critical panel layout in JS so overwrite-style extension updates cannot leave new DOM with stale scoped CSS.
-const aiGreetingStatus = computed(() =>
-  getExecutionFormData().aiGreeting.enable && conf.formData.aiGreeting.enable ? '已开启' : '未开启',
+const greetingMode = computed(() => getRuntimeGreetingMode(getExecutionFormData(), conf.formData))
+const greetingModeLabel = computed(
+  () => ({ ai: 'AI 招呼语', custom: '自定义话术', none: '不发送文本' })[greetingMode.value],
 )
 function getDeliveryQueueSnapshot() {
   void jobList.deliveryQueueRevision
@@ -461,7 +463,7 @@ const compactStatusItems = computed(() =>
     sourcePoolCompositionText.value,
     listRefreshesLastHour.value == null ? '' : `列表刷新 ${listRefreshesLastHour.value} 次/小时`,
     `AI 筛选 ${getExecutionFormData().aiFiltering.enable ? `≥ ${getExecutionFormData().aiFiltering.score}%` : '未开启'}`,
-    `招呼语${getExecutionFormData().aiGreeting.enable && conf.formData.aiGreeting.enable ? '开启' : '关闭'}`,
+    greetingModeLabel.value,
     `节奏 ${deliveryPaceText.value}`,
     `批休 ${batchRestText.value}`,
     `去重 ${dedupeStatus.value}`,
@@ -513,8 +515,8 @@ const taskSequence = computed(() => {
     },
     {
       number: '03',
-      label: '生成招呼语',
-      description: describe('03', `AI 招呼语${aiGreetingStatus.value}`),
+      label: greetingMode.value === 'custom' ? '准备固定话术' : '生成招呼语',
+      description: describe('03', greetingModeLabel.value),
       state: stepState('03'),
     },
     {
@@ -3294,6 +3296,10 @@ async function ensureEnabledAiTasksReady() {
   }
   try {
     const runtime = await counter.configRuntime(String(uid))
+    if (getGreetingMode(conf.formData) === 'custom' && !conf.formData.customGreeting.value.trim()) {
+      AgentMessage.error('请先填写自定义招呼语')
+      return null
+    }
     if (conf.formData.aiFiltering.enable && !runtime.readiness.aiFilteringReady) {
       AgentMessage.error('AI 匹配未就绪，请先配置模型并解析简历')
       return null

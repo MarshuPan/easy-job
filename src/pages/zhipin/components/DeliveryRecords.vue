@@ -551,6 +551,7 @@ function buildExportRow(row: Extract<DeliveryRow, { kind: 'record' }>) {
       description: job.card?.postDescription ?? '',
     },
     greeting: formatGreetingText(data),
+    greetingType: data?.greetingSend?.type ?? 'none',
     // 这条招呼语对准的 JD 需求，复盘时对照 JD 看选得对不对。
     ...(data?.aiGreetingMeta?.anchor ? { greetingAnchor: data.aiGreetingMeta.anchor } : {}),
     ...(data?.aiGreetingMeta?.usedFactIds?.length

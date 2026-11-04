@@ -10,6 +10,7 @@ import {
   removePendingGreeting,
 } from '@/composables/useWebSocket/pendingGreeting'
 import { COMMUTE_FEATURE_AVAILABLE, DEFAULT_AI_FILTERING_SCORE } from '@/config/defaults'
+import { getGreetingMode, getRuntimeGreetingMode } from '@/config/greetingMode'
 import { counter, runBackgroundAiTask } from '@/message'
 import { useConf } from '@/stores/conf'
 import { reportDeliveryStage } from '@/stores/deliveryActivity'
@@ -91,10 +92,10 @@ const pendingGreetingExpirySafetyMs = 10_000
 const sameCompanyStorageMutex = createStorageMutex('agent-delivery:same-company')
 type GreetingSendRecord = NonNullable<NonNullable<logData['greetingSend']>['messages']>[number]
 
-class AiGreetingDisabledError extends Error {
-  constructor() {
-    super('AI招呼语已关闭，已取消待发送文本')
-    this.name = 'AiGreetingDisabledError'
+class GreetingDisabledError extends Error {
+  constructor(type: 'ai' | 'custom') {
+    super(`${type === 'ai' ? 'AI' : '自定义'}招呼语已关闭，已取消待发送文本`)
+    this.name = 'GreetingDisabledError'
   }
 }
 
@@ -161,16 +162,21 @@ export function handles(runtimeFormData?: FormData) {
       resumeEvidenceVersion: ctx.aiGreetingMeta?.resumeEvidenceVersion,
       resumeSourceHash: ctx.aiGreetingMeta?.resumeSourceHash,
       promptFingerprint:
-        ctx.aiGreetingMeta?.promptFingerprint ??
-        (typeof conf.formData.aiGreeting.prompt === 'string' &&
-        conf.formData.aiGreeting.prompt.trim()
-          ? fingerprintGreeting([conf.formData.aiGreeting.prompt])
-          : undefined),
+        getGreetingMode(conf.formData) === 'ai'
+          ? (ctx.aiGreetingMeta?.promptFingerprint ??
+            (typeof conf.formData.aiGreeting.prompt === 'string' &&
+            conf.formData.aiGreeting.prompt.trim()
+              ? fingerprintGreeting([conf.formData.aiGreeting.prompt])
+              : undefined))
+          : undefined,
     }
   }
 
-  const isAiGreetingRuntimeEnabled = () =>
-    conf.formData.aiGreeting.enable && liveConf.formData.aiGreeting.enable
+  const runtimeGreetingMode = () => getRuntimeGreetingMode(conf.formData, liveConf.formData)
+
+  function assertGreetingEnabled(type: 'ai' | 'custom') {
+    if (runtimeGreetingMode() !== type) throw new GreetingDisabledError(type)
+  }
 
   function resolveCommuteOrigin() {
     const origin = conf.formData.amap.origins.trim()
@@ -601,7 +607,7 @@ export function handles(runtimeFormData?: FormData) {
     ctx.greetingSend = {
       ...(ctx.greetingSend ?? {
         ok: false,
-        type: 'ai',
+        type: getGreetingMode(conf.formData),
       }),
       ok: false,
       error: message,
@@ -700,7 +706,10 @@ export function handles(runtimeFormData?: FormData) {
     assertDeliveryNotStopped()
   }
 
-  function markAiGreetingDisabled(ctx: logData, records: GreetingSendRecord[] = []) {
+  function markGreetingDisabled(ctx: logData, records: GreetingSendRecord[] = []) {
+    const type =
+      ctx.greetingSend?.type === 'custom' || conf.formData.customGreeting?.enable ? 'custom' : 'ai'
+    const label = type === 'custom' ? '自定义' : 'AI'
     const sentRecords = records.filter((item) => item.ok)
     const sentLength = sentRecords.reduce((total, item) => total + item.contentLength, 0)
     ctx.message = undefined
@@ -708,7 +717,7 @@ export function handles(runtimeFormData?: FormData) {
     ctx.aiGreetingMeta = undefined
     ctx.greetingSend = {
       ok: true,
-      type: sentRecords.length > 0 ? 'ai' : 'none',
+      type: sentRecords.length > 0 ? type : 'none',
       contentLength: sentLength,
       messageCount: sentRecords.length,
       messages: records,
@@ -718,8 +727,8 @@ export function handles(runtimeFormData?: FormData) {
       '招呼语发送',
       sentRecords.length > 0 ? 'warning' : 'success',
       sentRecords.length > 0
-        ? `AI招呼语已关闭，已停止剩余文本；关闭前已发送 ${sentRecords.length} 条`
-        : 'AI招呼语已关闭，本次不发送文本',
+        ? `${label}招呼语已关闭，已停止剩余文本；关闭前已发送 ${sentRecords.length} 条`
+        : `${label}招呼语已关闭，本次不发送文本`,
       {
         cancelled: true,
         sentCount: sentRecords.length,
@@ -746,6 +755,7 @@ export function handles(runtimeFormData?: FormData) {
     }
     assertDeliveryNotStopped()
     assertCurrentGreetingUid(uid)
+    assertGreetingEnabled(type)
     try {
       const buf = new Message(messageArgs)
       const channel = buf.send()
@@ -811,7 +821,7 @@ export function handles(runtimeFormData?: FormData) {
     assertCurrentGreetingUid(uid)
     if (queuedResult.cancelled) {
       await removePendingGreeting(pending.id, uid)
-      throw new AiGreetingDisabledError()
+      throw new GreetingDisabledError(type)
     }
     if (queuedResult.ok) {
       ctx.greetingSend = {
@@ -928,7 +938,7 @@ export function handles(runtimeFormData?: FormData) {
     let domResult: Awaited<ReturnType<typeof sendGreetingByDom>>
     try {
       assertCurrentGreetingUid(uid)
-      domResult = await sendGreetingByDom(content, uid)
+      domResult = await sendGreetingByDom(content, uid, type)
       assertCurrentGreetingUid(uid)
     } catch (e) {
       assertCurrentGreetingUid(uid)
@@ -963,7 +973,8 @@ export function handles(runtimeFormData?: FormData) {
         anchor: ctx.aiGreetingMeta?.anchor,
         review: ctx.aiGreetingMeta?.review,
         audit: ctx.aiGreetingMeta?.audit,
-        fingerprint: ctx.aiGreetingMeta?.fingerprint,
+        fingerprint:
+          type === 'custom' ? fingerprintGreeting(messages) : ctx.aiGreetingMeta?.fingerprint,
       })
     }
     const sendRecords: GreetingSendRecord[] = []
@@ -979,8 +990,8 @@ export function handles(runtimeFormData?: FormData) {
 
     const chatPageState = { prepared: false }
     for (const [index, content] of messages.entries()) {
-      if (type === 'ai' && !isAiGreetingRuntimeEnabled()) {
-        markAiGreetingDisabled(ctx, sendRecords)
+      if (runtimeGreetingMode() !== type) {
+        markGreetingDisabled(ctx, sendRecords)
         return { cancelled: true, records: sendRecords }
       }
       try {
@@ -1036,8 +1047,8 @@ export function handles(runtimeFormData?: FormData) {
           })
         }
       } catch (e) {
-        if (e instanceof AiGreetingDisabledError) {
-          markAiGreetingDisabled(ctx, sendRecords)
+        if (e instanceof GreetingDisabledError) {
+          markGreetingDisabled(ctx, sendRecords)
           return { cancelled: true, records: sendRecords }
         }
         sendRecords.push({
@@ -1327,6 +1338,7 @@ export function handles(runtimeFormData?: FormData) {
   async function sendGreetingByDom(
     content: string,
     expectedUid: string | number,
+    type: 'ai' | 'custom',
   ): Promise<{
     channel: 'DOM'
     detail: Record<string, unknown>
@@ -1350,6 +1362,7 @@ export function handles(runtimeFormData?: FormData) {
     const sendButton = await waitForSendButton(2500)
     assertDeliveryNotStopped()
     assertCurrentGreetingUid(expectedUid)
+    assertGreetingEnabled(type)
     detail.sendButtonFound = sendButton != null
     detail.sendButtonText = sendButton?.textContent?.trim()
 
@@ -1483,7 +1496,7 @@ export function handles(runtimeFormData?: FormData) {
     })
   }
 
-  const aiGreeting: StepFactory = () => {
+  const greeting: StepFactory = () => {
     return {
       // 契约 §6：先生成招呼语，再建立沟通。生成失败时沟通还没建立、额度还没花，
       // 不会留下「已建立沟通但没有招呼语」的记录。
@@ -1491,7 +1504,12 @@ export function handles(runtimeFormData?: FormData) {
         ctx.aiGreetingMessages = undefined
         ctx.aiGreetingMeta = undefined
         ctx.message = undefined
-        if (!isAiGreetingRuntimeEnabled()) return
+        const mode = runtimeGreetingMode()
+        if (mode === 'none') return
+        if (mode === 'custom') {
+          prepareCustomGreeting(ctx)
+          return
+        }
         try {
           await generateAiGreetingMessages(ctx)
         } catch (e) {
@@ -1500,36 +1518,40 @@ export function handles(runtimeFormData?: FormData) {
       },
       after: async (args, ctx) => {
         try {
-          if (!isAiGreetingRuntimeEnabled()) {
-            markAiGreetingDisabled(ctx)
+          const mode = runtimeGreetingMode()
+          if (mode === 'none') {
+            markGreetingDisabled(ctx)
             return
           }
           const uid = useUser().getUserId()
           if (uid == null) {
             throw new GreetError('没有获取到uid')
           }
-          await ensureBossDataForGreeting(ctx, 'AI招呼语')
-          if (!isAiGreetingRuntimeEnabled()) {
-            markAiGreetingDisabled(ctx)
+          await ensureBossDataForGreeting(ctx, mode === 'ai' ? 'AI招呼语' : '自定义招呼语')
+          if (runtimeGreetingMode() !== mode) {
+            markGreetingDisabled(ctx)
             return
           }
-          const greetingMessages = ctx.aiGreetingMessages?.length
-            ? ctx.aiGreetingMessages
-            : await generateAiGreetingMessages(ctx)
+          const greetingMessages =
+            mode === 'custom'
+              ? prepareCustomGreeting(ctx)
+              : ctx.aiGreetingMessages?.length
+                ? ctx.aiGreetingMessages
+                : await generateAiGreetingMessages(ctx)
           ctx.deliveryStage = '正在打招呼'
           reportDeliveryStage('正在打招呼')
           const result = await sendGreetingMessages({
             ctx,
             uid,
             messages: greetingMessages,
-            type: 'ai',
+            type: mode,
           })
           if (result.cancelled) return
           addLogTrace(
             ctx,
             '招呼语发送',
             'success',
-            `AI招呼语${greetingMessages.length}条已全部发送`,
+            `${mode === 'ai' ? 'AI' : '自定义'}招呼语${greetingMessages.length}条已全部发送`,
           )
         } catch (e) {
           markGreetingWarning(ctx, e)
@@ -1539,12 +1561,25 @@ export function handles(runtimeFormData?: FormData) {
     }
   }
 
-  const greeting: StepFactory = () => {
-    return aiGreeting()
+  function prepareCustomGreeting(ctx: logData) {
+    const text =
+      ctx.greetingSend?.type === 'custom' && ctx.message != null
+        ? ctx.message
+        : conf.formData.customGreeting.value
+    if (!text.trim()) throw new GreetingGenerationError('请先填写自定义招呼语')
+    ctx.aiGreetingMessages = undefined
+    ctx.aiGreetingMeta = undefined
+    ctx.aiGreetingA = undefined
+    ctx.aiGreetingR = undefined
+    ctx.message = text
+    ctx.greetingSend = { ok: false, type: 'custom', messageCount: 1, contentLength: text.length }
+    addLogTrace(ctx, '自定义招呼语', 'success', '已准备固定话术，按原文发送一条消息')
+    return [text]
   }
 
   const retryGreeting: Handler = async (_, ctx) => {
-    if (!isAiGreetingRuntimeEnabled() || ctx.greetingSend?.type === 'none') {
+    const mode = runtimeGreetingMode()
+    if (mode === 'none' || ctx.greetingSend?.type === 'none') {
       ctx.message = undefined
       ctx.aiGreetingMessages = undefined
       ctx.greetingSend = {
@@ -1554,29 +1589,38 @@ export function handles(runtimeFormData?: FormData) {
         messageCount: 0,
         messages: [],
       }
-      addLogTrace(ctx, '招呼语发送', 'success', 'AI招呼语未开启，已跳过文本补发', {
+      addLogTrace(ctx, '招呼语发送', 'success', '招呼语未开启，已跳过文本补发', {
         messageCount: 0,
       })
       return
+    }
+    const existingType = ctx.greetingSend?.type ?? (ctx.aiGreetingMessages?.length ? 'ai' : mode)
+    if (existingType !== mode) throw new GreetError('招呼语模式已切换，未发送原模式的缓存话术')
+    if (isPlainResultUnknown(ctx.greetingSend?.detail)) {
+      throw new GreetError('招呼语发送结果不确定，请人工核对后再处理')
     }
     const uid = useUser().getUserId()
     if (uid == null) {
       throw new GreetError('没有获取到uid')
     }
     if (ctx.bossData == null) {
-      await ensureBossDataForGreeting(ctx, 'AI招呼语')
+      await ensureBossDataForGreeting(ctx, existingType === 'ai' ? 'AI招呼语' : '自定义招呼语')
     }
 
-    let existingMessages = ctx.aiGreetingMessages?.length
-      ? ctx.aiGreetingMessages
-      : ctx.message
-          ?.split('\n')
-          .map((item) => item.trim())
-          .filter(Boolean)
+    let existingMessages =
+      existingType === 'custom'
+        ? ctx.message != null
+          ? [ctx.message]
+          : undefined
+        : ctx.aiGreetingMessages?.length
+          ? ctx.aiGreetingMessages
+          : ctx.message
+              ?.split('\n')
+              .map((item) => item.trim())
+              .filter(Boolean)
     const sentIndexes = new Set(
       ctx.greetingSend?.messages?.filter((item) => item.ok).map((item) => item.index) ?? [],
     )
-    const existingType = 'ai' as const
     if (existingType === 'ai' && existingMessages?.length && !ctx.aiGreetingMeta) {
       if (sentIndexes.size > 0) {
         throw new GreetError('旧招呼语缺少质量元数据，停止自动补发')
@@ -1587,11 +1631,13 @@ export function handles(runtimeFormData?: FormData) {
       ctx.message = undefined
     }
     if (!existingMessages?.length) {
-      if (!isAiGreetingRuntimeEnabled()) {
-        throw new GreetError('没有可续发的招呼语内容')
+      if (existingType === 'custom') {
+        throw new GreetError('缺少原自定义话术，停止自动补发')
+      } else {
+        assertGreetingEnabled('ai')
+        addLogTrace(ctx, 'AI招呼语', 'info', '没有可续发的招呼语内容，重新生成AI招呼语')
+        existingMessages = await generateAiGreetingMessages(ctx)
       }
-      addLogTrace(ctx, 'AI招呼语', 'info', '没有可续发的招呼语内容，重新生成AI招呼语')
-      existingMessages = await generateAiGreetingMessages(ctx)
     }
 
     const pendingMessages = existingMessages
@@ -1601,7 +1647,7 @@ export function handles(runtimeFormData?: FormData) {
     if (pendingMessages.length === 0) {
       ctx.greetingSend = {
         ...(ctx.greetingSend ?? {
-          type: 'ai',
+          type: existingType,
         }),
         ok: true,
         messageCount: existingMessages.length,
@@ -1622,7 +1668,10 @@ export function handles(runtimeFormData?: FormData) {
         anchor: ctx.aiGreetingMeta?.anchor,
         review: ctx.aiGreetingMeta?.review,
         audit: ctx.aiGreetingMeta?.audit,
-        fingerprint: ctx.aiGreetingMeta?.fingerprint,
+        fingerprint:
+          type === 'custom'
+            ? fingerprintGreeting(existingMessages)
+            : ctx.aiGreetingMeta?.fingerprint,
       })
     }
     const mergedRecords = [...(ctx.greetingSend?.messages ?? [])]
@@ -1639,6 +1688,8 @@ export function handles(runtimeFormData?: FormData) {
     const chatPageState = { prepared: false }
     for (const item of pendingMessages) {
       try {
+        assertDeliveryNotStopped()
+        assertGreetingEnabled(type)
         const channel = await sendGreetingMessage({
           ctx,
           uid,
@@ -1708,6 +1759,15 @@ export function handles(runtimeFormData?: FormData) {
       messages: mergedRecords,
     }
     addLogTrace(ctx, '招呼语发送', 'success', '招呼语已续发完成', mergedRecords)
+  }
+
+  function isPlainResultUnknown(detail: unknown) {
+    return (
+      typeof detail === 'object' &&
+      detail != null &&
+      'resultUnknown' in detail &&
+      detail.resultUnknown === true
+    )
   }
 
   function amapHandler(

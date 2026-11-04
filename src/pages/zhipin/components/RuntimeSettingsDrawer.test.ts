@@ -1,72 +1,81 @@
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { conf, confPersist, persistAiTasks, disableAiGreetingNow, messageWarning } = vi.hoisted(
-  () => {
-    const confPersist = vi.fn(async () => true)
-    const persistAiTasks = vi.fn(async () => true)
-    const disableAiGreetingNow = vi.fn(async () => true)
-    return {
+const {
+  conf,
+  confPersist,
+  persistAiTasks,
+  disableAiGreetingNow,
+  disableCustomGreetingNow,
+  messageWarning,
+} = vi.hoisted(() => {
+  const confPersist = vi.fn(async () => true)
+  const persistAiTasks = vi.fn(async () => true)
+  const disableAiGreetingNow = vi.fn(async () => true)
+  const disableCustomGreetingNow = vi.fn(async () => true)
+  return {
+    confPersist,
+    persistAiTasks,
+    disableAiGreetingNow,
+    disableCustomGreetingNow,
+    messageWarning: vi.fn(),
+    conf: {
+      isLoaded: true,
+      hasPersonalConfig: true,
+      readiness: {
+        configRevision: 1,
+        displayNameReady: true,
+        modelReady: true,
+        resumeReady: true,
+        resumeStatus: 'ready',
+        aiFilteringReady: true,
+        aiGreetingReady: true,
+      },
       confPersist,
       persistAiTasks,
       disableAiGreetingNow,
-      messageWarning: vi.fn(),
-      conf: {
-        isLoaded: true,
-        hasPersonalConfig: true,
-        readiness: {
-          configRevision: 1,
-          displayNameReady: true,
-          modelReady: true,
-          resumeReady: true,
-          resumeStatus: 'ready',
-          aiFilteringReady: true,
-          aiGreetingReady: true,
+      disableCustomGreetingNow,
+      formData: {
+        customGreeting: { enable: false, value: '' },
+        aiFiltering: { enable: true, score: 60 },
+        aiGreeting: {
+          enable: true,
+          messageCount: 3,
+          targetTotalCharacters: 150,
+          prompt: '默认招呼语要求',
         },
-        confPersist,
-        persistAiTasks,
-        disableAiGreetingNow,
-        formData: {
-          aiFiltering: { enable: true, score: 60 },
-          aiGreeting: {
-            enable: true,
-            messageCount: 3,
-            targetTotalCharacters: 150,
-            prompt: '默认招呼语要求',
-          },
-          activityFilter: { value: true },
-          goldHunterFilter: { value: true },
-          jobContent: {
-            enable: true,
-            include: false,
-            value: ['销售岗'],
-            options: ['销售岗'],
-          },
-          sameCompanyFilter: { value: true },
-          sameHrFilter: { value: true },
-          friendStatus: { value: true },
-          amap: {
-            enable: false,
-            key: '',
-            origins: '',
-            straightDistance: 0,
-            drivingDistance: 30,
-            drivingDuration: 60,
-            walkingDistance: 0,
-            walkingDuration: 0,
-          },
-          deliveryLimit: { search: 60, group: 40 },
-          delay: {
-            deliveryInterval: 30,
-            deliveryIntervalMax: 60,
-            batchSize: 30,
-            batchRestMinutes: 10,
-          },
+        activityFilter: { value: true },
+        goldHunterFilter: { value: true },
+        jobContent: {
+          enable: true,
+          include: false,
+          value: ['销售岗'],
+          options: ['销售岗'],
+        },
+        sameCompanyFilter: { value: true },
+        sameHrFilter: { value: true },
+        friendStatus: { value: true },
+        amap: {
+          enable: false,
+          key: '',
+          origins: '',
+          straightDistance: 0,
+          drivingDistance: 30,
+          drivingDuration: 60,
+          walkingDistance: 0,
+          walkingDuration: 0,
+        },
+        deliveryLimit: { search: 60, group: 40 },
+        delay: {
+          deliveryInterval: 30,
+          deliveryIntervalMax: 60,
+          batchSize: 30,
+          batchRestMinutes: 10,
         },
       },
-    }
-  },
-)
+    },
+  }
+})
 
 vi.mock('@/stores/conf', async () => {
   const { reactive } = await vi.importActual<typeof import('vue')>('vue')
@@ -140,6 +149,7 @@ describe('runtime settings drawer', () => {
     conf.formData.aiGreeting.messageCount = 3
     conf.formData.aiGreeting.targetTotalCharacters = 150
     conf.formData.aiGreeting.prompt = '默认招呼语要求'
+    conf.formData.customGreeting = { enable: false, value: '' }
     conf.formData.amap.enable = false
     conf.formData.jobContent.enable = true
     conf.formData.jobContent.include = false
@@ -167,6 +177,58 @@ describe('runtime settings drawer', () => {
     expect(wrapper.text()).not.toContain('保存配置')
     expect(wrapper.text()).not.toContain('应用个人配置')
     expect(wrapper.text()).not.toContain('私有配置已加载')
+  })
+
+  it('saves a fixed greeting without model or resume prerequisites and switches modes exclusively', async () => {
+    vi.useFakeTimers()
+    conf.readiness.modelReady = false
+    conf.readiness.resumeReady = false
+    conf.readiness.displayNameReady = false
+    const wrapper = mount(RuntimeSettingsDrawer)
+    await flushPromises()
+    await wrapper.get('[aria-label="启用自定义招呼语"]').trigger('click')
+    expect(conf.formData.aiGreeting.enable).toBe(false)
+    expect(wrapper.find('[data-test="ai-greeting-panel"]').exists()).toBe(false)
+    await wrapper
+      .get('[aria-label="自定义招呼语内容"]')
+      .setValue('您好，期待交流。\n这是固定原文。')
+    await vi.advanceTimersByTimeAsync(250)
+    expect(persistAiTasks).toHaveBeenCalledOnce()
+    expect(confPersist).not.toHaveBeenCalled()
+    expect(messageWarning).not.toHaveBeenCalled()
+    conf.readiness.modelReady = conf.readiness.resumeReady = conf.readiness.displayNameReady = true
+    await wrapper.get('[aria-label="启用 AI 招呼语"]').trigger('click')
+    expect(conf.formData.customGreeting.enable).toBe(false)
+    expect(conf.formData.customGreeting.value).toBe('您好，期待交流。\n这是固定原文。')
+    expect(wrapper.find('[data-test="custom-greeting-panel"]').exists()).toBe(false)
+  })
+
+  it('disables custom greetings immediately and preserves edits in the pending save', async () => {
+    vi.useFakeTimers()
+    conf.formData.aiGreeting.enable = false
+    conf.formData.customGreeting = { enable: true, value: '旧文本' }
+    const wrapper = mount(RuntimeSettingsDrawer)
+    await flushPromises()
+    await wrapper.get('[aria-label="自定义招呼语内容"]').setValue('更新后的原文')
+    await wrapper.get('[aria-label="启用自定义招呼语"]').trigger('click')
+    expect(disableCustomGreetingNow).toHaveBeenCalledOnce()
+    expect(conf.formData.aiGreeting.enable).toBe(false)
+    await vi.advanceTimersByTimeAsync(250)
+    expect(conf.formData.customGreeting).toEqual({ enable: false, value: '更新后的原文' })
+    expect(persistAiTasks).toHaveBeenCalledOnce()
+  })
+
+  it('restores the saved mode when a configuration write is rejected', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(RuntimeSettingsDrawer)
+    await flushPromises()
+    persistAiTasks.mockResolvedValueOnce(false)
+    await wrapper.get('[aria-label="启用自定义招呼语"]').trigger('click')
+    await vi.advanceTimersByTimeAsync(250)
+    expect(conf.formData.aiGreeting.enable).toBe(true)
+    expect(conf.formData.customGreeting.enable).toBe(false)
+    await vi.advanceTimersByTimeAsync(250)
+    expect(persistAiTasks).toHaveBeenCalledOnce()
   })
 
   it('auto-saves runtime changes without invoking the reload-based save flow', async () => {

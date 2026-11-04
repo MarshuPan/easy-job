@@ -128,6 +128,7 @@ vi.mock('@/stores/log', async () => {
       finishDelivery: logFinishDeliveryMock,
       info: logInfoMock,
       debug: logInfoMock,
+      recordDiagnostic: vi.fn(),
       startDelivery: logStartDeliveryMock,
       touchDelivery: logTouchDeliveryMock,
     }),
@@ -355,7 +356,8 @@ describe('useDeliver job list flow', () => {
     expect(result).toBe('stopped')
     expect(shouldRefill).not.toHaveBeenCalled()
     expect(jobListRef.value[1].status.status).toBe('wait')
-    expect(sendPublishReqMock).toHaveBeenCalledOnce()
+    expect(jobListRef.value[0].status.status).toBe('wait')
+    expect(sendPublishReqMock).not.toHaveBeenCalled()
   })
 
   it('does not establish communication after a manual stop during filtering', async () => {
@@ -480,8 +482,8 @@ describe('useDeliver job list flow', () => {
     const late = await withFixedRandom(0.75)
 
     expect(early).toBeLessThan(late)
-    // 常规档是用户配的 40 秒：开头那档应该明显快于它，跑久之后明显慢于它。
-    expect(early).toBeLessThan(40_000)
+    // 加速只能到配置的硬下限，不能突破；长会话仍可放慢。
+    expect(early).toBe(40_000)
     expect(late).toBeGreaterThan(40_000)
   })
 
@@ -1020,6 +1022,11 @@ describe('useDeliver job list flow', () => {
     // 无快照时写 live store 又会让界面显示一个从未持久化的值。
     formData.delay.deliveryInterval = 30
     formData.delay.deliveryIntervalMax = 60
+    const clock = { now: Date.now() }
+    vi.spyOn(Date, 'now').mockImplementation(() => clock.now)
+    delayMock.mockImplementation(async (seconds: number) => {
+      clock.now += seconds * 1000
+    })
     jobListRef.value = [createJob('job-rate-limit-config')]
     createHandleMock.mockResolvedValue({ after: [], before: [], retryGreeting: vi.fn() })
     sendPublishReqMock.mockRejectedValueOnce(new RateLimitError('操作过于频繁'))
@@ -1052,9 +1059,9 @@ describe('useDeliver job list flow', () => {
     expect(sendPublishReqMock).not.toHaveBeenCalled()
   })
 
-  it('treats communication as successful with zero text when AI greeting is disabled', async () => {
+  it('treats communication as successful with zero text when both greeting modes are disabled', async () => {
     formData.aiGreeting.enable = false
-    formData.customGreeting.enable = true
+    formData.customGreeting.enable = false
     jobListRef.value = [createJob('job-no-text')]
     createHandleMock.mockResolvedValue({
       after: [],

@@ -58,6 +58,106 @@ const LEGACY_BUILT_IN_FILTERING_PROMPT =
   '你要回答的问题是：这个人能不能做好这份工作。不是「简历里有没有写过 JD 里出现的每个词」。\n\n一、先看这是不是同一类工作\n职能不同就是不匹配，先判断这个，再谈能力。\n- 职能 = 这份工作主要产出什么：定义产品、做运营增长、写代码、做销售、做人事。候选人的职能看简历事实里的 role 和实际做过的事。\n- 职能不同不能靠可迁移能力补。一个做产品的人搭过内容矩阵、看过投放数据，不等于他要做运营总监；一个写过 SQL 的产品经理不是数据工程师。能力能迁到别的职能上去，不代表那就是他的职能。\n- 「职能不同」和「场景不同」是两回事，别混。产品换个行业做还是产品，不扣分；产品换成运营，那是另一份工作。\n\n二、读懂这份工作实际在做什么\n从职责描述里提炼出它真正要解决的问题、要具备的能力，而不是罗列 JD 出现过的名词。\n岗位标签、所属行业、公司介绍不是对候选人的要求，JD 正文没把它写成要求时不能当缺口。\n\n三、职能一致之后，用简历事实去覆盖这些能力，不要做逐条核对\n- 一条事实可以同时支撑多项要求。做成过一件事，往往同时说明了方法、判断力和协作方式；不要求事实和要求一一对应。\n- 场景不同不等于不匹配。同一套产品方法用在不同业务上是常态，判断的是「这套做法能不能用到这里」，不是「有没有在同一个行业干过」。行业知识多数是入职后补的。\n- 工具、平台、框架的具体名称不构成缺口——那些是几周能上手的东西。只有当某项能力需要长期积累的专门判断力，而简历里连相近的实践都找不到时，才算真正的缺口。\n\n四、给分，按能力覆盖的程度\n- 主体是覆盖度：这份工作的核心要做的事，简历事实能支撑多少。\n- 证据强度作调整：主导过 > 参与过 > 用过或了解过。\n- 学历、专业、年限这类形式条件权重最低。差一档只小幅扣分，绝不作为跳过的主要理由——招聘方会在面试里自己判断，而在读、非全日制、年限差一两年都不等于不能胜任。\n- 分档：85-100 strong，70-84 good，55-69 maybe，40-54 weak，0-39 reject。\n- 职能不同的，不高于 35，理由写明职能不符——这是最先判断的一条，不受下面几条影响。\n- 职能相同、方向相关但侧重不同的，不应低于 55。\n\n五、你不知道投递门槛在哪里，也不要去猜\n只给出「这个人能做好这份工作的程度」。理由里不要出现「达到/不达到投递门槛」「建议/不建议投递」这类话——是否投递由外部规则决定，不是你的判断范围。分数要反映真实差距，不要向任何特定数值靠拢。\n\n六、结论必须自洽\n每一条扣分都要能在 JD 里指出是哪一条要求。选中的简历事实不能在理由里被自己否认。\n岗位薪资覆盖或高于候选人期望不是风险，只有明确低于期望时才记为风险。\n\n七、理由保持简洁：说清楚能力覆盖在哪里、最大的实质差距是什么，并选出最适合后续招呼语使用的主事实。'
 
 describe('ConfigService', () => {
+  it('saves exclusive greeting modes globally without changing either draft or account rules', async () => {
+    const state = createDefaultStoredConfigState()
+    state.models = [configuredModel()]
+    state.accountSettings['account-a'] = createDefaultDeliverySettings()
+    const originalSettings = jsonClone(state.accountSettings)
+    const storage = memoryStorage(state)
+    const service = new ConfigService(storage.adapter)
+    await service.saveAiTasks({ customGreeting: { enabled: true, value: '您好\n期待交流。' } })
+    expect((await service.getPublicRuntimeConfig('account-a')).formData.customGreeting).toEqual({
+      enable: true,
+      value: '您好\n期待交流。',
+    })
+    expect((await service.getPublicRuntimeConfig('account-b')).formData.customGreeting).toEqual({
+      enable: true,
+      value: '您好\n期待交流。',
+    })
+    expect(storage.readValue()?.tasks.aiGreeting.enabled).toBe(false)
+    await service.saveAiTasks({ aiGreeting: { enabled: true, prompt: '按岗位需求介绍' } })
+    expect(storage.readValue()?.tasks.customGreeting).toEqual({
+      enabled: false,
+      value: '您好\n期待交流。',
+    })
+    await service.saveAiTasks({ customGreeting: { enabled: true } })
+    expect(storage.readValue()?.tasks.aiGreeting).toMatchObject({
+      enabled: false,
+      prompt: '按岗位需求介绍',
+    })
+    expect(storage.readValue()?.accountSettings).toEqual(originalSettings)
+  })
+
+  it('rejects conflicting modes in saves and imports without modifying stored data', async () => {
+    const storage = memoryStorage(createDefaultStoredConfigState())
+    const service = new ConfigService(storage.adapter)
+    const before = storage.readValue()
+    await expect(
+      service.saveAiTasks({ customGreeting: { enabled: true }, aiGreeting: { enabled: true } }),
+    ).rejects.toBeInstanceOf(ConfigValidationError)
+    const bundle = createDefaultConfigBundle()
+    bundle.models = [configuredModel()]
+    bundle.tasks.aiGreeting = {
+      ...bundle.tasks.aiGreeting,
+      enabled: true,
+      modelId: bundle.models[0].id,
+    }
+    bundle.tasks.customGreeting = { enabled: true, value: '不应导入' }
+    await expect(service.replaceBundle('account-a', bundle)).rejects.toBeInstanceOf(
+      ConfigValidationError,
+    )
+    expect(storage.readValue()).toEqual(before)
+  })
+
+  it('backfills old configurations without activating dormant account greeting text', async () => {
+    const state = createDefaultStoredConfigState()
+    state.accountSettings['account-a'] = createDefaultDeliverySettings()
+    state.accountSettings['account-a'].delivery.customGreeting = {
+      enabled: true,
+      value: '旧版未执行的话术',
+    }
+    delete (state.tasks as Partial<typeof state.tasks>).customGreeting
+    const storage = memoryStorage(state)
+    const runtime = await new ConfigService(storage.adapter).getPublicRuntimeConfig('account-a')
+    expect(runtime.formData.customGreeting).toEqual({ enable: false, value: '' })
+    expect(storage.readValue()?.accountSettings['account-a'].delivery.customGreeting.value).toBe(
+      '旧版未执行的话术',
+    )
+  })
+
+  it('round-trips fixed text and permits immediate disable while rejecting edits during a task', async () => {
+    const storage = memoryStorage()
+    const service = new ConfigService(storage.adapter)
+    await service.saveAiTasks({ customGreeting: { enabled: true, value: '固定\n原文' } })
+    expect((await service.getPublicRuntimeConfig('account-a')).readiness).toMatchObject({
+      modelReady: false,
+      resumeReady: false,
+      customGreetingReady: true,
+    })
+    const bundle = await service.getBundle('account-a')
+    await service.replaceBundle('account-b', bundle)
+    expect((await service.getPublicRuntimeConfig('account-b')).formData.customGreeting).toEqual({
+      enable: true,
+      value: '固定\n原文',
+    })
+    const running = new ConfigService(
+      storage.adapter,
+      'test',
+      undefined,
+      () => true,
+      () => true,
+    )
+    await expect(
+      running.saveAiTasks({ customGreeting: { value: '不应在运行中改写' } }),
+    ).rejects.toBeInstanceOf(ConfigMutationRunningError)
+    await running.disableGreeting('custom')
+    expect(storage.readValue()?.tasks.customGreeting).toEqual({
+      enabled: false,
+      value: '固定\n原文',
+    })
+    expect(storage.readValue()?.tasks.aiGreeting.enabled).toBe(false)
+  })
+
   it('still serves a config that predates a newly required field', async () => {
     // 真机故障：greetingSegmentSeconds 加在 0.9.37，之前存过配置的账号一读就报
     // 「缺少必填字段」，面板起不来。加字段不能让老用户的扩展变砖，所以读取要先补默认值。
@@ -137,16 +237,16 @@ describe('ConfigService', () => {
     const storage = memoryStorage(state)
     const service = new ConfigService(storage.adapter)
     const accountA = await service.getPublicRuntimeConfig('account-a')
-    accountA.formData.customGreeting = { enable: true, value: '账号 A' }
+    accountA.formData.delay.deliveryInterval = 42
     await service.savePublicRuntimeConfig('account-a', accountA.formData)
     const accountB = await service.getPublicRuntimeConfig('account-b')
-    accountB.formData.customGreeting = { enable: true, value: '账号 B' }
+    accountB.formData.delay.deliveryInterval = 48
     await service.savePublicRuntimeConfig('account-b', accountB.formData)
 
     const stored = storage.readValue()!
     expect(stored.profile.displayName).toBe('全局姓名')
-    expect(stored.accountSettings['account-a'].delivery.customGreeting.value).toBe('账号 A')
-    expect(stored.accountSettings['account-b'].delivery.customGreeting.value).toBe('账号 B')
+    expect(stored.accountSettings['account-a'].delivery.timing.minJobIntervalSeconds).toBe(42)
+    expect(stored.accountSettings['account-b'].delivery.timing.minJobIntervalSeconds).toBe(48)
   })
 
   it('rejects an oversized expectation payload instead of silently dropping the tail', async () => {
@@ -686,20 +786,20 @@ describe('ConfigService', () => {
     const service = new ConfigService(storage.adapter)
     const a = await service.getPublicRuntimeConfig('account-a')
     const b = await service.getPublicRuntimeConfig('account-b')
-    a.formData.customGreeting.value = 'A'
-    b.formData.customGreeting.value = 'B'
+    a.formData.delay.deliveryInterval = 42
+    b.formData.delay.deliveryInterval = 48
 
     await Promise.all([
       service.savePublicRuntimeConfig('account-a', a.formData),
       service.savePublicRuntimeConfig('account-b', b.formData),
     ])
 
-    expect(storage.readValue()?.accountSettings['account-a'].delivery.customGreeting.value).toBe(
-      'A',
-    )
-    expect(storage.readValue()?.accountSettings['account-b'].delivery.customGreeting.value).toBe(
-      'B',
-    )
+    expect(
+      storage.readValue()?.accountSettings['account-a'].delivery.timing.minJobIntervalSeconds,
+    ).toBe(42)
+    expect(
+      storage.readValue()?.accountSettings['account-b'].delivery.timing.minJobIntervalSeconds,
+    ).toBe(48)
     expect(storage.readValue()?.configRevision).toBe(2)
   })
 

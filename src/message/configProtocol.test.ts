@@ -156,7 +156,7 @@ describe('configuration message protocol', () => {
     expect(createConfigFailure('request-busy', new ConfigMutationRunningError())).toMatchObject({
       ok: false,
       errorCode: 'CONFIG_MUTATION_BLOCKED',
-      error: '投递正在运行，仅可关闭 AI 招呼语，停止投递后才能修改其他配置',
+      error: '投递正在运行，仅可关闭当前招呼语，停止投递后才能修改其他配置',
     })
   })
 

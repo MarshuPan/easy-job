@@ -85,7 +85,10 @@ const panelEyebrow = computed(() => {
   return navigation.find((item) => item.id === activeSection.value)?.eyebrow ?? 'CONTROL UNIT'
 })
 const systemReady = computed(
-  () => conf.readiness?.aiFilteringReady !== false && conf.readiness?.aiGreetingReady !== false,
+  () =>
+    conf.readiness?.aiFilteringReady !== false &&
+    conf.readiness?.aiGreetingReady !== false &&
+    conf.readiness?.customGreetingReady !== false,
 )
 const systemStateLabel = computed(() => (systemReady.value ? '系统正常' : '需要配置'))
 const personalFrameUrl = computed(() => {

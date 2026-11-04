@@ -406,6 +406,10 @@ export const useConf = defineStore('conf', () => {
       from = await readPersistedFormData()
       from = (await formDataHandler(from)) ?? from
       const bootstrap = deepmerge<FormData>(defaultFormData, from)
+      // Active custom greetings come from the global tasks, never a dormant legacy switch.
+      bootstrap.customGreeting = jsonClone(
+        runtime.formData.customGreeting ?? { enable: false, value: '' },
+      )
       bootstrap.userId = uid
       if (!runtime.readiness.modelReady) {
         bootstrap.aiFiltering.enable = false
@@ -479,6 +483,10 @@ export const useConf = defineStore('conf', () => {
   async function persistAiTasks() {
     try {
       readiness.value = await counter.configAiTasksSave({
+        customGreeting: {
+          enabled: formData.customGreeting.enable,
+          value: formData.customGreeting.value,
+        },
         aiFiltering: {
           enabled: formData.aiFiltering.enable,
           score: formData.aiFiltering.score,
@@ -514,6 +522,20 @@ export const useConf = defineStore('conf', () => {
       // 这是即时安全控制，失败必须留痕：用户以为已经停止发送，实际没有。
       useLog().info('AI 设置', `关闭 AI 招呼语失败，招呼语可能仍在发送：${detail}`)
       AgentMessage.error('关闭 AI 招呼语失败，请稍后重试')
+      return false
+    }
+  }
+
+  async function disableCustomGreetingNow() {
+    formData.customGreeting.enable = false
+    try {
+      readiness.value = await counter.configGreetingDisable('custom')
+      return true
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      logger.error('关闭自定义招呼语失败', error)
+      useLog().info('招呼语设置', `关闭自定义招呼语失败：${detail}`)
+      AgentMessage.error('关闭自定义招呼语失败，请稍后重试')
       return false
     }
   }
@@ -590,6 +612,7 @@ export const useConf = defineStore('conf', () => {
     confPersist,
     persistAiTasks,
     disableAiGreetingNow,
+    disableCustomGreetingNow,
     confSaving,
     confReload,
     confExport,

@@ -253,6 +253,7 @@ function collectResumeEvidenceStrings(evidence, values) {
 }
 
 function collectCoreSensitiveValues(bundle, values) {
+  addSensitiveString(values, bundle?.tasks?.customGreeting?.value)
   addSensitiveString(values, bundle?.profile?.displayName)
   addSensitiveString(values, bundle?.profile?.resume?.markdown)
   addSensitiveString(values, bundle?.profile?.resume?.sourceHash)

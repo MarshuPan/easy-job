@@ -38,6 +38,65 @@ function formData(overrides: Partial<FormData> = {}) {
 }
 
 describe('delivery config snapshot', () => {
+  it('pins the custom text and rejects a snapshot with both greeting modes enabled', () => {
+    const input = formData({ customGreeting: { enable: true, value: '固定\n原文' } })
+    const snapshot = buildDeliveryConfigSnapshot(input, 7)
+    const parsed = parseDeliveryConfigSnapshot(snapshot)!
+    input.customGreeting.value = '之后的编辑'
+    expect(parsed.formData.customGreeting).toEqual({ enable: true, value: '固定\n原文' })
+    expect(Object.isFrozen(parsed.formData.customGreeting)).toBe(true)
+    snapshot.formData.aiGreeting.enable = true
+    expect(parseDeliveryConfigSnapshot(snapshot)).toBeNull()
+  })
+
+  it.each([false, true])(
+    'keeps a legacy task resumable without enabling its dormant custom text (AI: %s)',
+    (aiEnabled) => {
+      const input = formData({ customGreeting: { enable: true, value: '旧版未执行的话术' } })
+      input.aiGreeting.enable = aiEnabled
+      const { customGreeting: _customGreeting, ...legacyPipeline } =
+        buildDeliveryConfigSnapshot(input).pipeline
+      const legacy = { ...buildDeliveryConfigSnapshot(input), pipeline: legacyPipeline }
+      const original = structuredClone(legacy)
+
+      const parsed = parseDeliveryConfigSnapshot(legacy)!
+
+      expect(parsed.formData.customGreeting).toEqual({
+        enable: false,
+        value: '旧版未执行的话术',
+      })
+      expect(parsed.formData.aiGreeting.enable).toBe(aiEnabled)
+      expect(parsed.pipeline).toMatchObject({ aiGreeting: aiEnabled, customGreeting: false })
+      expect(Object.isFrozen(parsed.formData.customGreeting)).toBe(true)
+      expect(legacy).toEqual(original)
+      expect(parseDeliveryConfigSnapshot(parsed)).toEqual(parsed)
+    },
+  )
+
+  it.each([undefined, true, 'false'])(
+    'rejects a new snapshot with an invalid or inconsistent custom marker (%s)',
+    (marker) => {
+      const snapshot = buildDeliveryConfigSnapshot(formData())
+      const candidate = { ...snapshot, pipeline: { ...snapshot.pipeline, customGreeting: marker } }
+
+      expect(parseDeliveryConfigSnapshot(candidate)).toBeNull()
+    },
+  )
+
+  it('backfills absent custom text only for a legacy snapshot', () => {
+    const snapshot = buildDeliveryConfigSnapshot(formData())
+    const { customGreeting: _customGreeting, ...legacyForm } = snapshot.formData
+    const { customGreeting: _customPipeline, ...legacyPipeline } = snapshot.pipeline
+    expect(parseDeliveryConfigSnapshot({ ...snapshot, formData: legacyForm })).toBeNull()
+    expect(
+      parseDeliveryConfigSnapshot({
+        ...snapshot,
+        formData: legacyForm,
+        pipeline: legacyPipeline,
+      })?.formData.customGreeting,
+    ).toEqual({ enable: false, value: '' })
+  })
+
   it('builds a stable queue fingerprint from normalized source configuration', () => {
     const first = buildDeliveryQueueConfigScope(formData())
     const second = buildDeliveryQueueConfigScope(

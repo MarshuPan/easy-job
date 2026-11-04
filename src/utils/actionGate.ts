@@ -138,7 +138,15 @@ export function pruneEvents(
   rules: GateRules = defaultGateRules,
 ) {
   const cutoff = now - getMaxWindowMs(rules)
-  return events.filter((event) => event.at > cutoff)
+  // A configured interval can outlast rate windows. Keep one last action per
+  // kind so pruning by another action does not erase the interval on resume.
+  const latest = new Map<BossActionKind, ActionEvent>()
+  for (const event of events) {
+    if (!latest.has(event.kind) || latest.get(event.kind)!.at < event.at) {
+      latest.set(event.kind, event)
+    }
+  }
+  return events.filter((event) => event.at > cutoff || latest.get(event.kind) === event)
 }
 
 function sortedTimes(events: readonly ActionEvent[]) {

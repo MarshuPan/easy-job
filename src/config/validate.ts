@@ -430,7 +430,19 @@ function validateTasks(
   issues: ConfigValidationIssue[],
 ) {
   const tasks = asRecord(value, path, issues)
-  exactKeys(tasks, path, ['resumeExtraction', 'aiFiltering', 'aiGreeting'], [], issues)
+  exactKeys(
+    tasks,
+    path,
+    ['resumeExtraction', 'aiFiltering', 'aiGreeting', 'customGreeting'],
+    [],
+    issues,
+  )
+
+  const customPath = childPath(path, 'customGreeting')
+  const custom = asRecord(tasks.customGreeting, customPath, issues)
+  exactKeys(custom, customPath, ['enabled', 'value'], [], issues)
+  const customEnabled = expectBoolean(custom.enabled, childPath(customPath, 'enabled'), issues)
+  expectString(custom.value, childPath(customPath, 'value'), issues)
 
   const extractionPath = childPath(path, 'resumeExtraction')
   const extraction = asRecord(tasks.resumeExtraction, extractionPath, issues)
@@ -477,6 +489,9 @@ function validateTasks(
     childPath(greetingPath, 'enabled'),
     issues,
   )
+  if (greetingEnabled && customEnabled) {
+    addIssue(issues, customPath, 'AI 招呼语与自定义招呼语不能同时开启')
+  }
   const greetingModelId = validateNullableModelId(
     greeting.modelId,
     childPath(greetingPath, 'modelId'),
@@ -826,6 +841,7 @@ function createDefaultConfigBundleForModel(value: unknown): ConfigBundleV1 {
     },
     models: [value as import('./types').AiModelConfig],
     tasks: {
+      customGreeting: { enabled: false, value: '' },
       resumeExtraction: { modelId: null },
       aiFiltering: {
         enabled: false,

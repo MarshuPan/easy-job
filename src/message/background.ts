@@ -440,6 +440,10 @@ export class BackgroundCounter implements BackgroundCounterApi {
     return configService.disableAiGreeting()
   }
 
+  async configGreetingDisable(type: 'ai' | 'custom') {
+    return configService.disableGreeting(type)
+  }
+
   async deliveryTaskRead(uid: string) {
     return deliveryTaskCoordinator.read(uid)
   }

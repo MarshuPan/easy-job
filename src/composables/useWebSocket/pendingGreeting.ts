@@ -1,3 +1,4 @@
+import { getGreetingMode } from '@/config/greetingMode'
 import { counter } from '@/message'
 import { PENDING_GREETING_STORAGE_KEY } from '@/message/pendingGreetingProtocol'
 import { useUser } from '@/stores/user'
@@ -227,28 +228,13 @@ export async function consumePendingGreetings(
           remaining.push(item, ...queue.slice(index + 1))
           break
         }
-        if (!runtime.accountInitialized || runtime.formData.aiGreeting.enable !== true) {
-          const pendingItems = queue.slice(index)
-          const cancelledItems = pendingItems.map((entry) =>
-            entry.fromUid === normalizedCurrentUid
-              ? withStatus(entry, 'cancelled', 'AI招呼语已关闭，已取消待发送文本')
-              : entry,
-          )
-          remaining.push(...cancelledItems)
-          for (const entry of pendingItems) {
-            if (entry.fromUid !== normalizedCurrentUid) continue
-            results.push({
-              id: entry.id,
-              ok: false,
-              error: 'AI招呼语已关闭，已取消待发送文本',
-            })
-          }
-          logger.info('AI招呼语已关闭，已取消当前账号待发送文本', {
-            cancelledCount: pendingItems.filter((entry) => entry.fromUid === normalizedCurrentUid)
-              .length,
-          })
+        if (!runtime.accountInitialized || getGreetingMode(runtime.formData) !== item.type) {
+          const reason = `${item.type === 'ai' ? 'AI' : '自定义'}招呼语已关闭，已取消待发送文本`
+          remaining.push(withStatus(item, 'cancelled', reason))
+          results.push({ id: item.id, ok: false, error: reason })
+          logger.info(reason, { pendingId: item.id })
           changed = true
-          break
+          continue
         }
         const sendingItem = withStatus(item, 'sending', '发送通道已接管消息，等待本地队列确认')
         await savePendingGreetings([...remaining, sendingItem, ...queue.slice(index + 1)])
