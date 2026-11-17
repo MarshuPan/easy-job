@@ -54,7 +54,9 @@ const {
 } = vi.hoisted(() => ({
   storageGetMock: vi.fn(async (_key: string, fallback: unknown) => fallback),
   storageSetMock: vi.fn(async () => true),
-  storageUsageMock: vi.fn(async () => null as { bytesInUse: number; quotaBytes: number } | null),
+  storageUsageMock: vi.fn(
+    async () => null as { bytesInUse: number; quotaBytes: number | null } | null,
+  ),
   clock: {
     now: 1_000_000,
     pendingPageLoad: null as null | {
@@ -263,6 +265,27 @@ function registerStoredTask(overrides: Record<string, any> = {}) {
   )
   if (checkpoint == null) throw new Error('缺少页面任务夹具')
   registerDurableTask(checkpoint, overrides)
+}
+
+function registerLifecycleTask(status: string = 'paused') {
+  registerDurableTask(
+    {
+      id: 'lifecycle-task',
+      accountUid: 'account-a',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'group',
+          url: 'https://www.zhipin.com/web/geek/jobs',
+          status: 'running',
+          pagesDone: 0,
+        },
+      ],
+    },
+    { status },
+  )
 }
 
 function markBatchProcessed(batchItems?: Array<{ item?: any }>) {
@@ -772,12 +795,10 @@ describe('operation panel pagination delivery', () => {
   })
 
   afterEach(async () => {
-    for (let index = 0; index < 12; index++) {
-      // A mounted resume can acquire the run lock after teardown begins.
-      // Keep asserting stop until all queued resume continuations have observed it.
-      common.deliverStop = true
-      await flushPromises()
-    }
+    // Unmount cancels the owning execution; one stop must remain effective across awaits.
+    common.deliverStop = true
+    await flushPromises()
+    await flushPromises()
     expect(common.deliverLock).toBe(false)
     clock.pendingPageLoad = null
     sourceLists.group = []
@@ -1957,7 +1978,7 @@ describe('operation panel pagination delivery', () => {
       'agent-delivery:combined-delivery-task',
       JSON.stringify(checkpoint),
     )
-    registerDurableTask(checkpoint)
+    registerDurableTask(checkpoint, { status: 'running' })
 
     mount(OperationPanel)
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
@@ -2028,7 +2049,7 @@ describe('operation panel pagination delivery', () => {
       'agent-delivery:combined-delivery-task',
       JSON.stringify(checkpoint),
     )
-    registerDurableTask(checkpoint)
+    registerDurableTask(checkpoint, { status: 'running' })
 
     mount(OperationPanel)
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
@@ -2551,6 +2572,229 @@ describe('operation panel pagination delivery', () => {
     await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalled())
   })
 
+  it('cancels startup preparation without registering a task after pause', async () => {
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    const readiness = createDeferred<any>()
+    const original = vi.mocked(counter.configRuntime).getMockImplementation()!
+    vi.mocked(counter.configRuntime).mockImplementationOnce(() => readiness.promise)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    const start = button('开始投递')!
+    await Promise.all([start.trigger('click'), start.trigger('click')])
+    await vi.waitFor(() => expect(counter.configRuntime).toHaveBeenCalled())
+    await button('暂停')!.trigger('click')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在暂停')
+    readiness.resolve(await original('account-a'))
+    await vi.waitFor(() => expect(common.deliverLock).toBe(false))
+    expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    await flushPromises()
+    expect(button('开始投递')).toBeDefined()
+  })
+
+  it('keeps ending visible until the running batch has drained, without opening a second execution', async () => {
+    const batch = createDeferred<'stopped'>()
+    deliverJobListHandle.mockReturnValue(batch.promise)
+    const wrapper = mount(OperationPanel)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await button('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledOnce())
+    await button('暂停')!.trigger('click')
+    await button('结束')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在结束')
+    expect(button('开始投递')).toBeUndefined()
+    expect(button('继续')).toBeUndefined()
+    expect(button('重置待处理')).toBeUndefined()
+    expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
+    expect(common.deliverLock).toBe(true)
+    batch.resolve('stopped')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+    await flushPromises()
+    expect(common.deliverLock).toBe(false)
+    expect(counter.deliveryTaskTerminate).toHaveBeenCalledOnce()
+    expect(counter.deliveryTaskPause).not.toHaveBeenCalled()
+    expect(button('开始投递')).toBeDefined()
+  })
+
+  it('ends a task during initial recovery and ignores its late read after a new start', async () => {
+    registerLifecycleTask('running')
+    const oldRead = createDeferred<any>()
+    const oldTask = structuredClone(durableTaskState.value)
+    vi.mocked(counter.deliveryTaskRead).mockImplementationOnce(() => oldRead.promise)
+    const wrapper = mount(OperationPanel)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await vi.waitFor(() => expect(counter.deliveryTaskRead).toHaveBeenCalledOnce())
+    await button('结束')!.trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+    await flushPromises()
+    const batch = createDeferred<'stopped'>()
+    deliverJobListHandle.mockReturnValue(batch.promise)
+    await button('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledOnce())
+    const newId = durableTaskState.value.runId
+    expect(newId).not.toBe(oldTask.runId)
+    oldRead.resolve(oldTask)
+    await flushPromises()
+    expect(durableTaskState.value.runId).toBe(newId)
+    expect(common.deliverLock).toBe(true)
+    await button('暂停')!.trigger('click')
+    batch.resolve('stopped')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
+    expect(durableTaskState.value.runId).toBe(newId)
+  })
+
+  it('orders stop after an in-flight start and allows a fresh start after draining', async () => {
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    const registration = createDeferred()
+    const original = vi.mocked(counter.deliveryTaskStart).getMockImplementation()!
+    vi.mocked(counter.deliveryTaskStart).mockImplementationOnce(async (request) => {
+      await registration.promise
+      return original(request)
+    })
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await button('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalledOnce())
+    await button('暂停')!.trigger('click')
+    await button('结束')!.trigger('click')
+    expect(button('开始投递')).toBeUndefined()
+    registration.resolve()
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('stopped'))
+    await flushPromises()
+    expect(counter.deliveryTaskPause).not.toHaveBeenCalled()
+    expect(counter.deliveryTaskTerminate).toHaveBeenCalledOnce()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(common.deliverLock).toBe(false)
+    const previousId = durableTaskState.value.runId
+    await button('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskStart).toHaveBeenCalledTimes(2))
+    expect(durableTaskState.value.runId).not.toBe(previousId)
+    expect(AgentMessage.info).not.toHaveBeenCalledWith('当前已有投递任务在执行')
+  })
+
+  it('interrupts the refill timer immediately instead of holding the start lock for its full duration', async () => {
+    const originalDelay = delayMock.getMockImplementation()!
+    let waiting = false
+    delayMock.mockImplementation(async (seconds: number, signal?: AbortSignal) => {
+      if (!waiting && seconds >= 8) {
+        waiting = true
+        await new Promise<void>((resolve) =>
+          signal!.addEventListener('abort', () => resolve(), { once: true }),
+        )
+        return
+      }
+      await originalDelay(seconds)
+    })
+    const wrapper = mount(OperationPanel)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await button('开始投递')!.trigger('click')
+    await vi.waitFor(() => expect(waiting).toBe(true))
+    await button('暂停')!.trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
+    expect(common.deliverLock).toBe(false)
+    expect(pagerNext).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(logInfo).toHaveBeenCalledWith('投递任务', expect.stringContaining('补池已中断'), 'info')
+  })
+
+  it('does not revive a task when an older resume reply arrives after stop', async () => {
+    registerLifecycleTask()
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    const resumed = createDeferred()
+    const original = vi.mocked(counter.deliveryTaskResume).getMockImplementation()!
+    vi.mocked(counter.deliveryTaskResume).mockImplementationOnce(async (request) => {
+      await resumed.promise
+      return original(request)
+    })
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await button('继续')!.trigger('click')
+    await vi.waitFor(() => expect(counter.deliveryTaskResume).toHaveBeenCalledOnce())
+    await button('结束')!.trigger('click')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在结束')
+    resumed.resolve()
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+    await flushPromises()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(common.deliverStop).toBe(true)
+    expect(common.deliverLock).toBe(false)
+    expect(button('开始投递')).toBeDefined()
+  })
+
+  it('discards a mounted recovery read that finishes after the panel unmounts', async () => {
+    registerLifecycleTask('running')
+    const read = createDeferred<any>()
+    vi.mocked(counter.deliveryTaskRead).mockImplementationOnce(() => read.promise)
+    const snapshot = structuredClone(durableTaskState.value)
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() => expect(counter.deliveryTaskRead).toHaveBeenCalledOnce())
+    wrapper.unmount()
+    read.resolve(snapshot)
+    await flushPromises()
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(common.deliverLock).toBe(false)
+  })
+
+  it('retries a failed stop before exposing a new start', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
+    registerLifecycleTask()
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    vi.mocked(counter.deliveryTaskTerminate).mockRejectedValueOnce(
+      new Error('background disconnected'),
+    )
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    await button('结束')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在结束')
+    expect(button('开始投递')).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+    await flushPromises()
+    expect(counter.deliveryTaskTerminate).toHaveBeenCalledTimes(2)
+    expect(button('开始投递')).toBeDefined()
+  })
+
+  it('keeps an unconfirmed pause across a panel remount and saves it before recovery', async () => {
+    registerLifecycleTask('running')
+    const read = createDeferred<any>()
+    vi.mocked(counter.deliveryTaskRead).mockImplementationOnce(() => read.promise)
+    const wrapper = mount(OperationPanel)
+    await vi.waitFor(() => expect(counter.deliveryTaskRead).toHaveBeenCalledOnce())
+    vi.mocked(counter.deliveryTaskPause).mockRejectedValueOnce(new Error('offline'))
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '暂停')!
+      .trigger('click')
+    await vi.waitFor(() =>
+      expect(AgentMessage.info).toHaveBeenCalledWith(
+        '插件后台暂时不可用，暂停状态将在连接恢复后保存',
+      ),
+    )
+    expect(
+      JSON.parse(window.sessionStorage.getItem('agent-delivery:manual-control')!),
+    ).toMatchObject({ kind: 'pause', accountUid: 'account-a' })
+    wrapper.unmount()
+    const restored = mount(OperationPanel)
+    read.resolve(structuredClone(durableTaskState.value))
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
+    await flushPromises()
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(restored.find('.operation-panel__run-state').text()).toContain('已暂停')
+    expect(window.sessionStorage.getItem('agent-delivery:manual-control')).toBeNull()
+  })
+
   it('pauses without destroying the checkpoint, and only 结束 marks the task stopped', async () => {
     pagerNext.mockReturnValue(false)
     const batch = createDeferred<'stopped'>()
@@ -2564,6 +2808,9 @@ describe('operation panel pagination delivery', () => {
     // 投递中只提供「暂停」。暂停必须保住检查点，否则「继续」就只是重新开始。
     expect(findButton('结束')).toBeUndefined()
     await findButton('暂停')!.trigger('click')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在暂停')
+    expect(wrapper.findAll('button').some((button) => button.text() === '开始投递')).toBe(false)
+    batch.resolve('stopped')
     await vi.waitFor(() => expect(durableTaskState.value).toMatchObject({ status: 'paused' }))
     expect(durableTaskState.value.checkpoint).toBeTruthy()
     expect(durableTaskState.value.workerId).toBeUndefined()
@@ -2602,6 +2849,9 @@ describe('operation panel pagination delivery', () => {
     vi.mocked(counter.deliveryTaskPause).mockRejectedValueOnce(new Error('pause rpc failed'))
 
     await findButton('暂停')!.trigger('click')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在暂停')
+    expect(wrapper.findAll('button').some((button) => button.text() === '开始投递')).toBe(false)
+    batch.resolve('stopped')
     await vi.waitFor(() =>
       expect(AgentMessage.info).toHaveBeenCalledWith(
         '插件后台暂时不可用，暂停状态将在连接恢复后保存',
@@ -2610,7 +2860,7 @@ describe('operation panel pagination delivery', () => {
     expect(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')).not.toBeNull()
     expect(durableTaskState.value?.status).toBe('running')
     const waitingButtonTexts = wrapper.findAll('button').map((button) => button.text())
-    expect(waitingButtonTexts).toContain('暂停')
+    expect(waitingButtonTexts).toContain('正在暂停')
     expect(waitingButtonTexts).toContain('结束')
     expect(waitingButtonTexts).not.toContain('开始投递')
 
@@ -2823,6 +3073,9 @@ describe('operation panel pagination delivery', () => {
       .findAll('button')
       .find((button) => button.text() === '暂停')!
       .trigger('click')
+    expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在暂停')
+    expect(wrapper.findAll('button').some((button) => button.text() === '开始投递')).toBe(false)
+    batch.resolve('stopped')
     await vi.waitFor(() => expect(durableTaskState.value.status).toBe('paused'))
     heartbeat.resolve({
       accepted: false,
@@ -4008,6 +4261,25 @@ describe('operation panel pagination delivery', () => {
     )
   })
 
+  it('starts without a quota warning above 10 MiB when storage is unlimited', async () => {
+    storageUsageMock.mockResolvedValueOnce({
+      bytesInUse: 20 * 1024 * 1024,
+      quotaBytes: null,
+    })
+    resetStorageQuotaNotice()
+
+    const wrapper = mount(OperationPanel)
+    const startButton = wrapper.findAll('button').find((button) => button.text() === '开始投递')
+    await startButton!.trigger('click')
+    for (let index = 0; index < 6; index++) await flushPromises()
+
+    expect(logInfo).not.toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('扩展本地存储接近上限'),
+      expect.anything(),
+    )
+  })
+
   it('resumes a task whose steps are all done instead of killing it', async () => {
     // 换轮瞬间 currentIndex 会越过步骤边界。若此时刷新页面，恢复路径以前把这个
     // 状态判成任务级错误并清除任务；它应当与运行循环一致，视为「该补池换轮」。
@@ -4445,6 +4717,78 @@ describe('operation panel pagination delivery', () => {
       sourceLists.group.some((item) => item.encryptJobId === 'page-changed-but-pool-not-merged'),
     ).toBe(true)
     expect(pagerNext).toHaveBeenCalledOnce()
+  })
+
+  it('switches the task source before retrying a stale page and enters controlled waiting', async () => {
+    // 真实日志中的形态：任务游标仍指向搜索步骤，但页面已经回到 group
+    // 路由。旧实现因只有一个 group 步骤而直接放行，随后把每次页码变化
+    // 都当成新页，重复补池直到租约过期。
+    actualSource.value = 'group'
+    visibleSource.value = 'group'
+    window.history.replaceState({}, '', '/web/geek/jobs?ka=header-jobs')
+    getDeliveryLimit.mockImplementation((_, source) => (source === 'group' ? 50 : 50))
+    const processedGroupJob = job('processed-group-page')
+    processedGroupJob.status.setStatus('success')
+    jobListRef.value = [processedGroupJob]
+    sourceLists.group = []
+    sourceLists.search = []
+    pagerNext.mockImplementation(() => {
+      pagerPage.value = { ...pagerPage.value, page: pagerPage.value.page + 1 }
+      jobListRevision.value += 1
+      // 平台先更新分页状态，列表内容暂时保持不变。
+      return true
+    })
+
+    const checkpoint = {
+      accountUid: 'account-a',
+      id: 'stale-source-page-task',
+      startedAt: clock.now - 60_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [
+        {
+          source: 'search' as const,
+          url: 'https://www.zhipin.com/web/geek/job?query=RAG产品',
+          searchDirection: 'RAG产品',
+          status: 'waiting' as const,
+          pagesDone: 35,
+        },
+        {
+          source: 'group' as const,
+          url: 'https://www.zhipin.com/web/geek/jobs?ka=header-jobs',
+          status: 'running' as const,
+          pagesDone: 1,
+        },
+      ],
+    }
+    window.sessionStorage.setItem(
+      'agent-delivery:combined-delivery-task',
+      JSON.stringify(checkpoint),
+    )
+    registerDurableTask(checkpoint, { status: 'running' })
+
+    mount(OperationPanel)
+    await vi.waitFor(() => expect(durableTaskState.value?.status).toBe('waiting-for-page'))
+
+    const saved = JSON.parse(
+      window.sessionStorage.getItem('agent-delivery:combined-delivery-task') ?? 'null',
+    )
+    expect(saved.steps[1]).toMatchObject({ status: 'waiting', prefetchExhausted: false })
+    expect(saved.steps[1].prefetchRetryAt).toBeGreaterThan(clock.now)
+    expect(pagerNext).toHaveBeenCalledOnce()
+    expect(
+      logInfo.mock.calls.some(
+        ([title, message]) =>
+          title === '投递批次' &&
+          String(message).includes('混合投递池切换来源补充') &&
+          String(message).includes('"currentIndex":1'),
+      ),
+    ).toBe(true)
+    expect(logInfo).toHaveBeenCalledWith(
+      '投递任务',
+      expect.stringContaining('当前取岗步骤暂时不可用，保留并稍后自动重试'),
+      expect.anything(),
+    )
   })
 
   it('captures jobs appended by the next page while the first job stays unchanged', async () => {

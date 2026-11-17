@@ -58,4 +58,20 @@ describe('extension request loader isolation', () => {
 
     await waiting
   })
+
+  it('cancels a long delivery wait immediately and clears its timer', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const controller = new AbortController()
+      const waiting = delay(240, controller.signal)
+      expect(vi.getTimerCount()).toBe(1)
+      controller.abort()
+      await waiting
+      expect(vi.getTimerCount()).toBe(0)
+      await delay(240, controller.signal)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

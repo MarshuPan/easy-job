@@ -553,13 +553,15 @@ export class JobList {
     },
   )
 
-  async initJobList(formData: FormData) {
+  async initJobList(formData: FormData, signal?: AbortSignal) {
+    signal?.throwIfAborted()
     this._use_cache.value = formData.useCache.value
     if (this._use_cache.value) await getCacheManager().ready()
     await this.hydrateSourcePools()
-    await this.hookJobDetail()
-    this.clickJobCardAction = await this.hookClickJobCardAction()
-    await this.hookJobList()
+    signal?.throwIfAborted()
+    await this.hookJobDetail(signal)
+    this.clickJobCardAction = await this.hookClickJobCardAction(signal)
+    await this.hookJobList(signal)
   }
 
   async setAccountScope(uid: string | number) {

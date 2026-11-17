@@ -6,6 +6,8 @@ Easy Job 是一个开源浏览器扩展，支持 Chrome、Edge 和 Firefox。你
 
 [下载最新版本](https://github.com/MarshuPan/easy-job/releases/latest) · [快速开始](#快速开始) · [选择招呼语模式](#选择招呼语模式) · [问题反馈](https://github.com/MarshuPan/easy-job/issues)
 
+**1.3.47 更新**：修复岗位来源切换与分页完成判定，统一开始、暂停、继续和结束的执行控制；本机诊断按 10 MiB 分卷保留完整历史，并修正已授权无限存储时的容量误报。完整变更与安装包见 [版本说明](https://github.com/MarshuPan/easy-job/releases/tag/v1.3.47)。
+
 ![投递控制：今日进度、投递池、来源效率与任务序列](assets/readme/overview.png)
 
 > 本文配图由插件实际界面在独立离线环境中渲染，使用虚构岗位、简历、话术和统计数据。图中数字仅用于演示，不代表真实投递效果。
@@ -177,7 +179,7 @@ data/runtime/
 └── feedback/    # 话术版本、实际发送分段与会话反馈
 ```
 
-接收器默认永久保留，没有 200 条上限；文件达到大小后只滚动文件。只有显式设置正数 `EASY_JOB_LOG_RETENTION_DAYS` 才按天清理。未启动时事件进入扩展本地持久队列，恢复后补传，不阻塞投递。
+接收器默认永久保留，没有 200 条上限；每个文件最多约 10 MB（10 MiB），写入下一条事件会超出时新建带序号的文件，完整保留旧文件和事件。只有显式设置正数 `EASY_JOB_LOG_RETENTION_DAYS` 才按天清理。未启动时事件进入扩展本地持久队列，恢复后补传，不阻塞投递。
 
 检查采集完整性：
 

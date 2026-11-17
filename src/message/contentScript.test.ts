@@ -19,15 +19,20 @@ import { CHAT_RUNTIME_REQUEST, CHAT_RUNTIME_RESPONSE } from './chatRuntimeProtoc
 import { PENDING_GREETING_WAKE_TYPE } from './pendingGreetingProtocol'
 import type { BackgroundCounterApi } from './types'
 
-const { runtimeListeners, runtimeSendMessage, storageGet } = vi.hoisted(() => ({
-  runtimeListeners: [] as Array<(message: unknown, sender?: unknown) => unknown>,
-  runtimeSendMessage: vi.fn().mockResolvedValue(undefined),
-  storageGet: vi.fn().mockResolvedValue(null),
-}))
+const { runtimeListeners, runtimeSendMessage, storageGet, storageBytesInUse, storageManifest } =
+  vi.hoisted(() => ({
+    runtimeListeners: [] as Array<(message: unknown, sender?: unknown) => unknown>,
+    runtimeSendMessage: vi.fn().mockResolvedValue(undefined),
+    storageGet: vi.fn().mockResolvedValue(null),
+    storageBytesInUse: vi.fn(),
+    storageManifest: vi.fn(),
+  }))
 
 vi.mock('#imports', () => ({
   browser: {
+    storage: { local: { getBytesInUse: storageBytesInUse } },
     runtime: {
+      getManifest: storageManifest,
       id: 'test-extension',
       onMessage: {
         addListener: vi.fn((listener) => runtimeListeners.push(listener)),
@@ -49,6 +54,47 @@ const { ContentCounter, InjectBackgroundAdapter, ProvideContentAdapter, setBridg
   contentScriptModule
 
 describe('MAIN-world content counter', () => {
+  it('reads required unlimitedStorage through the API available to content scripts', async () => {
+    storageBytesInUse.mockResolvedValueOnce(20 * 1024 * 1024)
+    storageManifest.mockReturnValueOnce({ permissions: ['storage', 'unlimitedStorage'] })
+    const counter = new ContentCounter({} as BackgroundCounterApi)
+
+    await expect(counter.storageUsage()).resolves.toEqual({
+      bytesInUse: 20 * 1024 * 1024,
+      quotaBytes: null,
+    })
+    expect(storageManifest).toHaveBeenCalledOnce()
+    expect(storageBytesInUse).toHaveBeenCalledWith(null)
+  })
+
+  it('reports the ordinary quota when unlimitedStorage is not granted', async () => {
+    storageBytesInUse.mockResolvedValueOnce(9 * 1024 * 1024)
+    storageManifest.mockReturnValueOnce({ permissions: ['storage'] })
+    const counter = new ContentCounter({} as BackgroundCounterApi)
+
+    await expect(counter.storageUsage()).resolves.toEqual({
+      bytesInUse: 9 * 1024 * 1024,
+      quotaBytes: 10 * 1024 * 1024,
+    })
+  })
+
+  it('skips capacity warnings when browser usage cannot be read', async () => {
+    storageBytesInUse.mockRejectedValueOnce(new Error('unavailable'))
+    storageManifest.mockReturnValueOnce({ permissions: ['storage', 'unlimitedStorage'] })
+    const counter = new ContentCounter({} as BackgroundCounterApi)
+
+    await expect(counter.storageUsage()).resolves.toBeNull()
+  })
+
+  it('does not invent a quota if the permission check fails', async () => {
+    storageManifest.mockImplementationOnce(() => {
+      throw new Error('extension context invalidated')
+    })
+    const counter = new ContentCounter({} as BackgroundCounterApi)
+
+    await expect(counter.storageUsage()).resolves.toBeNull()
+  })
+
   it('returns the authenticated main-world readiness receipt to this extension only', async () => {
     setBridgeToken('readiness-token')
     const request = {

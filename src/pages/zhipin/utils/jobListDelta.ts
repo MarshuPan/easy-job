@@ -13,7 +13,13 @@ export function diffJobListSnapshot(before: JobListSnapshot, after: JobListSnaps
 
   return {
     addedJobIds,
-    responded:
-      after.page !== before.page || after.listRevision !== before.listRevision || jobIdsChanged,
+    pageChanged: after.page !== before.page,
+    listRevisionChanged: after.listRevision !== before.listRevision,
+    jobIdsChanged,
+    // BOSS updates the pager state before it replaces the visible list. A page
+    // number or an internal revision by itself is therefore not evidence that
+    // the requested page has arrived. The caller must keep waiting for a real
+    // list transition (including an empty list transition).
+    responded: jobIdsChanged,
   }
 }

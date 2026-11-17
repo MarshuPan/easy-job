@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto'
+
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -48,6 +51,11 @@ vi.mock('#imports', async () => ({
         removeListener: vi.fn(),
       },
       sendMessage: vi.fn(async (_id: string, message: any) => {
+        if (message.type === 'agent-delivery:worker-identity:request')
+          return {
+            type: 'agent-delivery:worker-identity:response',
+            workerId: `boss-tab-41:${message.sessionToken}`,
+          }
         if (message.task) fixture.aiRequests.push(copy(message))
         for (const listener of fixture.runtimeListeners) {
           const response = listener(message, {
@@ -97,6 +105,8 @@ vi.mock('@/stores/conf', () => ({
     },
     aiTaskTimeoutSeconds: 60,
     availableJobExpectations: [],
+    setAvailableJobExpectations: vi.fn(),
+    confPersist: vi.fn(async () => true),
   }),
 }))
 vi.mock('@/composables/useVue', () => ({
@@ -115,6 +125,10 @@ vi.mock('@/utils/logger', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }))
 vi.mock('@/ui/instrument', () => ({
+  AgentButton: {
+    emits: ['click'],
+    template: '<button @click="$emit(\'click\')"><slot /></button>',
+  },
   AgentMessage: { info: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }))
 
@@ -326,6 +340,19 @@ describe('local simulation of the delivery workflow across internal boundaries',
     vi.clearAllMocks()
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2030-01-07T02:00:00Z'))
+    // Native Web Crypto completes on real time, while finish() advances the
+    // simulated delivery clock. Under a busy test worker the clock can outrun
+    // that callback and falsely expire an AI request. Keep the browser boundary
+    // deterministic while still calculating the actual digest.
+    vi.spyOn(crypto.subtle, 'digest').mockImplementation(async (algorithm, data) => {
+      const name = typeof algorithm === 'string' ? algorithm : algorithm.name
+      const input = ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data)
+      return Uint8Array.from(
+        createHash(name.replaceAll('-', '').toLowerCase()).update(input).digest(),
+      ).buffer
+    })
     setActivePinia(createPinia())
     fixture.storage.clear()
     fixture.runtimeListeners.length = 0
@@ -363,6 +390,22 @@ describe('local simulation of the delivery workflow across internal boundaries',
       window.dispatchEvent(
         new MessageEvent('message', { data, source: window, origin: location.origin }),
       )
+      if (data.type === 'agent-delivery:runtime-probe-request')
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: {
+              type: 'agent-delivery:runtime-probe-response',
+              requestId: data.requestId,
+              bridgeToken: data.bridgeToken,
+              ok: true,
+              mainVersion: data.version,
+              contentVersion: data.version,
+              backgroundVersion: data.version,
+            },
+            source: window,
+            origin: location.origin,
+          }),
+        )
     })
     fixture.get.mockImplementation(async (_url, options) => {
       fixture.sequence.push('detail')
@@ -441,6 +484,77 @@ describe('local simulation of the delivery workflow across internal boundaries',
     Reflect.deleteProperty(document, 'currentScript')
     vi.useRealTimers()
     vi.unstubAllGlobals()
+  })
+
+  it('runs start, pause during AI, continue and stop through the real coordinator and delivery pipeline', async () => {
+    const { form, stats, pool, common, log } = await initialize()
+    form.jobSources = {
+      searchEnabled: false,
+      recommendEnabled: true,
+      enabledExpectIds: [],
+      expectationsInitialized: true,
+    }
+    form.deliveryLimit = { group: 100, search: 0 }
+    fixture.modelDelayMs = 5_000
+    const { default: OperationPanel } = await import('@/pages/zhipin/components/OperationPanel.vue')
+    const { usePager } = await import('@/pages/zhipin/hooks/usePager')
+    await usePager().initPager()
+    const expectations = document.createElement('div')
+    expectations.className = 'c-expect-select'
+    expectations.innerHTML = '<button class="synthesis active">推荐</button>'
+    document.body.append(expectations)
+    const { counter } = await import('@/message')
+    const wrapper = mount(OperationPanel)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    const until = async (check: () => boolean | Promise<boolean>) => {
+      for (let attempt = 0; attempt < 1_200; attempt++) {
+        await flushPromises()
+        if (await check()) return
+        await vi.advanceTimersByTimeAsync(250)
+      }
+      throw new Error(
+        `Lifecycle fixture stalled: ${wrapper.find('.operation-panel__hero-copy').text()}; ${(await counter.deliveryTaskRead('10001'))?.terminalMessage}; ${JSON.stringify(fixture.sequence)}`,
+      )
+    }
+    try {
+      await until(() => button('开始投递') != null)
+      await button('开始投递')!.trigger('click')
+      await until(() => fixture.aiRequests.some((request) => request.task === 'aiGreeting'))
+      const runId = (await counter.deliveryTaskRead('10001'))!.runId
+      await button('暂停')!.trigger('click')
+      expect(button('开始投递')).toBeUndefined()
+      expect(wrapper.find('.operation-panel__run-state').text()).toContain('正在暂停')
+      await until(async () => (await counter.deliveryTaskRead('10001'))?.status === 'paused')
+      expect(common.deliverLock).toBe(false)
+      expect(fixture.publishTimes).toHaveLength(0)
+      expect(fixture.send).not.toHaveBeenCalled()
+      expect(pool.listBySource('group')[0].status.status).toBe('wait')
+      expect(stats.todayData.success).toBe(0)
+      fixture.modelDelayMs = 0
+      await until(() => button('继续') != null)
+      await button('继续')!.trigger('click')
+      await until(() => fixture.send.mock.calls.length === 3)
+      expect((await counter.deliveryTaskRead('10001'))!.runId).toBe(runId)
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+      await until(() => button('暂停') != null)
+      await button('暂停')!.trigger('click')
+      await until(async () => (await counter.deliveryTaskRead('10001'))?.status === 'paused')
+      await until(() => button('结束') != null)
+      await button('结束')!.trigger('click')
+      await until(async () => (await counter.deliveryTaskRead('10001'))?.status === 'stopped')
+      await until(() => button('开始投递') != null)
+      expect(common.deliverLock).toBe(false)
+      const record = log.data.value.find((entry) => entry.job?.encryptJobId === 'fixture-job')!
+      expect(record.data?.publish?.ok).toBe(true)
+      expect(record.data?.greetingSend?.ok).toBe(true)
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(fixture.send).toHaveBeenCalledTimes(3)
+    } finally {
+      wrapper.unmount()
+      await flushPromises()
+    }
   })
 
   it('carries four historical, matched and generated facts through to sending and durable records', async () => {
@@ -662,7 +776,10 @@ describe('local simulation of the delivery workflow across internal boundaries',
         'completed',
       )
 
-      expect(fixture.publishTimes).toHaveLength(1)
+      expect(
+        fixture.publishTimes,
+        JSON.stringify({ sequence: fixture.sequence, status: item.status }),
+      ).toHaveLength(1)
       expect(fixture.publishTimes[0] - startedAt).toBeGreaterThanOrEqual(
         Math.max(30_000, modelDelayMs * aiCalls),
       )

@@ -10,6 +10,7 @@ import {
 import { useCommon } from '@/composables/useCommon'
 import { createEmptyStatistics, useStatistics } from '@/composables/useStatistics'
 import { getRuntimeGreetingMode } from '@/config/greetingMode'
+import { getDeliveryLifecycle } from '@/delivery/lifecycle'
 import { useConf } from '@/stores/conf'
 import { reportDeliveryStage, reportDeliveryWait } from '@/stores/deliveryActivity'
 import type { MyJobListData } from '@/stores/jobs'
@@ -128,6 +129,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
   const log = useLog()
   const statistics = useStatistics()
   const common = useCommon()
+  const lifecycle = getDeliveryLifecycle(common)
   const liveConf = useConf()
   let activeRuntimeFormData: FormData | null = null
   let activeBatchHooks: DeliveryBatchHooks | undefined
@@ -1170,10 +1172,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
     data: MyJobListData,
     source?: ReturnType<typeof getDeliveryLimitSource>,
   ) {
-    if (common.deliverLock) {
+    if (
+      common.deliverLock ||
+      lifecycle.command.value != null ||
+      lifecycle.pendingControl.value != null
+    ) {
       AgentMessage.info('当前已有投递任务在执行')
       return
     }
+    const run = lifecycle.acquire()
+    if (run == null) return
     common.deliverLock = true
     common.deliverStop = false
     try {
@@ -1181,6 +1189,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       await processJob(data, chandle, { index: 0, total: 1, source })
     } finally {
       common.deliverLock = false
+      lifecycle.release(run)
     }
   }
 
@@ -1204,10 +1213,16 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       AgentMessage.info(`该岗位已达到 ${maxManualJobRetries} 次重试上限，已跳过`)
       return
     }
-    if (common.deliverLock) {
+    if (
+      common.deliverLock ||
+      lifecycle.command.value != null ||
+      lifecycle.pendingControl.value != null
+    ) {
       AgentMessage.info('当前已有投递任务在执行')
       return
     }
+    const run = lifecycle.acquire()
+    if (run == null) return
     common.deliverLock = true
     common.deliverStop = false
     try {
@@ -1243,6 +1258,7 @@ export const useDeliver = defineStore('zhipin/deliver', () => {
       }
     } finally {
       common.deliverLock = false
+      lifecycle.release(run)
     }
   }
 

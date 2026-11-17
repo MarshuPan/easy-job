@@ -29,9 +29,20 @@ describe('storage quota detection', () => {
   })
 
   it('treats 80% of the quota as the soft limit', () => {
-    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES * 0.79)).toBe(false)
-    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES * 0.8)).toBe(true)
-    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES)).toBe(true)
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES * 0.79, STORAGE_QUOTA_BYTES)).toBe(false)
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES * 0.8, STORAGE_QUOTA_BYTES)).toBe(true)
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES, STORAGE_QUOTA_BYTES)).toBe(true)
+  })
+
+  it('does not apply the ordinary 10 MiB quota to unlimited storage', () => {
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES * 3, null)).toBe(false)
+  })
+
+  it('uses the supplied quota and ignores invalid capacity readings', () => {
+    expect(isStorageUsageOverSoftLimit(4 * 1024 * 1024, 5 * 1024 * 1024)).toBe(true)
+    expect(isStorageUsageOverSoftLimit(Number.NaN, STORAGE_QUOTA_BYTES)).toBe(false)
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES, 0)).toBe(false)
+    expect(isStorageUsageOverSoftLimit(STORAGE_QUOTA_BYTES, Number.NaN)).toBe(false)
   })
 
   it('throttles repeated notices so a full disk cannot spam the user', () => {

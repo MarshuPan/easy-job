@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 
-import { createLocalLogSinkServer } from './local-log-sink.mjs'
+import { createLocalLogSinkServer, MAX_FILE_BYTES } from './local-log-sink.mjs'
 
 const servers = []
 
@@ -30,6 +30,66 @@ function event(overrides = {}) {
 }
 
 describe('local log sink', () => {
+  it('rolls complete events at 10 MiB and preserves history across restart and retries', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'easy-job-rollover-'))
+    let sink = createLocalLogSinkServer({ root, port: 0 })
+    servers.push(sink)
+    let address = await sink.listen()
+    const at = Date.now()
+    const inputs = Array.from({ length: 26 }, (_, index) => ({
+      ...event({ jobId: `rollover-${index}`, fullPrompt: 'x'.repeat(420_000) }),
+      at,
+      sourceSessionId: 'rollover-session',
+      sequence: index + 1,
+    }))
+    const send = async (events) => {
+      const response = await fetch(`http://127.0.0.1:${address.port}/v1/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ events }),
+      })
+      assert.equal(response.status, 202)
+      assert.deepEqual(await response.json(), { ok: true, accepted: events.length })
+    }
+
+    await send(inputs.slice(0, 25))
+    await send(inputs.slice(25))
+    const directory = path.join(root, 'deliveries')
+    const files = (await readdir(directory)).sort((a, b) => a.length - b.length)
+    assert.equal(files.length, 2)
+    const contents = await Promise.all(
+      files.map((name) => readFile(path.join(directory, name), 'utf8')),
+    )
+    const firstSize = (await stat(path.join(directory, files[0]))).size
+    assert.ok(firstSize > 8 * 1024 * 1024, 'continues in the same file beyond the old 8 MiB limit')
+    assert.equal(MAX_FILE_BYTES, 10 * 1024 * 1024)
+    for (const content of contents) {
+      assert.ok(content.endsWith('\n'), 'rotation preserves whole NDJSON events')
+      assert.ok(Buffer.byteLength(content, 'utf8') <= MAX_FILE_BYTES)
+    }
+    const records = contents.flatMap((content) => content.trimEnd().split('\n').map(JSON.parse))
+    assert.deepEqual(
+      records.map((item) => item.id),
+      inputs.map((item) => item.id),
+    )
+    for (const [index, record] of records.entries()) {
+      assert.equal(record.data.fullPrompt, inputs[index].data.fullPrompt)
+      assert.equal(record.sequence, index + 1)
+    }
+
+    await sink.close()
+    sink = createLocalLogSinkServer({ root, port: 0 })
+    servers.push(sink)
+    address = await sink.listen()
+    await send(inputs)
+    assert.deepEqual((await readdir(directory)).sort(), [...files].sort())
+    for (const [index, name] of files.entries()) {
+      assert.equal(await readFile(path.join(directory, name), 'utf8'), contents[index])
+    }
+    await sink.close()
+    await rm(root, { recursive: true, force: true })
+  })
+
   it('keeps structured detail, sequences and JSON boundaries through URL sanitization', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'easy-job-log-'))
     const sink = createLocalLogSinkServer({ root, port: 0 })

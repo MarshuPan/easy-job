@@ -87,14 +87,16 @@ export function usePager() {
     next,
     prev,
     reload,
-    initPager: async () => {
+    initPager: async (signal?: AbortSignal) => {
+      signal?.throwIfAborted()
       ready.value = false
-      await initPage()
+      await initPage(signal)
       pageChange.value =
         location.href.includes('/web/geek/job-recommend') ||
         location.href.includes('/web/geek/jobs')
-          ? await initSearch()
-          : await initChange()
+          ? await initSearch(signal)
+          : await initChange(signal)
+      signal?.throwIfAborted()
       if (!pageChange.value) {
         throw new Error('pageChange is undefined')
       }

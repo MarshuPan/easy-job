@@ -34,8 +34,17 @@ export function animate({
 let delayLoadId: number | undefined
 
 // 纯计时等待。批量休息、节奏等待和轮询不应伪装成页面正在加载。
-export async function delay(s: number) {
-  return new Promise((resolve) => setTimeout(resolve, s * 1000))
+export async function delay(s: number, signal?: AbortSignal) {
+  if (signal?.aborted) return
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, s * 1000)
+    signal?.addEventListener('abort', finish, { once: true })
+  })
 }
 
 // 加载进度条

@@ -13,32 +13,40 @@ interface VueDataHookState {
 
 const vueDataHooks = new WeakMap<object, Map<string, VueDataHookState>>()
 
-export async function getRootVue(): Promise<any> {
-  if (rootVue.value !== undefined) {
-    return rootVue.value
-  }
+function waitForVue(selectors: string, message: string, signal?: AbortSignal, intervalMs = 100) {
+  signal?.throwIfAborted()
+  return new Promise<any>((resolve, reject) => {
+    let interval: ReturnType<typeof setInterval>
+    let timeout: ReturnType<typeof setTimeout>
+    const cleanup = () => {
+      clearInterval(interval)
+      clearTimeout(timeout)
+      signal?.removeEventListener('abort', abort)
+    }
+    const abort = () => {
+      cleanup()
+      reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'))
+    }
+    const read = () => {
+      const instance = document.querySelector<any>(selectors)?.__vue__
+      if (instance == null) return
+      cleanup()
+      resolve(instance)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    interval = setInterval(read, intervalMs)
+    timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error(message))
+    }, 20000)
+    read()
+  })
+}
 
-  const waitVueMount = async () => {
-    return new Promise((resolve, reject) => {
-      const interval = setInterval(() => {
-        const wrap = document.querySelector('#wrap')
-        if (rootVue.value !== undefined) {
-          return resolve(rootVue.value)
-        }
-        if (wrap && '__vue__' in wrap) {
-          rootVue.value = wrap.__vue__
-          resolve(rootVue.value)
-          clearInterval(interval)
-        }
-      }, 300)
-      setTimeout(() => {
-        reject(new Error('未找到vue根组件'))
-        clearInterval(interval)
-      }, 20000)
-    })
-  }
-
-  await waitVueMount()
+export async function getRootVue(signal?: AbortSignal): Promise<any> {
+  signal?.throwIfAborted()
+  if (rootVue.value !== undefined) return rootVue.value
+  rootVue.value = await waitForVue('#wrap', '未找到vue根组件', signal, 300)
   return rootVue.value
 }
 
@@ -49,20 +57,9 @@ export function useHookVueData<T = any>(
   update?: (val: T) => void,
 ) {
   const subscriber: VueDataHookSubscriber<T> = { data, update }
-  return async () => {
-    const jobVue = await new Promise<any>((resolve, reject) => {
-      const interval = setInterval(() => {
-        const jobVue = document.querySelector<any>(selectors)?.__vue__
-        if (jobVue) {
-          resolve(jobVue)
-          clearInterval(interval)
-        }
-      }, 100)
-      setTimeout(() => {
-        reject(new Error('未找到对应元素'))
-        clearInterval(interval)
-      }, 20000)
-    })
+  return async (signal?: AbortSignal) => {
+    const jobVue = await waitForVue(selectors, '未找到对应元素', signal)
+    signal?.throwIfAborted()
 
     data.value = jobVue[key]
     update?.(toValue(jobVue[key] as T))
@@ -106,20 +103,10 @@ export function useHookVueData<T = any>(
 }
 
 export function useHookVueFn(selectors: string, key: string | string[]) {
-  return async () => {
-    const jobVue = await new Promise<any>((resolve, reject) => {
-      const interval = setInterval(() => {
-        const jobVue = document.querySelector<any>(selectors)?.__vue__
-        if (jobVue) {
-          resolve(jobVue)
-          clearInterval(interval)
-        }
-      }, 100)
-      setTimeout(() => {
-        reject(new Error('未找到对应元素'))
-        clearInterval(interval)
-      }, 20000)
-    })
+  return async (signal?: AbortSignal) => {
+    const jobVue = await waitForVue(selectors, '未找到对应元素', signal)
+    signal?.throwIfAborted()
+
     const bindVueFn = (fn: any) => (typeof fn === 'function' ? fn.bind(jobVue) : fn)
     if (Array.isArray(key)) {
       for (const k of key) {

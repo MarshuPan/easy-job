@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 export const DEFAULT_PORT = 3210
 /** 与扩展端一致；超大业务事件由扩展端拆成可重组分片。 */
 export const MAX_EVENT_BYTES = 512 * 1024
-export const MAX_FILE_BYTES = 8 * 1024 * 1024
+export const MAX_FILE_BYTES = 10 * 1024 * 1024
 // The extension sends at most 25 events per batch. Allow a full batch of
 // max-sized events plus JSON framing; otherwise valid chunked diagnostics can
 // be rejected before individual event validation runs.

@@ -151,6 +151,6 @@ export interface ContentCounterApi extends Pick<
   storageGet<T>(key: string): Promise<T | null>
   storageSet<T>(key: string, value: T): Promise<boolean>
   storageRm(key: string): Promise<boolean>
-  storageUsage(): Promise<{ bytesInUse: number; quotaBytes: number } | null>
+  storageUsage(): Promise<{ bytesInUse: number; quotaBytes: number | null } | null>
   contentScriptTest(type: 'success' | 'error'): Promise<number>
 }

@@ -24,6 +24,9 @@ describe('diffJobListSnapshot', () => {
 
     expect(result).toEqual({
       responded: true,
+      pageChanged: true,
+      listRevisionChanged: true,
+      jobIdsChanged: true,
       addedJobIds: ['job-3', 'job-4'],
     })
   })
@@ -40,11 +43,14 @@ describe('diffJobListSnapshot', () => {
 
     expect(result).toEqual({
       responded: true,
+      pageChanged: true,
+      listRevisionChanged: true,
+      jobIdsChanged: true,
       addedJobIds: ['job-3', 'job-4'],
     })
   })
 
-  it('treats a page response containing only duplicate jobs as completed', () => {
+  it('does not treat a page number change with the same visible jobs as a response', () => {
     const result = diffJobListSnapshot(
       createSnapshot(),
       createSnapshot({
@@ -54,7 +60,10 @@ describe('diffJobListSnapshot', () => {
     )
 
     expect(result).toEqual({
-      responded: true,
+      responded: false,
+      pageChanged: true,
+      listRevisionChanged: true,
+      jobIdsChanged: false,
       addedJobIds: [],
     })
   })
@@ -62,6 +71,19 @@ describe('diffJobListSnapshot', () => {
   it('does not report a response while the observed list is unchanged', () => {
     expect(diffJobListSnapshot(createSnapshot(), createSnapshot())).toEqual({
       responded: false,
+      pageChanged: false,
+      listRevisionChanged: false,
+      jobIdsChanged: false,
+      addedJobIds: [],
+    })
+  })
+
+  it('does not treat an internal list revision alone as a response', () => {
+    expect(diffJobListSnapshot(createSnapshot(), createSnapshot({ listRevision: 2 }))).toEqual({
+      responded: false,
+      pageChanged: false,
+      listRevisionChanged: true,
+      jobIdsChanged: false,
       addedJobIds: [],
     })
   })

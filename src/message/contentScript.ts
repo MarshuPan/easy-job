@@ -235,13 +235,19 @@ export class ContentCounter implements ContentCounterApi {
   }
 
   /**
-   * 当前扩展本地存储的已用字节数。用于在投递开始前提醒用户清理，
-   * 避免运行到一半配额写满导致记录与投递池无法保存。
+   * 当前扩展本地存储用量及实际配额。已获 unlimitedStorage 时没有固定
+   * 容量上限，返回 null，不能再按普通扩展的 10 MiB 配额误报。
    */
   async storageUsage() {
     try {
+      // Content scripts can read runtime.getManifest(), but cannot use the
+      // permissions API. This is a required manifest permission: an enabled
+      // extension has already been granted it when installed or updated.
+      const unlimitedStorage = browser.runtime
+        .getManifest()
+        .permissions?.includes('unlimitedStorage')
       const bytesInUse = await browser.storage.local.getBytesInUse(null)
-      return { bytesInUse, quotaBytes: STORAGE_QUOTA_BYTES }
+      return { bytesInUse, quotaBytes: unlimitedStorage ? null : STORAGE_QUOTA_BYTES }
     } catch {
       // 浏览器不支持或调用失败时返回 null，调用方跳过检查即可，不影响投递。
       return null

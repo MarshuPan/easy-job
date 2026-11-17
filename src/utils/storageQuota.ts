@@ -9,7 +9,7 @@
  */
 export const STORAGE_QUOTA_BYTES = 10 * 1024 * 1024
 
-/** 超过该比例即认为需要提醒用户清理，留出余量避免写入直接失败。 */
+/** 仅在浏览器确实限制容量时提醒，留出余量避免写入直接失败。 */
 export const STORAGE_QUOTA_SOFT_RATIO = 0.8
 
 export const STORAGE_QUOTA_ERROR_MESSAGE = '扩展本地存储已满，投递记录和投递池无法继续保存'
@@ -31,8 +31,14 @@ export function formatStorageBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
 
-export function isStorageUsageOverSoftLimit(bytesInUse: number) {
-  return bytesInUse >= STORAGE_QUOTA_BYTES * STORAGE_QUOTA_SOFT_RATIO
+export function isStorageUsageOverSoftLimit(bytesInUse: number, quotaBytes: number | null) {
+  return (
+    Number.isFinite(bytesInUse) &&
+    quotaBytes != null &&
+    Number.isFinite(quotaBytes) &&
+    quotaBytes > 0 &&
+    bytesInUse >= quotaBytes * STORAGE_QUOTA_SOFT_RATIO
+  )
 }
 
 const quotaNoticeIntervalMs = 5 * 60 * 1000

@@ -372,16 +372,28 @@ export class DeliveryTaskCoordinator {
     return this.mutate<DeliveryTaskMutationResult>((tasks) => {
       const stored = tasks[request.uid]
       const current = stored ? effectiveTask(stored, now) : null
-      // 暂停中的任务不阻挡另开一轮：界面在暂停态只给「继续」和「结束」，
-      // 真的走到这里说明用户明确要开新的一轮，覆盖旧检查点是预期结果。
-      if (current && activeStatuses.has(current.status) && current.runId !== request.runId) {
+      const conflict =
+        current == null
+          ? null
+          : current.status === 'paused'
+            ? current.runId === request.runId
+              ? 'task-paused'
+              : 'active-run'
+            : current.runId === request.runId && terminalStatuses.has(current.status)
+              ? 'task-terminal'
+              : activeStatuses.has(current.status) && current.runId !== request.runId
+                ? 'active-run'
+                : current.runId === request.runId && ownsLiveWorker(current, request.workerId, now)
+                  ? 'worker-owned'
+                  : null
+      if (current != null && conflict != null) {
         if (current !== stored) tasks[request.uid] = current
         return {
           changed: current !== stored,
           result: {
             accepted: false,
             task: cloneTask(current),
-            conflict: 'active-run' as const,
+            conflict,
           },
         }
       }
@@ -393,10 +405,17 @@ export class DeliveryTaskCoordinator {
         runId: request.runId,
         status: 'running',
         phase: 'acquiring',
-        checkpoint: structuredClone(request.checkpoint),
+        // A retried start cannot rewind a checkpoint or replace a running configuration.
+        checkpoint: structuredClone(
+          current?.runId === request.runId ? current.checkpoint : request.checkpoint,
+        ),
         ...(request.configSnapshot === undefined
           ? {}
-          : { configSnapshot: structuredClone(request.configSnapshot) }),
+          : {
+              configSnapshot: structuredClone(
+                current?.runId === request.runId ? current.configSnapshot : request.configSnapshot,
+              ),
+            }),
         workerId: request.workerId,
         leaseExpiresAt: now + DELIVERY_WORKER_LEASE_MS,
         startedAt,

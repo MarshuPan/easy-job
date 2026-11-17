@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
 
-import { useHookVueData } from './useVue'
+import { useHookVueData, useHookVueFn } from './useVue'
 
 function mountRuntime(runtime: Record<string, unknown>) {
   const host = document.createElement('div')
@@ -51,4 +51,31 @@ describe('useHookVueData', () => {
     expect(firstUpdate).toHaveBeenCalledTimes(1)
     expect(secondUpdate).toHaveBeenCalledTimes(1)
   })
+
+  it.each(['data', 'action'])(
+    'cancels a missing %s binding without late attachment',
+    async (kind) => {
+      vi.useFakeTimers()
+      try {
+        const controller = new AbortController()
+        const data = ref<string[]>([])
+        const update = vi.fn()
+        const bind =
+          kind === 'data'
+            ? useHookVueData('#runtime', 'jobs', data, update)
+            : useHookVueFn('#runtime', 'next')
+        const binding = bind(controller.signal)
+        const rejected = expect(binding).rejects.toMatchObject({ name: 'AbortError' })
+        controller.abort()
+        await rejected
+        expect(vi.getTimerCount()).toBe(0)
+        mountRuntime({ jobs: ['late'], next: vi.fn() })
+        await vi.advanceTimersByTimeAsync(21_000)
+        expect(data.value).toEqual([])
+        expect(update).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
 })

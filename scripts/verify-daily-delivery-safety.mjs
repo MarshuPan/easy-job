@@ -85,7 +85,7 @@ assert.match(
 )
 assert.match(
   operationSource,
-  /pendingManualPause = \{ accountUid, taskId \}[\s\S]*?scheduleDeliveryResumeAt\(Date\.now\(\) \+ deliveryReconnectRetryMs\)[\s\S]*?async function retryPendingManualPause\(\)/,
+  /pendingManualControl\.value = control[\s\S]*?scheduleDeliveryResumeAt\(Date\.now\(\) \+ deliveryReconnectRetryMs\)[\s\S]*?async function retryPendingManualControl\(\)/,
   'a pause RPC interruption should retain and automatically retry the pause intent',
 )
 assert.match(

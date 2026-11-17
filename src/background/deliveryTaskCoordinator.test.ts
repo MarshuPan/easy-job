@@ -250,6 +250,49 @@ describe('DeliveryTaskCoordinator', () => {
     })
   })
 
+  it('rejects stale starts after pause or termination instead of reopening the task', async () => {
+    const coordinator = new DeliveryTaskCoordinator(memoryStorage().adapter)
+    const request = startRequest()
+    await coordinator.start(request, 1_000)
+    await coordinator.pause(request, 2_000)
+    expect(await coordinator.start(request, 3_000)).toMatchObject({
+      accepted: false,
+      conflict: 'task-paused',
+    })
+    expect(await coordinator.start(startRequest('run-b'), 3_000)).toMatchObject({
+      accepted: false,
+      conflict: 'active-run',
+    })
+    expect((await coordinator.read(request.uid, 3_000))?.checkpoint).toEqual(request.checkpoint)
+    await coordinator.terminate({ ...request, reason: 'manual-stop' }, 4_000)
+    expect(await coordinator.start(request, 5_000)).toMatchObject({
+      accepted: false,
+      conflict: 'task-terminal',
+    })
+    expect(await coordinator.start(startRequest('run-b'), 6_000)).toMatchObject({
+      accepted: true,
+      task: { runId: 'run-b' },
+    })
+  })
+
+  it('keeps the latest checkpoint on start retry and rejects a competing live worker', async () => {
+    const coordinator = new DeliveryTaskCoordinator(memoryStorage().adapter)
+    const request = startRequest()
+    await coordinator.start(request, 1_000)
+    await coordinator.checkpoint(
+      { ...request, checkpoint: checkpoint('run-a', { currentIndex: 3 }) },
+      2_000,
+    )
+    expect(await coordinator.start(request, 3_000)).toMatchObject({
+      accepted: true,
+      task: { checkpoint: { currentIndex: 3 } },
+    })
+    expect(await coordinator.start(startRequest('run-a', 'worker-b'), 4_000)).toMatchObject({
+      accepted: false,
+      conflict: 'worker-owned',
+    })
+  })
+
   it('rejects a mismatched or malformed checkpoint before it reaches storage', async () => {
     const storage = memoryStorage()
     const coordinator = new DeliveryTaskCoordinator(storage.adapter)
