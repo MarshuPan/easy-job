@@ -45,6 +45,7 @@ vi.mock('#imports', async () => ({
   browser: {
     runtime: {
       id: 'integration-extension',
+      getManifest: () => ({ permissions: ['storage', 'unlimitedStorage'] }),
       getURL: (path: string) => `chrome-extension://integration-extension/${path}`,
       onMessage: {
         addListener: (listener: any) => fixture.runtimeListeners.push(listener),
@@ -208,6 +209,15 @@ async function finish<T>(operation: Promise<T>): Promise<T> {
     throw new Error('Local workflow did not settle within five simulated minutes')
   if ('error' in settled) throw settled.error
   return settled.value
+}
+
+async function untilPipeline(check: () => boolean | Promise<boolean>) {
+  for (let attempt = 0; attempt < 1_200; attempt++) {
+    await flushPromises()
+    if (await check()) return
+    await vi.advanceTimersByTimeAsync(250)
+  }
+  throw new Error(`Pipeline stalled: ${JSON.stringify(fixture.sequence)}`)
 }
 
 async function initialize(options: { customText?: string; filtering?: boolean } = {}) {
@@ -555,6 +565,224 @@ describe('local simulation of the delivery workflow across internal boundaries',
       wrapper.unmount()
       await flushPromises()
     }
+  })
+
+  it('recovers the original background task after clicking start before page initialization completes', async () => {
+    const { form, pool, stats, log } = await initialize()
+    form.jobSources = {
+      searchEnabled: false,
+      recommendEnabled: true,
+      enabledExpectIds: [],
+      expectationsInitialized: true,
+    }
+    form.deliveryLimit = { group: 100, search: 0 }
+    const { buildDeliveryConfigSnapshot } = await import('@/delivery/configSnapshot')
+    const { counter } = await import('@/message')
+    const checkpoint = {
+      accountUid: '10001',
+      id: 'previous-page-task',
+      startedAt: Date.now() - 86_400_000,
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [{ source: 'group', url: location.href, status: 'running', pagesDone: 0 }],
+    }
+    const snapshot = buildDeliveryConfigSnapshot(form, 0)
+    expect(
+      (
+        await counter.deliveryTaskStart({
+          uid: '10001',
+          runId: checkpoint.id,
+          workerId: 'closed-page',
+          checkpoint,
+          configSnapshot: snapshot,
+        })
+      ).accepted,
+    ).toBe(true)
+    await counter.deliveryTaskRelease({
+      uid: '10001',
+      runId: checkpoint.id,
+      workerId: 'closed-page',
+    })
+    window.sessionStorage.removeItem('agent-delivery:combined-delivery-task')
+    form.aiFiltering.enable = false
+
+    const { default: OperationPanel } = await import('@/pages/zhipin/components/OperationPanel.vue')
+    const wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    try {
+      await button('开始投递')!.trigger('click')
+      await untilPipeline(() => wrapper.text().includes('等待中'))
+      expect((await counter.deliveryTaskRead('10001'))!.runId).toBe(checkpoint.id)
+      expect(button('开始投递')).toBeUndefined()
+      expect(
+        fixture.diagnostics.some((event) => event.event === 'task.started' && !event.data.accepted),
+      ).toBe(false)
+      expect(fixture.publishTimes).toHaveLength(0)
+      expect(pool.listBySource('group')[0].status.status).toBe('pending')
+
+      const { usePager } = await import('@/pages/zhipin/hooks/usePager')
+      await usePager().initPager()
+      const expectations = document.createElement('div')
+      expectations.className = 'c-expect-select'
+      expectations.innerHTML = '<button class="synthesis active">推荐</button>'
+      document.body.append(expectations)
+      await wrapper.setProps({ runtimeReady: true })
+      await untilPipeline(() => fixture.send.mock.calls.length === 3)
+      expect((await counter.deliveryTaskRead('10001'))!.runId).toBe(checkpoint.id)
+      expect(fixture.aiRequests.some((request) => request.task === 'aiFiltering')).toBe(true)
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+      const record = log.data.value.find((entry) => entry.job?.encryptJobId === 'fixture-job')!
+      expect(record.data?.publish?.ok).toBe(true)
+      expect(record.data?.greetingSend?.ok).toBe(true)
+      await untilPipeline(() => button('暂停') != null)
+      await button('暂停')!.trigger('click')
+      await untilPipeline(
+        async () => (await counter.deliveryTaskRead('10001'))?.status === 'paused',
+      )
+      await untilPipeline(() => button('结束') != null)
+      await button('结束')!.trigger('click')
+      await untilPipeline(
+        async () => (await counter.deliveryTaskRead('10001'))?.status === 'stopped',
+      )
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(fixture.send).toHaveBeenCalledTimes(3)
+    } finally {
+      wrapper.unmount()
+      await flushPromises()
+    }
+  })
+
+  it('keeps another page lease during a real registration race and takes over only after expiry', async () => {
+    const { form, stats } = await initialize()
+    form.jobSources = {
+      searchEnabled: false,
+      recommendEnabled: true,
+      enabledExpectIds: [],
+      expectationsInitialized: true,
+    }
+    form.deliveryLimit = { group: 100, search: 0 }
+    const { buildDeliveryConfigSnapshot } = await import('@/delivery/configSnapshot')
+    const { counter } = await import('@/message')
+    const { browser } = await import('#imports')
+    const checkpoint = {
+      accountUid: '10001',
+      id: 'other-page-task',
+      startedAt: Date.now(),
+      currentIndex: 0,
+      poolWarmup: { completed: true, attemptedStepIndexes: [], lowWaterArmed: true },
+      steps: [{ source: 'group', url: location.href, status: 'running', pagesDone: 0 }],
+    }
+    const configSnapshot = buildDeliveryConfigSnapshot(form, 0)
+    const { usePager } = await import('@/pages/zhipin/hooks/usePager')
+    await usePager().initPager()
+    const expectations = document.createElement('div')
+    expectations.className = 'c-expect-select'
+    expectations.innerHTML = '<button class="synthesis active">推荐</button>'
+    document.body.append(expectations)
+    const { default: OperationPanel } = await import('@/pages/zhipin/components/OperationPanel.vue')
+    const wrapper = mount(OperationPanel)
+    const button = (label: string) =>
+      wrapper.findAll('button').find((item) => item.text() === label)
+    let leaseExpiresAt = 0
+    try {
+      await untilPipeline(() => button('开始投递') != null)
+      // Race from an external browser API wait, retaining the real start/claim coordinator.
+      vi.mocked(browser.storage.local.getBytesInUse).mockImplementationOnce(async () => {
+        const result = await counter.deliveryTaskStart({
+          uid: '10001',
+          runId: checkpoint.id,
+          workerId: 'boss-tab-42:other-page',
+          checkpoint,
+          configSnapshot,
+        })
+        expect(result.accepted).toBe(true)
+        leaseExpiresAt = result.task!.leaseExpiresAt!
+        return 0
+      })
+      await button('开始投递')!.trigger('click')
+      await untilPipeline(() =>
+        fixture.diagnostics.some(
+          (event) => event.data?.message === '投递任务等待：其他标签页正在执行',
+        ),
+      )
+      const owner = (await counter.deliveryTaskRead('10001'))!
+      expect(owner).toMatchObject({ runId: checkpoint.id, workerId: 'boss-tab-42:other-page' })
+      expect(Date.now()).toBeLessThan(leaseExpiresAt)
+      expect(fixture.publishTimes).toHaveLength(0)
+      expect(fixture.send).not.toHaveBeenCalled()
+      expect(
+        fixture.diagnostics.filter(
+          (event) => event.event === 'task.started' && !event.data.accepted,
+        ),
+      ).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(leaseExpiresAt - Date.now() + 1)
+      await untilPipeline(() => fixture.send.mock.calls.length === 3)
+      expect((await counter.deliveryTaskRead('10001'))!.runId).toBe(checkpoint.id)
+      expect(stats.todayData).toMatchObject({ total: 1, success: 1 })
+      await untilPipeline(() => button('暂停') != null)
+      await button('暂停')!.trigger('click')
+      await untilPipeline(
+        async () => (await counter.deliveryTaskRead('10001'))?.status === 'paused',
+      )
+      await untilPipeline(() => button('结束') != null)
+      await button('结束')!.trigger('click')
+      await untilPipeline(
+        async () => (await counter.deliveryTaskRead('10001'))?.status === 'stopped',
+      )
+      expect(fixture.publishTimes).toHaveLength(1)
+      expect(fixture.send).toHaveBeenCalledTimes(3)
+    } finally {
+      wrapper.unmount()
+      await flushPromises()
+    }
+  })
+
+  it('timestamps a rejected start by its operation time while retaining the old task timestamp', async () => {
+    const { form } = await initialize()
+    const { buildDeliveryConfigSnapshot } = await import('@/delivery/configSnapshot')
+    const { counter } = await import('@/message')
+    const now = Date.now()
+    vi.setSystemTime(now - 86_400_000)
+    const checkpoint = {
+      accountUid: '10001',
+      id: 'yesterday-task',
+      startedAt: Date.now(),
+      currentIndex: 0,
+      steps: [{ source: 'group', url: location.href, status: 'running', pagesDone: 0 }],
+    }
+    const configSnapshot = buildDeliveryConfigSnapshot(form, 0)
+    await counter.deliveryTaskStart({
+      uid: '10001',
+      runId: checkpoint.id,
+      workerId: 'closed-page',
+      checkpoint,
+      configSnapshot,
+    })
+    await counter.deliveryTaskRelease({
+      uid: '10001',
+      runId: checkpoint.id,
+      workerId: 'closed-page',
+    })
+    vi.setSystemTime(now)
+    const result = await counter.deliveryTaskStart({
+      uid: '10001',
+      runId: 'today-attempt',
+      workerId: 'new-page',
+      checkpoint: { ...checkpoint, id: 'today-attempt' },
+      configSnapshot,
+    })
+    expect(result).toMatchObject({ accepted: false, conflict: 'active-run' })
+    const event = fixture.diagnostics.filter((item) => item.event === 'task.started').at(-1)!
+    expect(event.at).toBe(now)
+    expect(event.data.taskUpdatedAt).toBe(now - 86_400_000)
+    expect(event.data.taskSnapshot.updatedAt).toBe(now - 86_400_000)
+    expect(event.data).toMatchObject({
+      runId: 'today-attempt',
+      accepted: false,
+      conflict: 'active-run',
+    })
   })
 
   it('carries four historical, matched and generated facts through to sending and durable records', async () => {

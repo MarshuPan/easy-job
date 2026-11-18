@@ -141,10 +141,10 @@ vi.mock('./Config.vue', () => ({
 vi.mock('./OperationPanel.vue', () => ({
   default: {
     name: 'OperationPanel',
-    props: ['runtimeReady'],
+    props: ['accountReady', 'runtimeReady'],
     emits: ['open-settings', 'show-search', 'show-group', 'show-logs'],
     template: `
-      <section data-test="delivery-console" :data-runtime-ready="String(runtimeReady)">
+      <section data-test="delivery-console" :data-account-ready="String(accountReady)" :data-runtime-ready="String(runtimeReady)">
         <button data-test="open-settings" @click="$emit('open-settings')">运行配置</button>
         <button data-test="show-search" @click="$emit('show-search')">岗位规则</button>
         <button data-test="show-group" @click="$emit('show-group')">求职期望来源</button>
@@ -765,6 +765,9 @@ describe('zhipin popup UI shell', () => {
     const wrapper = mountUi()
     await flushPromises()
 
+    expect(wrapper.get('[data-test="delivery-console"]').attributes('data-account-ready')).toBe(
+      'true',
+    )
     expect(wrapper.get('[data-test="delivery-console"]').attributes('data-runtime-ready')).toBe(
       'false',
     )
@@ -784,6 +787,9 @@ describe('zhipin popup UI shell', () => {
     await flushPromises()
 
     expect(initPager).not.toHaveBeenCalled()
+    expect(wrapper.get('[data-test="delivery-console"]').attributes('data-account-ready')).toBe(
+      'true',
+    )
     expect(wrapper.get('[data-test="delivery-console"]').attributes('data-runtime-ready')).toBe(
       'false',
     )

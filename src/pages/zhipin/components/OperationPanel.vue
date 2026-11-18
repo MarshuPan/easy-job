@@ -4,6 +4,7 @@ import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 
 import type {
   DeliveryTaskActivePhase,
+  DeliveryTaskMutationResult,
   DeliveryTaskTerminalReason,
   DurableDeliveryTask,
 } from '@/background/deliveryTaskCoordinator'
@@ -152,9 +153,10 @@ import operationPanelRuntimeStyles from './OperationPanel.styles.css.txt?raw'
 const conf = useConf()
 const props = withDefaults(
   defineProps<{
+    accountReady?: boolean
     runtimeReady?: boolean
   }>(),
-  { runtimeReady: true },
+  { accountReady: true, runtimeReady: true },
 )
 const common = useCommon()
 const deliver = useDeliver()
@@ -646,13 +648,22 @@ onMounted(() => {
   }
   jobList.setDeliveryPoolCaptureEnabled(false)
   ensureOperationPanelRuntimeStyles()
-  if (props.runtimeReady) activateOperationRuntime()
+  if (props.accountReady) activateOperationRuntime()
 })
+
+watch(
+  () => props.accountReady,
+  (ready) => {
+    if (ready && operationPanelMounted) activateOperationRuntime()
+  },
+)
 
 watch(
   () => props.runtimeReady,
   (ready) => {
-    if (ready && operationPanelMounted) activateOperationRuntime()
+    if (!ready || !props.accountReady || !operationPanelMounted) return
+    if (operationRuntimeActivated) void resumeDeliveryTask('runtime-ready')
+    else activateOperationRuntime()
   },
 )
 
@@ -662,15 +673,10 @@ function activateOperationRuntime() {
   window.addEventListener('focus', handleStatisticsFocus)
   document.addEventListener('visibilitychange', handleStatisticsVisibilityChange)
   statisticsRefreshTimer = window.setInterval(requestStatisticsRefresh, statisticsRefreshIntervalMs)
-  void (async () => {
-    await refreshStatisticsForCurrentDate()
-    if (!operationPanelMounted) return
-    try {
-      await resumeDeliveryTask('mounted')
-    } catch (error) {
-      logger.warn('读取后台投递任务失败，等待运行时恢复后重试', error)
-    }
-  })()
+  requestStatisticsRefresh()
+  void resumeDeliveryTask('mounted').catch((error) => {
+    logger.warn('读取后台投递任务失败，等待运行时恢复后重试', error)
+  })
 }
 
 /**
@@ -1153,22 +1159,25 @@ async function hydratePersistentDeliveryTask(command: DeliveryCommand) {
   const localSnapshot = activeDeliveryConfigSnapshot.value
   const durableTask = await callDeliveryTaskRpc(() => counter.deliveryTaskRead(accountUid))
   if (!lifecycle.isCurrent(command)) return null
-  setDurableDeliveryTask(durableTask)
+  logBatchDiagnostic('后台投递任务状态已同步', {
+    taskId: durableTask?.runId ?? null,
+    status: durableTask?.status ?? null,
+    phase: durableTask?.phase ?? null,
+    revision: durableTask?.revision ?? null,
+    taskUpdatedAt: durableTask?.updatedAt ?? null,
+    lastWorkerAt: durableTask?.lastWorkerAt ?? null,
+    leaseExpiresAt: durableTask?.leaseExpiresAt ?? null,
+    localTaskId: localTask?.id ?? null,
+    trigger: command.kind,
+  })
+  const restored = restorePersistentDeliveryTask(durableTask, accountUid)
   if (
     durableTask != null &&
-    (durableTask.status === 'running' || durableTask.status === 'waiting-for-page')
+    (durableTask.status === 'running' ||
+      durableTask.status === 'waiting-for-page' ||
+      durableTask.status === 'paused')
   ) {
-    if (activeDeliveryConfigSnapshot.value == null) {
-      if (localTask != null) clearDeliveryTask(localTask.id)
-      throw new Error('运行配置快照已失效，请重新开始投递')
-    }
-    return restoreDeliveryTask(durableTask.checkpoint, accountUid)
-  }
-
-  if (durableTask?.status === 'paused' && durableTask.checkpoint != null) {
-    // 暂停任务也以后台检查点为准。否则刷新页面后旧逻辑会清掉本地任务，
-    // 用户点“继续”虽能 resume 后台状态，却没有页面执行上下文可接着跑。
-    return restoreDeliveryTask(durableTask.checkpoint, accountUid)
+    return restored
   }
 
   if (durableTask == null && localTask != null && localSnapshot != null) {
@@ -1181,6 +1190,24 @@ async function hydratePersistentDeliveryTask(command: DeliveryCommand) {
     clearDeliveryTask(localTask.id)
   }
   return null
+}
+
+function restorePersistentDeliveryTask(task: DurableDeliveryTask | null, accountUid: string) {
+  setDurableDeliveryTask(task)
+  if (task != null) pendingBackgroundRegistrationTaskId = null
+  if (task == null || !['running', 'waiting-for-page', 'paused'].includes(task.status)) return null
+  if (activeDeliveryConfigSnapshot.value == null) {
+    throw new Error('运行配置快照已失效，请重新开始投递')
+  }
+  const restored = restoreDeliveryTask(task.checkpoint, accountUid)
+  if (restored == null) throw new Error('后台投递检查点已失效，请结束原任务后重新开始')
+  return restored
+}
+
+class DeliveryTaskRegistrationConflict extends Error {
+  constructor(readonly result: DeliveryTaskMutationResult) {
+    super(result.conflict === 'active-run' ? '同一账号已有投递任务在运行' : '投递任务后台登记失败')
+  }
 }
 
 async function startPersistentDeliveryTask(
@@ -1198,12 +1225,10 @@ async function startPersistentDeliveryTask(
       configSnapshot: snapshot,
     }),
   )
-  setDurableDeliveryTask(result.task, task.id)
   if (!result.accepted) {
-    const message =
-      result.conflict === 'active-run' ? '同一账号已有投递任务在运行' : '投递任务后台登记失败'
-    throw new Error(message)
+    throw new DeliveryTaskRegistrationConflict(result)
   }
+  setDurableDeliveryTask(result.task, task.id)
   pendingBackgroundRegistrationTaskId = null
   beginBackgroundKeepAlive()
 }
@@ -1616,6 +1641,11 @@ function getRuntimeCommunicationMessage(error: unknown) {
 }
 
 async function startBatch() {
+  if (!props.accountReady) {
+    logBatchDiagnostic('开始投递等待：账号与配置尚未初始化')
+    AgentMessage.info('账号与配置正在初始化，请稍候')
+    return
+  }
   if (common.deliverLock || pendingManualControl.value != null) {
     logBatchDiagnostic('开始投递等待旧执行退出', {
       executionActive: activeRun.value != null,
@@ -1633,9 +1663,16 @@ async function startBatch() {
     lifecycle.complete(command)
     return
   }
+  let recoverExistingTask = false
   try {
-    const task = await lifecycle.serialize(command, () => prepareDeliveryTask(runToken))
-    if (task != null && canContinueDeliveryRun(runToken)) await runDeliveryTask(task, runToken)
+    logBatchDiagnostic('开始投递准备：核对后台任务')
+    const prepared = await lifecycle.serialize(command, () =>
+      prepareDeliveryTask(runToken, command),
+    )
+    if (prepared != null && canContinueDeliveryRun(runToken)) {
+      if (prepared.kind === 'recover') recoverExistingTask = true
+      else await runDeliveryTask(prepared.task, runToken)
+    }
   } finally {
     if (!operationPanelMounted && stopReason === 'runtime-reconnect') {
       const task = readCurrentAccountDeliveryTask()
@@ -1643,10 +1680,38 @@ async function startBatch() {
     }
     releaseDeliveryRun(runToken)
   }
+  if (recoverExistingTask && operationPanelMounted && !common.deliverStop)
+    await resumeDeliveryTask('manual-start')
 }
 
-async function prepareDeliveryTask(runToken: DeliveryRunToken) {
+type PreparedDeliveryStart = { kind: 'new'; task: DeliveryTask } | { kind: 'recover' }
+
+async function prepareDeliveryTask(
+  runToken: DeliveryRunToken,
+  command: DeliveryCommand,
+): Promise<PreparedDeliveryStart | undefined> {
+  try {
+    await hydratePersistentDeliveryTask(command)
+  } catch (error) {
+    if (!canContinueDeliveryRun(runToken)) return
+    logBatchDiagnostic('开始投递等待：后台任务状态暂不可用', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    AgentMessage.error('无法确认后台投递任务，请稍后重试')
+    return
+  }
+  if (!canContinueDeliveryRun(runToken)) return
+  const existing = durableDeliveryTask.value
+  if (existing != null && ['running', 'waiting-for-page', 'paused'].includes(existing.status)) {
+    logBatchDiagnostic('开始投递沿用后台已有任务', {
+      taskId: existing.runId,
+      status: existing.status,
+      revision: existing.revision,
+    })
+    return { kind: 'recover' }
+  }
   if (!(await refreshStatisticsForCurrentDate())) {
+    logBatchDiagnostic('开始投递被拦截：当日统计暂不可用')
     AgentMessage.info('当日投递统计暂不可用，请稍后重试')
     return
   }
@@ -1727,6 +1792,24 @@ async function prepareDeliveryTask(runToken: DeliveryRunToken) {
   } catch (error) {
     if (!canContinueDeliveryRun(runToken)) return
     if (
+      error instanceof DeliveryTaskRegistrationConflict &&
+      error.result.task?.accountUid === task.accountUid
+    ) {
+      const actualTask = error.result.task
+      restorePersistentDeliveryTask(actualTask, task.accountUid)
+      logBatchDiagnostic('开始投递同步后台竞争任务', {
+        requestedTaskId: task.id,
+        taskId: actualTask.runId,
+        status: actualTask.status,
+        revision: actualTask.revision,
+        conflict: error.result.conflict,
+        leaseExpiresAt: actualTask.leaseExpiresAt ?? null,
+      })
+      if (['running', 'waiting-for-page', 'paused'].includes(actualTask.status)) {
+        return { kind: 'recover' }
+      }
+    }
+    if (
       error instanceof ExtensionRuntimeHealthError ||
       isProviderHeartbeatError(error) ||
       isExtensionContextInvalidatedError(error)
@@ -1753,7 +1836,7 @@ async function prepareDeliveryTask(runToken: DeliveryRunToken) {
   jobList.setDeliveryPoolCaptureEnabled(true)
   await persistSearchRotation(task)
   if (!canContinueDeliveryRun(runToken)) return
-  return task
+  return { kind: 'new', task }
 }
 
 /**
@@ -2101,6 +2184,13 @@ async function resumeDeliveryTaskOnce(trigger: string, command: DeliveryCommand)
   // paused 只允许 resumeFromPause 显式转换为 running。页面挂载、focus 或 runtime-ready
   // 都只能恢复它的检查点和界面，不能把用户暂停的任务自动接管，也不能清掉本地任务。
   if (durableDeliveryTask.value?.status === 'paused') return
+  if (!props.runtimeReady) {
+    logBatchDiagnostic('投递任务等待：岗位页面尚未就绪', {
+      ...summarizeTask(task),
+      trigger,
+    })
+    return
+  }
   if (!statisticsReadyForDelivery && !(await refreshStatisticsForCurrentDate())) {
     logBatchDiagnostic('恢复投递任务等待：当日统计尚未就绪', {
       ...summarizeTask(task),
@@ -3480,25 +3570,32 @@ async function startDeliveryTaskHeartbeat(task: DeliveryTask, runToken: Delivery
 async function ensureEnabledAiTasksReady() {
   const uid = user.getUserId()
   if (uid == null || String(uid).trim() === '') {
+    logBatchDiagnostic('开始投递被拦截：未识别当前账号')
     AgentMessage.error('未识别当前 BOSS 账号')
     return null
   }
   try {
     const runtime = await counter.configRuntime(String(uid))
     if (getGreetingMode(conf.formData) === 'custom' && !conf.formData.customGreeting.value.trim()) {
+      logBatchDiagnostic('开始投递被拦截：自定义招呼语为空')
       AgentMessage.error('请先填写自定义招呼语')
       return null
     }
     if (conf.formData.aiFiltering.enable && !runtime.readiness.aiFilteringReady) {
+      logBatchDiagnostic('开始投递被拦截：AI 匹配未就绪', { readiness: runtime.readiness })
       AgentMessage.error('AI 匹配未就绪，请先配置模型并解析简历')
       return null
     }
     if (conf.formData.aiGreeting.enable && !runtime.readiness.aiGreetingReady) {
+      logBatchDiagnostic('开始投递被拦截：AI 招呼语未就绪', { readiness: runtime.readiness })
       AgentMessage.error('AI 招呼语未就绪，请先填写姓名、配置模型并解析简历')
       return null
     }
     return runtime
   } catch (error) {
+    logBatchDiagnostic('开始投递被拦截：AI 配置状态读取失败', {
+      error: error instanceof Error ? error.message : String(error),
+    })
     logger.warn('读取 AI 运行就绪状态失败', { error })
     AgentMessage.error('无法读取 AI 配置状态，请重新加载扩展后再试')
     return null
@@ -5255,7 +5352,7 @@ function formatRunEvent(message: string, detail: Record<string, unknown>) {
         ? `搜索 · ${step.searchDirection ?? ''}`
         : `求职期望 · ${step.expectation ?? '当前期望'}`,
     )
-    return `开始投递：${labels.join('、') || '无可用来源'}`
+    return `准备投递：${labels.join('、') || '无可用来源'}`
   }
   if (message === '投递任务退出') {
     const reason = stopReasonLabels[String(detail.stopReason)] ?? String(detail.stopReason ?? '')
@@ -5320,7 +5417,7 @@ function runEventState(message: string, detail: Record<string, unknown> = {}) {
   return 'info' as const
 }
 
-function logBatchDiagnostic(message: string, detail: Record<string, unknown>) {
+function logBatchDiagnostic(message: string, detail: Record<string, unknown> = {}) {
   const diagnostic = {
     ...detail,
     runtimeInstanceId: deliveryRuntimeInstanceId,
@@ -5434,7 +5531,13 @@ function resetFilter() {
               <Square :size="14" fill="currentColor" aria-hidden="true" />结束
             </AgentButton>
           </template>
-          <template v-else-if="controlTransition === 'resume' || controlTransition === 'recover'">
+          <template
+            v-else-if="
+              controlTransition === 'start' ||
+              controlTransition === 'resume' ||
+              controlTransition === 'recover'
+            "
+          >
             <AgentButton class="operation-panel__command-button" @click="pauseDeliver"
               >暂停</AgentButton
             >
@@ -5491,7 +5594,7 @@ function resetFilter() {
             v-else
             class="operation-panel__command-button is-primary"
             type="primary"
-            :disabled="common.deliverLock || controlTransition != null"
+            :disabled="!accountReady || common.deliverLock || controlTransition != null"
             @click="startBatch"
           >
             <Play :size="15" :stroke-width="0" fill="currentColor" aria-hidden="true" />

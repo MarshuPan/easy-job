@@ -239,7 +239,7 @@ function mirrorTaskMutation(
     stream: 'tasks',
     event: `task.${action}`,
     accountUid: request.uid,
-    at: task?.updatedAt ?? Date.now(),
+    at: Date.now(),
     data: {
       runId: request.runId,
       accepted: result.accepted,
@@ -247,6 +247,7 @@ function mirrorTaskMutation(
       status: task?.status,
       phase: task?.phase,
       revision: task?.revision,
+      taskUpdatedAt: task?.updatedAt,
       terminalReason: task?.terminalReason,
       terminalMessage: task?.terminalMessage,
       requestSnapshot: localTaskSnapshot(requestSnapshot),

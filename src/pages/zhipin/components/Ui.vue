@@ -65,6 +65,7 @@ const panelOpen = ref(false)
 const activeSection = ref<WorkspaceSection>('dashboard')
 const mountedSections = ref<Set<WorkspaceSection>>(new Set(['dashboard']))
 const jobRuntimeReady = ref(false)
+const accountRuntimeReady = ref(false)
 let sectionSelectionVersion = 0
 let previouslyFocusedElement: HTMLElement | null = null
 const navigation = [
@@ -206,6 +207,7 @@ onMounted(async () => {
   }
   try {
     jobList.setConfigScope?.(buildDeliveryQueueConfigScope(conf.formData))
+    accountRuntimeReady.value = true
     await jobList.initJobList(conf.formData)
   } catch (e) {
     logger.error(`初始化职位列表失败：${describeInitFailure(e)}`)
@@ -428,6 +430,7 @@ function handlePersonalFrameMessage(event: MessageEvent) {
             data-view="dashboard"
           >
             <OperationPanel
+              :account-ready="accountRuntimeReady"
               :runtime-ready="jobRuntimeReady"
               @open-settings="selectSection('settings')"
               @show-search="selectSection('filters')"

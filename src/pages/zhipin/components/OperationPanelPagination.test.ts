@@ -811,6 +811,125 @@ describe('operation panel pagination delivery', () => {
     vi.restoreAllMocks()
   })
 
+  it('hydrates a waiting task before the pager is ready and lets the user end it', async () => {
+    registerLifecycleTask('waiting-for-page')
+    const wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    await flushPromises()
+    await vi.waitFor(() => expect(wrapper.text()).toContain('等待中'))
+
+    expect(wrapper.findAll('button').some((button) => button.text() === '开始投递')).toBe(false)
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(
+      JSON.parse(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')!).id,
+    ).toBe('lifecycle-task')
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '结束')!
+      .trigger('click')
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+    await wrapper.setProps({ runtimeReady: true })
+    await flushPromises()
+
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+  })
+
+  it('does not lose page readiness while account-only task recovery is finishing', async () => {
+    registerLifecycleTask('waiting-for-page')
+    sourceLists.group = [job('ready-recovery-job')]
+    deliverJobListHandle.mockImplementationOnce(async () => {
+      common.deliverStop = true
+      return 'stopped'
+    })
+    let wrapper: ReturnType<typeof mount>
+    logInfo.mockImplementation((_title: string, message: string) => {
+      if (message.includes('投递任务等待：岗位页面尚未就绪')) {
+        void wrapper.setProps({ runtimeReady: true })
+      }
+    })
+    wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    try {
+      await vi.waitFor(() => expect(deliverJobListHandle).toHaveBeenCalledTimes(1))
+      expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
+      expect(durableTaskState.value.runId).toBe('lifecycle-task')
+    } finally {
+      logInfo.mockReset()
+      wrapper.unmount()
+      await flushPromises()
+    }
+  })
+
+  it('checks the existing paused task before saving configuration or registering a new task', async () => {
+    registerLifecycleTask('paused')
+    const snapshot = structuredClone(durableTaskState.value.configSnapshot)
+    const wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已暂停'))
+
+    expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
+    expect(confPersist).not.toHaveBeenCalled()
+    expect(durableTaskState.value.runId).toBe('lifecycle-task')
+    expect(durableTaskState.value.configSnapshot).toEqual(snapshot)
+    expect(wrapper.findAll('button').some((button) => button.text() === '继续')).toBe(true)
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+  })
+
+  it('adopts the actual background task when another page wins the registration race', async () => {
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    vi.mocked(counter.deliveryTaskStart).mockImplementationOnce(async () => {
+      registerLifecycleTask('paused')
+      return {
+        accepted: false,
+        conflict: 'active-run' as const,
+        task: structuredClone(durableTaskState.value),
+      }
+    })
+
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已暂停'))
+
+    expect(counter.deliveryTaskStart).toHaveBeenCalledTimes(1)
+    expect(counter.deliveryTaskTerminate).not.toHaveBeenCalled()
+    expect(
+      JSON.parse(window.sessionStorage.getItem('agent-delivery:combined-delivery-task')!).id,
+    ).toBe('lifecycle-task')
+    expect(wrapper.findAll('button').some((button) => button.text() === '继续')).toBe(true)
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+  })
+
+  it('honors stop while the start preflight read is pending', async () => {
+    const wrapper = mount(OperationPanel)
+    await flushPromises()
+    registerLifecycleTask('waiting-for-page')
+    const oldTask = structuredClone(durableTaskState.value)
+    const read = createDeferred<any>()
+    vi.mocked(counter.deliveryTaskRead).mockImplementationOnce(() => read.promise)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '开始投递')!
+      .trigger('click')
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '结束')!
+      .trigger('click')
+    read.resolve(oldTask)
+    await vi.waitFor(() => expect(durableTaskState.value.status).toBe('stopped'))
+
+    expect(counter.deliveryTaskStart).not.toHaveBeenCalled()
+    expect(counter.deliveryTaskClaim).not.toHaveBeenCalled()
+    expect(deliverJobListHandle).not.toHaveBeenCalled()
+    expect(common.deliverLock).toBe(false)
+  })
+
   it('fails fast before creating a task when the page bridge is stale', async () => {
     probeExtensionRuntimeHealth.mockRejectedValueOnce(
       new ExtensionRuntimeHealthError('CONTENT_SCRIPT_UNAVAILABLE'),

@@ -496,14 +496,14 @@ describe('operation panel', () => {
     await flushPromises()
   })
 
-  it('defers statistics and task recovery until the host runtime is ready', async () => {
+  it('defers account work until configuration is ready, independently of page bindings', async () => {
     statistics.updateStatistics.mockClear()
-    const wrapper = mount(OperationPanel, { props: { runtimeReady: false } })
+    const wrapper = mount(OperationPanel, { props: { accountReady: false, runtimeReady: false } })
     await flushPromises()
 
     expect(statistics.updateStatistics).not.toHaveBeenCalled()
 
-    await wrapper.setProps({ runtimeReady: true })
+    await wrapper.setProps({ accountReady: true })
     await flushPromises()
 
     expect(statistics.updateStatistics).toHaveBeenCalledOnce()
