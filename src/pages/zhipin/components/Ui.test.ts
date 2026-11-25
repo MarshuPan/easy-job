@@ -35,6 +35,7 @@ const {
   setStatisticsAccountScope,
   storageGet,
   storageSet,
+  userIdState,
 } = vi.hoisted(() => ({
   confInit: vi.fn(async () => undefined),
   formData: {
@@ -53,7 +54,7 @@ const {
   hydrateRuntimeLogs: vi.fn(async () => undefined),
   initJobList: vi.fn(async () => undefined),
   initPager: vi.fn(async () => undefined),
-  initUser: vi.fn(async () => undefined),
+  initUser: vi.fn(async (): Promise<unknown> => undefined),
   launcherStorage: new Map<string, unknown>(),
   loggerError: vi.fn(),
   loggerWarn: vi.fn(),
@@ -68,6 +69,7 @@ const {
   setStatisticsAccountScope: vi.fn(async () => undefined),
   storageGet: vi.fn(),
   storageSet: vi.fn(),
+  userIdState: { value: 'account-a' as string | null },
 }))
 
 vi.mock('@/composables/useStatistics', () => ({
@@ -110,7 +112,7 @@ vi.mock('@/stores/log', () => ({
 
 vi.mock('@/stores/user', () => ({
   useUser: () => ({
-    getUserId: vi.fn(() => 'account-a'),
+    getUserId: vi.fn(() => userIdState.value),
     initUser,
   }),
 }))
@@ -245,6 +247,7 @@ describe('zhipin popup UI shell', () => {
     initJobList.mockResolvedValue(undefined)
     initPager.mockResolvedValue(undefined)
     initUser.mockResolvedValue(undefined)
+    userIdState.value = 'account-a'
     probeExtensionRuntimeHealth.mockResolvedValue(undefined)
     launcherStorage.clear()
     storageGet.mockImplementation(async (key: string) => {
@@ -751,6 +754,32 @@ describe('zhipin popup UI shell', () => {
     expect(initJobList).toHaveBeenCalledWith(
       expect.objectContaining({ useCache: expect.objectContaining({ value: true }) }),
     )
+  })
+
+  it('keeps waiting when the BOSS account becomes available after the first attempt', async () => {
+    vi.useFakeTimers()
+    try {
+      userIdState.value = null
+      initUser.mockResolvedValueOnce(null).mockResolvedValueOnce(undefined)
+      const wrapper = mountUi()
+      await flushPromises()
+
+      expect(wrapper.get('[data-test="delivery-console"]').attributes('data-account-ready')).toBe(
+        'false',
+      )
+
+      userIdState.value = 'account-a'
+      await vi.advanceTimersByTimeAsync(750)
+      await flushPromises()
+
+      expect(initUser).toHaveBeenCalledTimes(2)
+      expect(wrapper.get('[data-test="delivery-console"]').attributes('data-account-ready')).toBe(
+        'true',
+      )
+      wrapper.unmount()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('activates the delivery controller only after pager initialization completes', async () => {

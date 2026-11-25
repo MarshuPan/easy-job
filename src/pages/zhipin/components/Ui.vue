@@ -66,6 +66,8 @@ const activeSection = ref<WorkspaceSection>('dashboard')
 const mountedSections = ref<Set<WorkspaceSection>>(new Set(['dashboard']))
 const jobRuntimeReady = ref(false)
 const accountRuntimeReady = ref(false)
+let uiMounted = true
+let accountRetryTimer: number | undefined
 let sectionSelectionVersion = 0
 let previouslyFocusedElement: HTMLElement | null = null
 const navigation = [
@@ -91,7 +93,12 @@ const systemReady = computed(
     conf.readiness?.aiGreetingReady !== false &&
     conf.readiness?.customGreetingReady !== false,
 )
-const systemStateLabel = computed(() => (systemReady.value ? '系统正常' : '需要配置'))
+const systemStateLabel = computed(() => {
+  if (!accountRuntimeReady.value) return '正在初始化账号'
+  if (!jobRuntimeReady.value) return '正在加载岗位'
+  return systemReady.value ? '系统正常' : '需要配置'
+})
+const systemStatusWarning = computed(() => systemStateLabel.value !== '系统正常')
 const personalFrameUrl = computed(() => {
   if (!props.personalUrl) return ''
   const uid = user.getUserId()
@@ -114,6 +121,7 @@ const personalFrameOrigin = computed(() => {
 })
 
 onMounted(() => {
+  uiMounted = true
   syncAgentMessageContainerHost()
   window.addEventListener(JOB_UI_VISIBILITY_EVENT, handleJobUiVisibility)
   window.addEventListener('keydown', handleWorkspaceKeydown)
@@ -121,6 +129,11 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  uiMounted = false
+  if (accountRetryTimer != null) {
+    window.clearTimeout(accountRetryTimer)
+    accountRetryTimer = undefined
+  }
   window.removeEventListener(JOB_UI_VISIBILITY_EVENT, handleJobUiVisibility)
   window.removeEventListener('keydown', handleWorkspaceKeydown)
   window.removeEventListener('message', handlePersonalFrameMessage)
@@ -146,6 +159,36 @@ function describeInitFailure(error: unknown) {
   }
 }
 
+async function waitForAccount() {
+  let reportedUnavailable = false
+  while (uiMounted) {
+    let currentUser
+    try {
+      currentUser = await user.initUser({ pollIntervalMs: 200, timeoutMs: 2_000 })
+    } catch (error) {
+      if (!reportedUnavailable) {
+        logger.error(`初始化用户信息失败：${describeInitFailure(error)}`)
+        reportedUnavailable = true
+      }
+    }
+    const accountUid = currentUser?.userId ?? user.getUserId()
+    if (accountUid != null) return accountUid
+
+    if (!reportedUnavailable) {
+      logger.warn('账号信息尚未就绪，等待 BOSS 页面完成初始化')
+      AgentMessage.info('账号信息正在初始化，请稍候')
+      reportedUnavailable = true
+    }
+    await new Promise<void>((resolve) => {
+      accountRetryTimer = window.setTimeout(() => {
+        accountRetryTimer = undefined
+        resolve()
+      }, 750)
+    })
+  }
+  return null
+}
+
 onMounted(async () => {
   // 通信桥要在最前面确认。后面每一步都靠它，桥断了或版本不一致时，最先炸的是账号数据，
   // 而那条错误只会说「账号数据加载失败」——真正的原因（该重开页面还是重载扩展）被盖住了。
@@ -168,16 +211,8 @@ onMounted(async () => {
     return
   }
   void restorePosition()
-  let currentUser
-  try {
-    currentUser = await user.initUser({ pollIntervalMs: 200, timeoutMs: 2_000 })
-  } catch (e) {
-    logger.error(`初始化用户信息失败：${describeInitFailure(e)}`)
-  }
-  const accountUid = currentUser?.userId ?? user.getUserId()
+  const accountUid = await waitForAccount()
   if (accountUid == null) {
-    logger.error('初始化账号数据失败：账号信息尚未就绪')
-    AgentMessage.error('账号信息未就绪，请刷新后重试')
     return
   }
   try {
@@ -390,7 +425,7 @@ function handlePersonalFrameMessage(event: MessageEvent) {
           :class="[
             'agent-delivery-workspace__config-state',
             'agent-delivery-workspace__menu-status',
-            { 'is-warning': !systemReady },
+            { 'is-warning': systemStatusWarning },
           ]"
           role="status"
           aria-live="polite"
